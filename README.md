@@ -183,22 +183,41 @@ cargo test --release
 | 0 | 骨架 | workspace / `.gitignore` / README / AGENTS / git 身份 | `chore: bootstrap cargo workspace for wbwpty` | ✅ |
 | 1 | 管道层 | 命名管道传输层（overlapped + pump） | `feat(pipe): named-pipe transport with overlapped io` | ✅ |
 | 2 | 子进程 | 挂起 + `DETACHED_PROCESS` 创建、环境块 | `feat(child): launch target suspended and detached without conhost` | ✅ |
-| 3 | 注入器 | PE 解析 / 重定位 / 导出解析 / PEB 遍历 / 入口 trampoline | `feat(inject): manual-map injector via peb module walk` | 🟡 进行中 |
-| 4 | DLL v1 | 开管道 + `SetStdHandle` + 可继承标记 | `feat(dll): redirect std handles to named pipes` | ⏳ |
-| 5 | CLI | 会话循环：双泵 / EOF / 退出码 / Ctrl+C | `feat(cli): interactive session over redirected stdio` | ⏳ |
-| 6 | PEB | 控制台语义补丁 + 偏移运行时自检 | `feat(dll): fake attached-console state in peb process parameters` | ⏳ |
-| 7 | CRT | `_open_osfhandle`/`_dup2`/`setvbuf`/`_flushall` | `feat(dll): repair and line-buffer the ucrt stdio streams` | ⏳ |
-| 8 | shim | 内联跳板 + console API shim + 键入翻译 + resize | `feat(dll): console api shim via kernelbase inline hooks` | ⏳ |
-| 9 | 测试 | cmd/python/大输出/stderr/无 conhost/孙进程 | `test: add integration coverage and conhost assertions` | ⏳ |
-| 10 | 文档 | README 定稿 + push | `docs: document architecture, build, usage and limitations` | ⏳ |
+| 3 | 注入器 | PE 解析 / 重定位 / 导出解析 / PEB 遍历；**loader 跑完再注入**，废弃入口 trampoline | `feat(inject): map the payload once the target loader has finished` | ✅ |
+| 4 | stdio | **`STARTF_USESTDHANDLES` + 可继承管道句柄**，重定向不再依赖 DLL 注入时机 | `feat(session): run a target over pipes with no console host` | ✅ |
+| 5 | CLI | 会话循环：双泵 / EOF / 退出码 / `--dump-conhost` / `--verbose` | （同上） | ✅ |
+| 6 | PEB | `ConsoleHandle` 哨兵补丁（阻止孙进程分配 console），偏移 `offset_of!` 断言 + 运行时自检 | `in progress` | 🟡 |
+| 7 | CRT | `_open_osfhandle`/`_dup2`/`setvbuf(_IOLBF)`/`_flushall` | ⏳ |
+| 8 | shim | KernelBase 内联 hook（`GetConsoleMode`/`WriteConsoleW`/`ReadConsoleW`/`GetConsoleScreenBufferInfo`）| ⏳ |
+| 9 | 测试 | cmd/python/大输出/stderr/无 conhost/孙进程 | ⏳ |
+| 10 | 文档 | README 定稿 | ⏳ |
 
-### 5.1 已完成部分的实际状态
+### 5.1 已完成部分的实际状态（截至本次提交）
 
-- `cargo build` 绿；`cargo test --workspace` = **18 passed / 1 ignored / 0 failed**
-- `wbwpty_redirect.dll` 可构建：`no_std` + `panic=abort` cdylib，导出 `DllMain`（RVA 见 objdump）
-- 手工映射注入器的**每一段机器码都被执行验证过**（不是只比对字节）：
-  入口 dispatcher 的"自旋 → 还原入口字节 → 调 DllMain → 跳回原入口"全流程有单测
-- 唯一 ignored 的测试就是下面的阻塞点
+- `cargo build --release` 绿；`cargo test --workspace` = **26 passed / 0 failed / 0 ignored**（`stub_calls_the_entry_with_dllmain_arguments` 执行验证了 stub 参数，`mapped_image_runs_a_trivial_export` 验证了手工映射本身正确，`injects_into_a_running_cmd` 验证了完整链路）。
+- `wbwpty.exe --dump-conhost -- cmd.exe /c echo hello` 实测：**hello 原样输出，exit=0，conhost.exe before=10 after=10 delta=0**，stderr 干净。
+- 手工映射每一段机器码都有**真正执行**的单测（不是只比对字节），`stub.rs` 已简化为只负责"调 DllMain"，不再携带死代码。
+- 核心注入失败根因已定位：**stub 用 `r9d` 而不是 `edx` 传 `DLL_PROCESS_ATTACH`**（Win64 第 2 参数在 `rdx`），导致 `DllMain` 拿到假 reason 直接 return TRUE 而不做任何事；修完后 stub 调用真实成功。
+
+### 5.2 关键技术发现（全部本机实测，恢复工作时不要推翻）
+
+1. **只有 `DETACHED_PROCESS` 不拉 conhost**（微软 Terminal `doc/specs/#7335` 原文佐证）。
+2. **挂起进程的 `PEB->Ldr` 是 NULL**：`CREATE_SUSPENDED` 时 loader 还没跑，
+   目标进程里除 exe 自身和 ntdll 外**什么都没映射**。实测在宿主的
+   `KERNEL32.dll` 基址读目标内存会 `ERROR_PARTIAL_COPY`。
+   → "先注入 → 再从目标解析导入" 这条路走不通，必须让 loader 先跑起来。
+3. **entry-point trampoline 对 `GUARD_CF` 映像致命**：`cmd.exe`（`DllCharacteristics=0xc160`）在入口点写 `E9 rel32` 后 resume，loader 立即以 `STATUS_POSSIBLE_DEADLOCK (0x103)` 杀死进程，根本走不到入口点；同进程的任意 `.text` 位置写入再还原则完全无害。**结论：放弃入口点 trampoline，改走"loader 跑完再注入"**。
+4. **模块列表就绪信号必须是"稳定快照"而非"非空"**：`LdrpInitializeProcess` 先发布 `PEB->Ldr` 再逐个链接模块，短窗口内列表为空或不完整；以 50ms 稳定间隔对比两次快照来判断就绪，才不会再踩 `walk produced nothing` 或 `not doubly linked`。
+5. **`WriteProcessMemory` 要求目标页已提交**：`VirtualQueryEx` 报告 `MEM_FREE` 不代表可写，必须用 `VirtualAllocEx` 真正预留+提交；旧代码只探测不提交，导致 `ERROR_INVALID_ADDRESS (998)`。
+6. **x64 import thunk 步进是 8 不是 16**：`IMAGE_THUNK_DATA64` 就是一个 `u64`，旧代码按 32-bit PE 步进 16 字节，读取的 RVA 全是垃圾（表现为 `"string at 0x65e0ac22 is outside the image"`）。
+7. **`api-ms-win-crt-*` DLL 不是真实磁盘文件**：`GetModuleHandleW` 在宿主里能拿到基址，但那个基址在目标里未映射；必须以目标 PEB 快照为准。
+8. **`STARTF_USESTDHANDLES` + 可继承句柄**是让 stdio 在 CRT 初始化之前接管的标准做法；宿主必须立刻释放自己持有的客户端副本，否则 `-out` 管道的 writer 永远不为空 → 死等 EOF。
+9. **stub 传参：Win64 ABI 第 2 参数在 `rdx`，不是 `r9`**。`mov r9d, 1` 编译无错但 `DllMain` 拿到的 `fdwReason` 是残留垃圾值，整条 attach 路径静默跳过；必须用 `mov edx, 1`。
+10. **宿主工具链是 MinGW gnu（无 MSVC）**。`no_std` cdylib 需要自己导出 `rust_eh_personality`。
+
+### 5.3 当前阻塞点
+
+`DllMain` 在执行 `stdio::install()`（含 `init_from_env`、`dlog!`、`peb::patch_console_state`）时**仍然报 `STATUS_ACCESS_VIOLATION (0xc0000005)`**。`mapped_image_runs_a_trivial_export`（调用 `wbwpty_probe`，只写 magic 不回读）已验证手工映射本身完全正确；故障被精确隔离在 DllMain 内部。下一步用 `PROBE_MARKER` + status word 在关键入口加埋点，定位哪条 FFI 调用越界。
 
 ### 5.2 关键技术发现（全部本机实测，恢复工作时不要推翻）
 

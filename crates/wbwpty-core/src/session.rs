@@ -404,10 +404,11 @@ mod tests {
             stderr: stdio.stderr,
         });
         let config = SessionConfig { shim: false, verbose: true, inject: true, ..Default::default() };
+        let inject_flag = config.inject;
         let session = Session::start(&spec, config).unwrap();
 
         let report = session.report();
-        eprintln!("DIAG inject={}", config.inject);
+        eprintln!("DIAG inject={inject_flag}");
         eprintln!("DIAG report={:?}", report.map(|r| r.image_base));
         eprintln!("DIAG status={:#x}", session.payload_status().unwrap_or(0));
         eprintln!("DIAG child_running={}", session.child.is_running());

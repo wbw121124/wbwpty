@@ -58,11 +58,9 @@ pub const WBWPTY_STATUS_NO_PIPE_OUT: u32 = 3;
 /// is loaded normally with `LoadLibrary`).
 #[no_mangle]
 pub extern "system" fn DllMain(_hinst: HINSTANCE, reason: DWORD, _reserved: *mut c_void) -> i32 {
-    // Record the args so the host can verify the stub passed them correctly,
-    // and exercise the same code path the real attach would.
-    unsafe {
-        WBWPTY_STATUS = PROBE_MARKER | (reason << 8) | ((_hinst as usize & 0xff) as u32);
-    }
+    // Record that we entered DllMain with the given reason, so the host can
+    // verify the stub passed arguments correctly.
+    unsafe { WBWPTY_STATUS = PROBE_MARKER | (reason << 16); }
     match reason {
         ffi::DLL_PROCESS_ATTACH => {
             crate::stdio::install();

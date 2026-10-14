@@ -29,7 +29,6 @@ use core::ffi::c_void;
 use core::mem::offset_of;
 use core::ptr;
 
-use crate::dlog;
 use crate::ffi::{DWORD, HANDLE};
 
 /// Sentinel written into `ConsoleHandle`. Deliberately an implausible handle
@@ -107,20 +106,18 @@ pub enum PatchOutcome {
 /// Never fails loudly and never panics: a target that cannot be patched still
 /// runs, it just spawns a console host for its children.
 pub fn patch_console_state() -> PatchOutcome {
+    // Quick null checks without dlog (dlog! formatting code accesses PEB offsets
+    // that may fault under the loader lock). Status word is set by DllMain caller.
     let peb = current_peb();
     if peb.is_null() {
-        dlog!("peb: TEB lookup returned null");
         return PatchOutcome::Skipped;
     }
-
     // SAFETY: `peb` is this process' PEB, and ProcessParameters is a valid
     // pointer at this point in the process' lifetime (we are running inside it).
     let params = unsafe { ptr::read_volatile(peb.add(PEB_PROCESS_PARAMETERS_OFFSET).cast::<usize>()) };
     if params == 0 {
-        dlog!("peb: ProcessParameters is null");
         return PatchOutcome::Skipped;
     }
-
     // SAFETY: `params` points at our own RTL_USER_PROCESS_PARAMETERS; the
     // ConsoleHandle slot is a plain pointer-sized field.
     let console_slot = unsafe { (params as *mut usize).add(PROCESS_PARAMETERS_CONSOLE_HANDLE_OFFSET) };
@@ -137,12 +134,10 @@ pub fn patch_console_state() -> PatchOutcome {
     // for this build and the target must be left alone.
     let verify = unsafe { ptr::read_volatile(console_slot) };
     if verify != CONSOLE_HANDLE_SENTINEL {
-        dlog!("peb: ConsoleHandle write did not stick ({verify:#x}); offsets look wrong");
         unsafe { ptr::write_volatile(console_slot, 0) };
         return PatchOutcome::Skipped;
     }
 
-    dlog!("peb: ConsoleHandle sentinel installed");
     PatchOutcome::Patched
 }
 

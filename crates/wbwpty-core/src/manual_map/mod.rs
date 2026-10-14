@@ -439,7 +439,7 @@ mod tests {
         };
 
         let mut pipes = PipePair::new(0x11_0001).unwrap();
-        let stdio = pipes.open_target_stdio().unwrap();
+        let mut stdio = pipes.open_target_stdio().unwrap();
         let spec = ChildSpec::new("cmd.exe").stdio(Stdio {
             stdin: stdio.stdin,
             stdout: stdio.stdout,
@@ -479,7 +479,7 @@ mod tests {
         use crate::pipe::PipePair;
 
         let mut pipes = PipePair::new(0x11_0002).unwrap();
-        let stdio = pipes.open_target_stdio().unwrap();
+        let mut stdio = pipes.open_target_stdio().unwrap();
         let child = Child::spawn(&ChildSpec::new("cmd.exe").stdio(Stdio {
             stdin: stdio.stdin,
             stdout: stdio.stdout,
@@ -574,12 +574,12 @@ mod tests {
             "rewriting the entry point must not be assumed to work: see README 5.3"
         );
     }
-    /// Bisect probe: mapping the image and running a trivial export must work.
+/// Bisect probe: mapping the image and running a trivial export must work.
     ///
-    /// `wbwpty_probe` only stores a magic into the payload's own data, so a
-    /// failure here localises the fault to the manual map itself (relocations,
+    /// `wbwpty_probe` only stores a magic into the payload's own writable data,
+    /// so a failure here localises the fault to the manual map itself (relocations,
     /// section copying, or the remote call) rather than to anything `DllMain`
-    /// does.
+    /// happens to do.
     #[test]
     fn mapped_image_runs_a_trivial_export() {
         use crate::manual_map::remote::RemoteProcess;
@@ -589,12 +589,13 @@ mod tests {
             return;
         };
         let file = std::fs::read(&dll).unwrap();
-        let pe = PeImage::parse(&file).unwrap();
+        let _pe = PeImage::parse(&file).unwrap();
         let status_rva = find_export_rva(&file, "WBWPTY_STATUS")
             .expect("payload must export WBWPTY_STATUS")
             .expect("WBWPTY_STATUS must be in the export table");
+        eprintln!("DIAG status_rva={status_rva:#x}");
 
-                // The target must outlive the injection, and a `cmd.exe` with no stdin
+        // The target must outlive the injection, and a `cmd.exe` with no stdin
         // exits immediately, so it gets a pipe nobody ever writes to.
         let mut pipes = crate::pipe::PipePair::new(0x11_0004).unwrap();
         let mut stdio = pipes.open_target_stdio().unwrap();
@@ -606,15 +607,62 @@ mod tests {
         .unwrap();
         stdio.release();
         let report = inject_into_child(&child, &dll, "wbwpty_probe").expect("probe injection");
+        eprintln!("DIAG probe report image_base={:#x} entry_rva={:#x} wait={}ms",
+            report.image_base, report.entry_rva, report.loader_wait_ms);
 
         let proc = RemoteProcess::new(child.process_handle());
-        let value = proc.read_bytes(report.image_base + status_rva as u64, 4).unwrap();
+        let bytes = proc.read_bytes(report.image_base + status_rva as u64, 4).unwrap();
+        let val = u32::from_le_bytes(bytes.try_into().unwrap());
         assert_eq!(
-            u32::from_le_bytes(value.try_into().unwrap()),
-            0xc0de_cafe,
-            "probe ran but left the wrong marker"
+            val, 0xc0de_cafe,
+            "probe wrote its marker, got {val:#x}"
         );
         assert!(child.is_running(), "target survived");
+        let _ = child.terminate();
+    }
+
+    /// Call `DllMain` directly (no `stdio::install`) and read back the status.
+    ///
+    /// `DllMain` now only does `WBWPTY_STATUS = PROBE_MARKER | (reason << 16)`.
+    /// If this test passes the status will be `0xc0de_0100` (reason=1, marker=0xc0decafe);
+    /// if it AVs we will get a panic instead.
+    #[test]
+    fn dllmain_runs_without_fauling() {
+        use crate::manual_map::remote::RemoteProcess;
+
+        let Some(dll) = payload_dll_path() else {
+            eprintln!("skipping: wbwpty_redirect.dll not built yet");
+            return;
+        };
+        let file = std::fs::read(&dll).unwrap();
+        let status_rva = find_export_rva(&file, "WBWPTY_STATUS")
+            .expect("payload must export WBWPTY_STATUS")
+            .expect("WBWPTY_STATUS must be in the export table");
+
+        let mut pipes = crate::pipe::PipePair::new(0x11_0006).unwrap();
+        let mut stdio = pipes.open_target_stdio().unwrap();
+        let child = Child::spawn(&ChildSpec::new("cmd.exe").stdio(Stdio {
+            stdin: stdio.stdin,
+            stdout: stdio.stdout,
+            stderr: stdio.stderr,
+        }))
+        .unwrap();
+        stdio.release();
+        let report = inject_into_child(&child, &dll, "DllMain").expect("DllMain injection");
+        eprintln!("DIAG dllmain report image_base={:#x} entry_rva={:#x} wait={}ms",
+            report.image_base, report.entry_rva, report.loader_wait_ms);
+
+        let proc = RemoteProcess::new(child.process_handle());
+        let bytes = proc.read_bytes(report.image_base + status_rva as u64, 4).unwrap();
+        let val = u32::from_le_bytes(bytes.try_into().unwrap());
+        eprintln!("DIAG dllmain status={val:#x} (non-zero (DllMain ran))");
+        if val == 0 {
+            panic!("DllMain did not write status at all (crashed in prologue?)");
+        }
+        // Any value >= 10 means DllMain entered the attach branch.
+        // Value 99 = past install(). Values 10-22 = inside install().
+assert!(val != 0, "DllMain must write to status; got {val:#x}");
+        assert!(child.is_running(), "target survived DllMain");
         let _ = child.terminate();
     }
 

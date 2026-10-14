@@ -121,9 +121,7 @@ cargo test --release                  # 相关测试必须全绿
 1. **挂起进程的 `PEB->Ldr` 是 NULL**。`CREATE_SUSPENDED` 时 loader 尚未运行，
    目标里除 exe 与 ntdll 外无任何映射，宿主与目标的 `KERNEL32.dll` 基址也不同
    （Shared mapping 只在同一 boot 的"已加载"进程间共享）。
-   → 所以"挂起 → 手工映射 → 从目标解析导入"这条路是死的，
-   现有方案是 **入口点 trampoline**（patch `AddressOfEntryPoint` → resume →
-   loader 跑完停在 dispatcher → 宿主再解析导入 → 放行）。
+   → 必须等 `PEB->Ldr` 可遍历再注入。注入策略改为：**先 resume，轮询稳定快照**。
 2. **x64 PE 的重定位是 `IMAGE_REL_BASED_DIR64`(10)**，不是 `HIGHLOW`(3)。两个都要实现。
 3. **手写 x64 机器码时 REX 前缀的 R/B 位极易写错**，而且错得很隐蔽
    （`mov r10, [r9]` 曾被编码成 `mov r9, [r9]`，`mov rcx, r11` 编成 `mov rcx, r9`）。
@@ -132,6 +130,11 @@ cargo test --release                  # 相关测试必须全绿
 4. `no_std` cdylib 必须自己导出 `rust_eh_personality`（sysroot 的 `core` 按 unwind 编译）。
 5. 读 PE 数据目录/名字字符串要用 RVA→文件偏移的映射（`PeImage::read_rva`），
    直接拿 RVA 当文件偏移会读到垃圾。
+6. **不能把挂起进程的入口点改成 `jmp`**：`cmd.exe` 这类 `GUARD_CF` 映像在入口点写入任何跳转指令，loader 就会以 `STATUS_POSSIBLE_DEADLOCK (0x103)` 杀死进程。其他 `.text` 位置写入完全无害，只有 entry point 敏感。
+7. **Win64 FFI 第 2 参数在 `rdx`，不是 `r9`**：stub 写了 `mov r9d, 1` 想传 `DLL_PROCESS_ATTACH`，编译无错但 `DllMain` 拿到的 reason 是垃圾值，整条 attach 路径静默跳过，且 stub 依然返回 exit code 0（完全伪装成功）。必须用 `mov edx, 1`。
+8. **`VirtualQueryEx` 报告 `MEM_FREE` 不代表可写**：必须用 `VirtualAllocEx` 真正 commit，否则 `WriteProcessMemory` 返回 `ERROR_INVALID_ADDRESS (998)`。
+9. **x64 `IMAGE_THUNK_DATA64` 步进是 8 字节**：旧的 import resolver 按 16 字节步进，读取的 RVA 全是垃圾，表现成 `"string at 0x65e0ac22 is outside the image"`。
+10. **`STARTF_USESTDHANDLES` 传管道句柄后，宿主必须立刻释放自己的客户端副本**：否则 `-out` 管道的 writer 永远不为空，`pump_output` 死等 EOF。
 
 ## 10. 外部可复用模块（评估过再用）
 

@@ -12,14 +12,11 @@
 //!   console, so anything it spawns inherits the session pipes instead of being
 //!   allocated one (which is what would spawn `conhost.exe`).
 
-use crate::dlog;
 use crate::peb::{self, PatchOutcome};
 
 /// Runs the payload's attach path. Safe to call more than once.
 pub fn install() {
-    match peb::patch_console_state() {
-        PatchOutcome::Patched => dlog!("stdio: console state faked"),
-        PatchOutcome::AlreadySet => dlog!("stdio: console handle already set"),
-        PatchOutcome::Skipped => dlog!("stdio: console state left untouched"),
-    }
+    // dlog! is intentionally omitted here: its formatting code reads PEB offsets
+    // beyond RTL_USER_PROCESS_PARAMETERS under the loader lock, causing AV.
+    let _ = peb::patch_console_state();
 }
