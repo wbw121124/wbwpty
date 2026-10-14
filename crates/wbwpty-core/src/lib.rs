@@ -11,9 +11,11 @@
 //! * [`console`]     — host side virtual terminal state (rows/cols/code page)
 //! * [`inspect`]     — process snapshots used to prove "no conhost.exe"
 
+pub mod child;
 pub mod error;
 pub mod pipe;
 
 pub use anyhow::{Error, Result};
+pub use child::ChildSpec;
 pub use error::Handle;
 pub use pipe::{PipePair, ReadEvent};
