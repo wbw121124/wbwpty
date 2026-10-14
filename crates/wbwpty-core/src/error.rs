@@ -7,6 +7,8 @@
 use std::fmt;
 
 pub use anyhow::{anyhow, bail, Context, Result};
+use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// Convenience alias so callers can `use wbwpty_core::Result`.
 pub type CoreResult<T> = anyhow::Result<T>;
@@ -64,6 +66,34 @@ impl Handle {
 
     pub fn as_raw(&self) -> isize {
         self.0
+    }
+
+    /// `DuplicateHandle` onto the current process.
+    ///
+    /// The copy does *not* inherit the `HANDLE_FLAG_INHERIT` attribute of the
+    /// original, which is exactly what the session needs: the duplicate can be
+    /// released in the host while the child's copy keeps the pipe alive.
+    pub fn duplicate(&self) -> Result<Self> {
+        if !self.is_valid() {
+            bail!("cannot duplicate an invalid handle");
+        }
+        let mut out = std::ptr::null_mut();
+        // SAFETY: both handles are owned by this process and `out` is live.
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                self.0 as _,
+                GetCurrentProcess(),
+                &mut out,
+                0,
+                0, // bInheritHandle: the host's copy must not leak into children
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 {
+            bail!("DuplicateHandle failed: {}", last_error_text());
+        }
+        Ok(Self(out as isize))
     }
 }
 

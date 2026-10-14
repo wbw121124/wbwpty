@@ -19,6 +19,9 @@ use super::pe::{u16_at, u32_at, DataDirectory, IMAGE_NT_OPTIONAL_HDR64_MAGIC};
 use super::remote::{RemoteModule, RemoteProcess};
 
 const MAX_EXPORT_NAME: usize = 512;
+/// Upper bound on a module's export arrays; the largest system DLLs sit far
+/// below this, so anything larger means we mis-parsed the directory.
+const MAX_EXPORTS: usize = 0x10000;
 
 #[derive(Debug, Clone)]
 pub enum ExportTarget {
@@ -53,68 +56,80 @@ impl ExportTable {
 }
 
 /// Reads and indexes the export directory of a remote module.
+///
+/// Everything is fetched as its own `ReadProcessMemory` rather than as one
+/// blob: the three arrays are addressed by *absolute* RVA, and the name strings
+/// may live past `IMAGE_EXPORT_DIRECTORY.Size`, so a single window computed
+/// from `dir.size` is not guaranteed to cover them.
 pub fn load_exports(proc: &RemoteProcess, module: &RemoteModule) -> Result<ExportTable> {
     let Some(dir) = read_export_directory(proc, module)? else {
         return Ok(ExportTable::default());
     };
 
-    // Read a generous window: headers, arrays and name strings all live in it.
-    let window = dir.size.max(0x400) as usize;
-    let blob = proc
-        .read_bytes(module.base + dir.virtual_address as u64, window)
-        .with_context(|| format!("reading export directory of {}", module.base_name))?;
+    let base = module.base;
+    let at = |rva: u32, len: usize| -> Result<Vec<u8>> {
+        proc.read_bytes(base + rva as u64, len)
+            .with_context(|| format!("reading {:#x} bytes at rva {rva:#x} of {}", len, module.base_name))
+    };
 
-    let base_index = u32_at(&blob, 0x10)?;
-    let number_of_functions = u32_at(&blob, 0x14)? as usize;
-    let number_of_names = u32_at(&blob, 0x18)? as usize;
-    let functions_rva = u32_at(&blob, 0x1c)? as usize;
-    let names_rva = u32_at(&blob, 0x20)? as usize;
-    let ordinals_rva = u32_at(&blob, 0x24)? as usize;
+    // IMAGE_EXPORT_DIRECTORY header.
+    let header = at(dir.virtual_address, 0x28)?;
+    let base_index = u32_at(&header, 0x10)?;
+    let number_of_functions = u32_at(&header, 0x14)? as usize;
+    let number_of_names = u32_at(&header, 0x18)? as usize;
+    let functions_rva = u32_at(&header, 0x1c)?;
+    let names_rva = u32_at(&header, 0x20)?;
+    let ordinals_rva = u32_at(&header, 0x24)?;
 
-    if number_of_functions == 0 || number_of_functions > 0x10000 || number_of_names > 0x10000 {
-        bail!("implausible export counts in {}", module.base_name);
+    if number_of_functions == 0 || number_of_functions > MAX_EXPORTS {
+        bail!("implausible export function count {number_of_functions} in {}", module.base_name);
+    }
+    if number_of_names > MAX_EXPORTS {
+        bail!("implausible export name count {number_of_names} in {}", module.base_name);
     }
 
-    // The function address array is the one thing we always index directly.
-    let mut function_rvas = Vec::with_capacity(number_of_functions);
-    for i in 0..number_of_functions {
-        function_rvas.push(u32_at(&blob, functions_rva + i * 4)?);
-    }
+    let functions = at(functions_rva, number_of_functions * 4)?;
+    let names = at(names_rva, number_of_names * 4)?;
+    let ordinals = at(ordinals_rva, number_of_names * 2)?;
 
     let dir_start = dir.virtual_address;
     let dir_end = dir_start + dir.size;
-    let classify = |rva: u32| -> ExportTarget {
-        if rva >= dir_start && rva < dir_end {
+    let classify = |rva: u32| -> Result<ExportTarget> {
+        if (dir_start..dir_end).contains(&rva) {
             // Inside the export directory => ASCII forwarder string.
-            let at = rva as usize - dir_start as usize;
-            let end = blob[at..].iter().position(|&b| b == 0).unwrap_or(MAX_EXPORT_NAME - 1);
-            ExportTarget::Forwarder(
-                String::from_utf8_lossy(&blob[at..at + end.min(MAX_EXPORT_NAME)]).into_owned(),
-            )
+            let blob = at(rva, MAX_EXPORT_NAME)?;
+            let end = blob.iter().position(|&b| b == 0).unwrap_or(MAX_EXPORT_NAME);
+            Ok(ExportTarget::Forwarder(
+                String::from_utf8_lossy(&blob[..end]).into_owned(),
+            ))
         } else {
-            ExportTarget::Rva(rva)
+            Ok(ExportTarget::Rva(rva))
         }
     };
 
     let mut table = ExportTable::default();
-    for (index, rva) in function_rvas.iter().enumerate() {
-        if *rva == 0 {
+    for i in 0..number_of_functions {
+        let rva = u32_at(&functions, i * 4)?;
+        if rva == 0 {
             continue;
         }
-        if index < 0xffff {
-            let ordinal = (index as u32 + base_index) as u16;
-            table.by_ordinal.insert(ordinal, classify(*rva));
-        }
+        let ordinal = (i as u32 + base_index) as u16;
+        table.by_ordinal.insert(ordinal, classify(rva)?);
     }
 
     for i in 0..number_of_names {
-        let name_ptr = u32_at(&blob, names_rva + i * 4)?;
-        let ordinal_index = u16_at(&blob, ordinals_rva + i * 2)? as usize;
-        if ordinal_index >= function_rvas.len() {
+        let name_rva = u32_at(&names, i * 4)?;
+        let index = u16_at(&ordinals, i * 2)? as usize;
+        if index >= number_of_functions {
             continue;
         }
-        let name = read_cstr(&blob, name_ptr as usize)?;
-        table.by_name.insert(name, classify(function_rvas[ordinal_index]));
+        let blob = at(name_rva, MAX_EXPORT_NAME)?;
+        let end = blob.iter().position(|&b| b == 0).unwrap_or(0);
+        let name = String::from_utf8_lossy(&blob[..end]).into_owned();
+        let rva = u32_at(&functions, index * 4)?;
+        if rva != 0 {
+            table.by_name.insert(name, classify(rva)?);
+        }
     }
 
     Ok(table)
@@ -137,18 +152,14 @@ fn read_export_directory(
         return Ok(None);
     }
     let dir_off = oh + 0x70;
-    Ok(Some(DataDirectory {
-        virtual_address: u32_at(&head, dir_off)?,
-        size: u32_at(&head, dir_off + 4)?,
-    }))
-}
-
-fn read_cstr(blob: &[u8], at: usize) -> Result<String> {
-    let slice = blob
-        .get(at..at + MAX_EXPORT_NAME)
-        .ok_or_else(|| anyhow::anyhow!("export name at {at:#x} is outside the export window"))?;
-    let end = slice.iter().position(|&b| b == 0).unwrap_or(0);
-    Ok(String::from_utf8_lossy(&slice[..end]).into_owned())
+    let virtual_address = u32_at(&head, dir_off)?;
+    let size = u32_at(&head, dir_off + 4)?;
+    // Exes and data-only images leave the directory slot zeroed; that is "no
+    // exports", not an empty directory to be parsed.
+    if virtual_address == 0 || size < 0x28 {
+        return Ok(None);
+    }
+    Ok(Some(DataDirectory { virtual_address, size }))
 }
 
 /// Splits `KERNELBASE.WriteConsoleW` into `(module, symbol)`.

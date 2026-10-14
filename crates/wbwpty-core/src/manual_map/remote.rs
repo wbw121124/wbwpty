@@ -15,11 +15,14 @@
 use std::ffi::c_void;
 
 use anyhow::{bail, Context, Result};
-use windows_sys::Win32::Foundation::{HANDLE, TRUE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, TRUE};
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Memory::{
     VirtualAllocEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_FREE, MEM_RESERVE,
     PAGE_EXECUTE_READWRITE,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateRemoteThread, GetExitCodeThread, LPTHREAD_START_ROUTINE, WaitForSingleObject, INFINITE,
 };
 
 use crate::error::last_error_text;
@@ -279,6 +282,28 @@ impl RemoteProcess {
         Ok(p as u64)
     }
 
+    /// Reserves and commits exactly at `addr`, returning `None` when the
+    /// address is unavailable.
+    ///
+    /// Unlike [`Self::is_range_free`] this actually *commits* the pages, so the
+    /// caller can write to the result: a `MEM_FREE` region reported by
+    /// `VirtualQueryEx` is not writable until something reserves it.
+    pub fn reserve_at(&self, addr: u64, size: usize) -> Option<u64> {
+        // SAFETY: `addr` is a hint we are willing to move off; the handle is
+        // live. A null return just means the hint was unusable.
+        let p = unsafe {
+            VirtualAllocEx(
+                self.handle,
+                addr as *mut c_void,
+                size,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        };
+        // The allocator is free to ignore the hint, so trust what it returns.
+        (!p.is_null()).then_some(p as u64)
+    }
+
     /// True when `[addr, addr+size)` is unclaimed, which is what lets us try
     /// the preferred image base first and avoid relocating at all.
     pub fn is_range_free(&self, addr: u64, size: u64) -> bool {
@@ -337,8 +362,25 @@ impl RemoteProcess {
     /// Every list node is validated before it is followed, so a bogus link can
     /// only produce an error - never an infinite loop or a wild read.
     pub fn walk_modules(&self) -> Result<Vec<RemoteModule>> {
+        let modules = self.walk_modules_allow_empty()?;
+        if modules.is_empty() {
+            bail!("module list walk produced nothing");
+        }
+        if !Self::looks_like_a_real_module_list(&modules) {
+            bail!("PEB walk is missing ntdll.dll/kernel32.dll; offsets look wrong");
+        }
+        Ok(modules)
+    }
+
+    /// Same walk, but an empty list is returned as an empty `Vec` instead of an
+    /// error, because that is a legitimate state while the loader is still
+    /// starting up. Link validation is unchanged.
+    fn walk_modules_allow_empty(&self) -> Result<Vec<RemoteModule>> {
         let peb = self.peb()?;
         let ldr = self.read_u64(peb + PEB_LDR_OFFSET).context("reading PEB->Ldr")?;
+        if ldr == 0 {
+            return Ok(Vec::new());
+        }
         let head = ldr + PEB_LDR_IN_MEMORY_ORDER_LIST_OFFSET;
         let first = self.read_u64(head).context("reading InMemoryOrderModuleList.Flink")?;
 
@@ -379,17 +421,16 @@ impl RemoteProcess {
             }
         }
 
-        if modules.is_empty() {
-            bail!("module list walk produced nothing");
-        }
-        // A correct walk always contains these two; use it as the sanity check.
-        let has_ntdll = modules.iter().any(|m| m.base_name.eq_ignore_ascii_case("ntdll.dll"));
-        let has_kernel32 =
-            modules.iter().any(|m| m.base_name.eq_ignore_ascii_case("kernel32.dll"));
-        if !has_ntdll || !has_kernel32 {
-            bail!("PEB walk is missing ntdll.dll/kernel32.dll; offsets look wrong");
-        }
         Ok(modules)
+    }
+
+    /// A correct walk always contains these two; use it as the offset sanity
+    /// check. Split out of the walk itself because the loader publishes
+    /// `PEB->Ldr` before any entry exists, so this may only be applied once the
+    /// list is non-empty.
+    fn looks_like_a_real_module_list(modules: &[RemoteModule]) -> bool {
+        modules.iter().any(|m| m.base_name.eq_ignore_ascii_case("ntdll.dll"))
+            && modules.iter().any(|m| m.base_name.eq_ignore_ascii_case("kernel32.dll"))
     }
 
     fn read_u32(&self, addr: u64) -> Result<u32> {
@@ -445,6 +486,88 @@ impl RemoteProcess {
             }
         }
         bail!("could not allocate {size} bytes near {near:#x}: {}", last_error_text())
+    }
+
+    /// Blocks until the target's loader has mapped its imports.
+    ///
+    /// A `CREATE_SUSPENDED` target starts with `PEB->Ldr == NULL`; the kernel
+    /// builds that list inside `LdrpInitializeProcess`, which only the resumed
+    /// initial thread ever runs. Polling `PEB->Ldr` is therefore the signal
+    /// that import resolution in the host can be trusted - it is the moment the
+    /// "inject after loader init" strategy waits for (README 5.4).
+    ///
+    /// This replaces the old entry-point trampoline, which needed the entry
+    /// point itself to be writable and is fatal on `GUARD_CF` images.
+    pub fn wait_until_loader_ready(&self, timeout: std::time::Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            // Readiness means the list is populated *and* complete. Both
+            // conditions are racy during `LdrpInitializeProcess`: `PEB->Ldr`
+            // is published before any entry exists, and entries appear one by
+            // one as DLLs are mapped. So a walk that returns an empty or
+            // incomplete list is retried, not treated as a hard error.
+            match self.walk_modules_allow_empty() {
+                Ok(modules)
+                    if !modules.is_empty()
+                        && Self::looks_like_a_real_module_list(&modules) =>
+                {
+                    return Ok(())
+                }
+                Ok(_) => {
+                    if std::time::Instant::now() >= deadline {
+                        bail!(
+                            "target loader list never became complete within {}ms \
+                             (was the child resumed?)",
+                            timeout.as_millis()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(err) => return Err(err).context("reading the target module list"),
+            }
+        }
+    }
+
+    /// Runs `start_address` in the target on a new thread and waits for it to
+    /// return.
+    ///
+    /// `CreateRemoteThread` passes `(lpParameter, dwCreationFlags)` in
+    /// `rcx`/`rdx`, which is *not* the `DllMain(hinst, reason, reserved)`
+    /// signature, so the caller is expected to point this at a small trampoline
+    /// (see [`crate::manual_map::stub`]) rather than at the entry itself.
+    pub fn run_thread(&self, start_address: u64) -> Result<u32> {
+        let start: LPTHREAD_START_ROUTINE =
+            Some(unsafe { std::mem::transmute::<u64, unsafe extern "system" fn(*mut c_void) -> u32>(start_address) });
+        let mut thread_id = 0u32;
+        // SAFETY: `start` is machine code the host wrote into the target, and
+        // the process handle carries full access because we created it.
+        let thread = unsafe {
+            CreateRemoteThread(
+                self.handle,
+                std::ptr::null(),
+                0,
+                start,
+                std::ptr::null(),
+                0,
+                &mut thread_id,
+            )
+        };
+        if thread.is_null() {
+            bail!("CreateRemoteThread({start_address:#x}) failed: {}", last_error_text());
+        }
+
+        // SAFETY: valid handle; INFINITE is acceptable because the trampolines
+        // we run are bounded (map-and-return), never blocking on the target.
+        let wait = unsafe { WaitForSingleObject(thread, INFINITE) };
+        let mut code = 0u32;
+        // SAFETY: valid handles, `code` is a live local.
+        let ok = unsafe { GetExitCodeThread(thread, &mut code) };
+        // SAFETY: we own the thread handle.
+        unsafe { CloseHandle(thread) };
+        if wait != 0 || ok == 0 {
+            bail!("remote thread at {start_address:#x} failed (wait {wait}): {}", last_error_text());
+        }
+        Ok(code)
     }
 
     /// Reads a `UNICODE_STRING` (Length@0x00, MaximumLength@0x04, Buffer@0x08).

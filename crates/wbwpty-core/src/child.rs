@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeThread, ResumeThread, TerminateProcess, WaitForSingleObject,
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, INFINITE,
+    CreateProcessW, GetExitCodeProcess, GetExitCodeThread, ResumeThread, TerminateProcess,
+    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, INFINITE,
     PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
@@ -53,6 +53,19 @@ pub mod contract {
 /// Creation flags shared by every target launch.
 pub const TARGET_CREATION_FLAGS: u32 = DETACHED_PROCESS | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
 
+/// The three standard handles handed to the target at creation time.
+///
+/// Passing the real pipe handles through `STARTF_USESTDHANDLES` is what makes
+/// the redirection race free: `ucrtbase!__acrt_initialize_stdio` reads them
+/// with `GetStdHandle` on its very first call, so it can never observe a
+/// half-installed state no matter when the payload is mapped.
+#[derive(Debug, Clone, Copy)]
+pub struct Stdio {
+    pub stdin: HANDLE,
+    pub stdout: HANDLE,
+    pub stderr: HANDLE,
+}
+
 /// What to run and how to hand it its configuration.
 pub struct ChildSpec {
     pub program: OsString,
@@ -60,11 +73,20 @@ pub struct ChildSpec {
     /// Extra environment entries; they win over inherited ones.
     pub env: Vec<(String, String)>,
     pub cwd: Option<PathBuf>,
+    /// Standard handles to inherit; `None` starts the target with NULL std
+    /// handles, which is only useful for tests that never do I/O.
+    pub stdio: Option<Stdio>,
 }
 
 impl ChildSpec {
     pub fn new(program: impl Into<OsString>) -> Self {
-        Self { program: program.into(), args: Vec::new(), env: Vec::new(), cwd: None }
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+            stdio: None,
+        }
     }
 
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
@@ -88,6 +110,15 @@ impl ChildSpec {
 
     pub fn cwd(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cwd = Some(dir.into());
+        self
+    }
+
+    /// Hands the target these standard handles.
+    ///
+    /// The handles must be inheritable; see [`crate::pipe::PipePair`] for the
+    /// helper that opens pipe ends and marks them so.
+    pub fn stdio(mut self, stdio: Stdio) -> Self {
+        self.stdio = Some(stdio);
         self
     }
 
@@ -140,7 +171,11 @@ pub struct Child {
     thread: Handle,
     pub pid: u32,
     pub image: PathBuf,
+    resumed: std::sync::atomic::AtomicBool,
 }
+
+/// `GetExitCodeProcess` reports this for a process that has not exited.
+const STILL_ACTIVE: u32 = 259;
 
 impl Child {
     /// Creates the process suspended. Nothing in it has executed yet.
@@ -156,11 +191,17 @@ impl Child {
 
         let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
         si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-        // `STARTF_USESTDHANDLES` is deliberately *not* set: we do not inherit
-        // any handle, the injected DLL installs the pipes itself. Without this
-        // flag the child starts with NULL std handles, which is exactly the
-        // clean slate the DLL wants.
-        let _ = STARTF_USESTDHANDLES;
+
+        // Without a `Stdio` the target starts with NULL standard handles, which
+        // is only ever what a test wants. Real sessions always pass the pipes,
+        // which makes the redirection deterministic (see [`Stdio`]).
+        let inherit_handles = spec.stdio.is_some();
+        if let Some(stdio) = spec.stdio {
+            si.dwFlags = STARTF_USESTDHANDLES;
+            si.hStdInput = stdio.stdin;
+            si.hStdOutput = stdio.stdout;
+            si.hStdError = stdio.stderr;
+        }
 
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
@@ -172,7 +213,7 @@ impl Child {
                 command_line.as_mut_ptr(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                0, // bInheritHandles: nothing to inherit
+                if inherit_handles { 1 } else { 0 },
                 TARGET_CREATION_FLAGS,
                 environment.as_ptr() as *const c_void,
                 cwd_wide.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
@@ -196,19 +237,35 @@ impl Child {
             thread: Handle::from_raw(pi.hThread as isize),
             pid: pi.dwProcessId,
             image,
+            resumed: std::sync::atomic::AtomicBool::new(false),
         };
         Ok(child)
     }
 
     /// Lets the loader run. Everything the injected DLL prepared stays in
     /// place because nothing in the target has executed yet.
+    ///
+    /// Idempotent: the session owns the lifecycle and both the caller and
+    /// [`crate::manual_map::inject_into_child`] may want to make sure the
+    /// target is running.
     pub fn resume(&self) -> Result<()> {
+        if self.resumed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
         // SAFETY: `hThread` is the suspended primary thread we own.
         let previous = unsafe { ResumeThread(self.thread.as_raw() as HANDLE) };
         if previous == u32::MAX {
             bail!("ResumeThread failed: {}", last_error_text());
         }
         Ok(())
+    }
+
+    /// True while the target process has not exited yet.
+    pub fn is_running(&self) -> bool {
+        let mut code = 0u32;
+        // SAFETY: we own `process` and `code` is a live local.
+        let ok = unsafe { GetExitCodeProcess(self.process.as_raw() as HANDLE, &mut code) };
+        ok != 0 && code == STILL_ACTIVE
     }
 
     /// Waits for the target and returns its exit code.

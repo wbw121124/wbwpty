@@ -21,7 +21,10 @@
 use std::io;
 
 use anyhow::{bail, Result};
-use windows_sys::Win32::Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{
+    GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT};
@@ -302,6 +305,53 @@ impl PipePair {
     pub fn shutdown(&mut self) {
         // `PipeEnd` closes its handle on drop; nothing else to do here.
     }
+
+    /// Opens the client ends and marks them inheritable so they can be handed
+    /// to the target as its standard handles.
+    ///
+    /// The caller owns the returned handles and must close its copies once the
+    /// child exists: the child keeps its own, and EOF only propagates when the
+    /// last writer is gone.
+    pub fn open_target_stdio(&mut self) -> Result<InheritableStdio> {
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+
+        // The `-in` server is outbound (host writes), so the target reads.
+        let stdin = self.input.open_client(GENERIC_READ)?;
+        // The `-out` server is inbound (host reads), so the target writes; it
+        // serves both of the target's output streams.
+        let stdout = self.output.open_client(GENERIC_WRITE)?;
+        let stderr = stdout.duplicate()?;
+
+        for h in [&stdin, &stdout, &stderr] {
+            // SAFETY: handles come from `open_client`, which validated them.
+            let ok = unsafe {
+                SetHandleInformation(
+                    h.as_raw() as HANDLE,
+                    HANDLE_FLAG_INHERIT,
+                    HANDLE_FLAG_INHERIT,
+                )
+            };
+            if ok == 0 {
+                bail!("SetHandleInformation(HANDLE_FLAG_INHERIT) failed: {}", last_error_text());
+            }
+        }
+
+        Ok(InheritableStdio {
+            stdin: stdin.as_raw() as HANDLE,
+            stdout: stdout.as_raw() as HANDLE,
+            stderr: stderr.as_raw() as HANDLE,
+            _handles: vec![stdin, stdout, stderr],
+        })
+    }
+}
+
+/// Client ends of the session pipes, marked inheritable, together with the
+/// host's copies so they can be dropped once the child has them.
+pub struct InheritableStdio {
+    pub stdin: HANDLE,
+    pub stdout: HANDLE,
+    pub stderr: HANDLE,
+    _handles: Vec<Handle>,
 }
 
 /// NUL terminated UTF-16 for the `*W` Win32 entry points.
