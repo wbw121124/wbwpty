@@ -12,6 +12,8 @@
 //! * [`inspect`]     — process snapshots used to prove "no conhost.exe"
 
 pub mod error;
+pub mod pipe;
 
 pub use anyhow::{Error, Result};
 pub use error::Handle;
+pub use pipe::{PipePair, ReadEvent};
