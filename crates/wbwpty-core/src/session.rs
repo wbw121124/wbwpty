@@ -80,6 +80,8 @@ pub struct Session {
     pipes: Arc<SharedPipes>,
     config: SessionConfig,
     report: Option<InjectionReport>,
+    /// RVA of the payload's exported WBWPTY_STATUS word, resolved at start.
+    status_rva: Option<u32>,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -131,11 +133,22 @@ impl Session {
             }
         };
 
+        // Resolve the status word RVA once so `payload_status()` can read it later.
+        let dll_path = config
+            .dll
+            .clone()
+            .or_else(|| std::env::var("WBWPTY_DLL").ok().map(std::path::PathBuf::from))
+            .unwrap_or_else(default_dll_path);
+        let status_rva = std::fs::read(&dll_path)
+            .ok()
+            .and_then(|file| crate::manual_map::find_export_rva(&file, "WBWPTY_STATUS").ok().flatten());
+
         let session = Self {
             child,
             pipes: Arc::new(SharedPipes::new(pipes)),
             config,
             report,
+            status_rva,
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
         session.start_input_pump();
@@ -145,6 +158,19 @@ impl Session {
     /// The payload report, present only when the DLL mapped successfully.
     pub fn report(&self) -> Option<&InjectionReport> {
         self.report.as_ref()
+    }
+
+    /// Reads the payload's `WBWPTY_STATUS` word out of the target.
+    ///
+    /// The injected thread dies on an exception when the attach path faults, and
+    /// that tells us nothing about *where*; the status word is how far it got.
+    pub fn payload_status(&self) -> Option<u32> {
+        use crate::manual_map::remote::RemoteProcess;
+        let report = self.report.as_ref()?;
+        let rva = self.status_rva?;
+        let proc = RemoteProcess::new(self.child.process_handle());
+        let bytes = proc.read_bytes(report.image_base + rva as u64, 4).ok()?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
     }
 
     pub fn pid(&self) -> u32 {
@@ -370,16 +396,118 @@ mod tests {
     /// trampoline was removed.
     #[test]
     fn payload_maps_into_a_live_target() {
-        let spec = ChildSpec::new("cmd.exe"); // interactive, blocks on stdin
-        let config = SessionConfig { shim: false, ..Default::default() };
+        let mut pipes = crate::pipe::PipePair::new(0x11_0005).unwrap();
+        let mut stdio = pipes.open_target_stdio().unwrap();
+        let spec = ChildSpec::new("cmd.exe").stdio(Stdio {
+            stdin: stdio.stdin,
+            stdout: stdio.stdout,
+            stderr: stdio.stderr,
+        });
+        let config = SessionConfig { shim: false, verbose: true, inject: true, ..Default::default() };
         let session = Session::start(&spec, config).unwrap();
 
-        let report = session
-            .report()
+        let report = session.report();
+        eprintln!("DIAG inject={}", config.inject);
+        eprintln!("DIAG report={:?}", report.map(|r| r.image_base));
+        eprintln!("DIAG status={:#x}", session.payload_status().unwrap_or(0));
+        eprintln!("DIAG child_running={}", session.child.is_running());
+        let report = report
             .expect("payload should map into a running cmd.exe");
         assert!(report.image_base != 0);
         assert!(report.patch_count > 0, "imports must be resolved");
         assert!(session.child.is_running(), "target survived DllMain");
+
+        session.shutdown();
+    }
+
+    /// The `ConsoleHandle` sentinel must actually be in the target's PEB.
+    ///
+    /// This is the mechanism that stops descendants from being allocated a
+    /// console (and therefore from spawning `conhost.exe`), so it is asserted
+    /// directly on the target's own `RTL_USER_PROCESS_PARAMETERS` rather than
+    /// inferred from a process count - a count measured from inside the test
+    /// harness is polluted by whatever console the harness itself runs in.
+    #[test]
+    fn payload_makes_the_target_look_like_it_has_a_console() {
+        let log = std::env::temp_dir().join("wbwpty-test-console.log");
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::write(&log, b"");
+
+        let spec = ChildSpec::new("cmd.exe");
+        let config = SessionConfig {
+            shim: false,
+            log_path: Some(log.clone()),
+            ..Default::default()
+        };
+        let session = Session::start(&spec, config).unwrap();
+        let report = session
+            .report()
+            .expect("payload must map before its PEB patch can be observed");
+        eprintln!(
+            "DIAG image_base={:#x} entry_rva={:#x} patches={} modules={} wait={}ms",
+            report.image_base,
+            report.entry_rva,
+            report.patch_count,
+            report.module_count,
+            report.loader_wait_ms
+        );
+
+        let proc = crate::manual_map::remote::RemoteProcess::new(session.child.process_handle());
+        let handle = proc.console_handle().expect("target process parameters are readable");
+        let dll_log = std::fs::read_to_string(&log).unwrap_or_default();
+        eprintln!("DIAG console_handle={handle:#x}");
+        eprintln!("DIAG log={dll_log:?}");
+        eprintln!("DIAG status={:#x}", session.payload_status().unwrap_or(0));
+        assert_ne!(
+            handle, 0,
+            "ConsoleHandle must be non-null or descendants get a real console; \
+             payload log was:\n{dll_log}"
+        );
+
+        session.shutdown();
+    }
+
+    /// End to end: a grandchild spawned by the target must write to our pipe.
+    ///
+    /// The target is an interactive `cmd.exe` that is blocked reading its
+    /// (never written) stdin, which makes the ordering deterministic: injection
+    /// completes first, and only then is a command fed in. Feeding a command to
+    /// `cmd /c` immediately would race the injection and prove nothing.
+    ///
+    /// `conhost.exe` is deliberately *not* counted here: the test harness itself
+    /// runs in a console, so the machine-wide count moves for reasons unrelated
+    /// to the target. The no-console-host claim is verified by the CLI's
+    /// `--dump-conhost` acceptance run instead, where the surroundings are known.
+    #[test]
+    fn grandchild_output_reaches_the_pipe() {
+        let spec = ChildSpec::new("cmd.exe");
+        let config = SessionConfig { shim: false, ..Default::default() };
+        let session = Session::start(&spec, config).unwrap();
+        session
+            .report()
+            .expect("payload must map before the descendant behaviour is meaningful");
+
+        let _ = session
+            .pipes
+            .with(|p| p.input().write_all(b"cmd.exe /c echo wbwpty-grandchild-ok\r\n"))
+            .expect("pipe write");
+
+        // Read until the grandchild's line shows up.
+        let mut buf = [0u8; 4096];
+        let mut text = String::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline && !text.contains("wbwpty-grandchild-ok") {
+            match session.pipes.with(|p| p.output().read(&mut buf, 200)).unwrap() {
+                Ok(ReadEvent::Data(n)) => text.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Ok(ReadEvent::Eof) => break,
+                Ok(ReadEvent::Timeout) => {}
+                Err(e) => panic!("output read failed: {e:#}"),
+            }
+        }
+        assert!(
+            text.contains("wbwpty-grandchild-ok"),
+            "grandchild output never arrived; saw {text:?}"
+        );
 
         session.shutdown();
     }

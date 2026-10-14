@@ -32,6 +32,23 @@ use ffi::{HINSTANCE, DWORD};
 #[no_mangle]
 pub static mut WBWPTY_STATUS: u32 = 0;
 
+/// Marks the image as live. Written by [`wbwpty_probe`] so the host can tell
+/// "the image mapped and its code runs" from "the image is present but its code
+/// faults", which is otherwise indistinguishable from a silent failure.
+pub const PROBE_MARKER: u32 = 0xc0de_cafe;
+
+/// Bisect entry point: touches nothing but the payload's own writable data.
+///
+/// If the host can read [`PROBE_MARKER`] back out of the target after mapping
+/// this as the entry, the manual mapper produced a working image. If it cannot,
+/// the fault is in the mapping (relocations, sections, or the call itself) and
+/// not in whatever [`DllMain`] happens to do.
+#[no_mangle]
+pub extern "system" fn wbwpty_probe() -> i32 {
+    unsafe { WBWPTY_STATUS = PROBE_MARKER };
+    0
+}
+
 pub const WBWPTY_STATUS_IDLE: u32 = 0;
 pub const WBWPTY_STATUS_OK: u32 = 1;
 pub const WBWPTY_STATUS_NO_PIPE_IN: u32 = 2;
@@ -41,19 +58,18 @@ pub const WBWPTY_STATUS_NO_PIPE_OUT: u32 = 3;
 /// is loaded normally with `LoadLibrary`).
 #[no_mangle]
 pub extern "system" fn DllMain(_hinst: HINSTANCE, reason: DWORD, _reserved: *mut c_void) -> i32 {
+    // Record the args so the host can verify the stub passed them correctly,
+    // and exercise the same code path the real attach would.
+    unsafe {
+        WBWPTY_STATUS = PROBE_MARKER | (reason << 8) | ((_hinst as usize & 0xff) as u32);
+    }
     match reason {
         ffi::DLL_PROCESS_ATTACH => {
-            // `DisableThreadLibraryCalls` is intentionally *not* called: we
-            // start our own worker thread and want the attach notification for
-            // a possible late-attach repair pass.
             crate::stdio::install();
         }
         ffi::DLL_THREAD_ATTACH | ffi::DLL_THREAD_DETACH | ffi::DLL_PROCESS_DETACH => {}
         _ => {}
     }
-
-    // Always TRUE: returning FALSE would make the loader unload us and can kill
-    // the target process when we were manually mapped by the host.
     ffi::TRUE
 }
 

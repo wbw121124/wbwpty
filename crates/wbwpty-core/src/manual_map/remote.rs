@@ -33,6 +33,11 @@ use crate::error::last_error_text;
 // (ProcessParameters).
 const PEB_IMAGE_BASE_OFFSET: u64 = 0x10;
 const PEB_LDR_OFFSET: u64 = 0x18;
+// PEB.ProcessParameters@0x20 (the four leading single-byte fields push the first
+// pointer to 0x08, ImageBaseAddress to 0x10, Ldr to 0x18).
+const PEB_PROCESS_PARAMETERS_OFFSET: u64 = 0x20;
+// RTL_USER_PROCESS_PARAMETERS.ConsoleHandle@0x10 (four ULONGs precede it).
+const PROCESS_PARAMETERS_CONSOLE_HANDLE_OFFSET: u64 = 0x10;
 // x64 PEB_LDR_DATA: Length@0x00 Initialized@0x04 SsHandle@0x08
 // InLoadOrderModuleList@0x10 InMemoryOrderModuleList@0x20
 // InInitializationOrderModuleList@0x30 EntryInProgress@0x40
@@ -475,12 +480,28 @@ impl RemoteProcess {
         Ok(self.read_u64(peb + PEB_LDR_OFFSET)? == 0)
     }
 
-    /// `PEB->ImageBaseAddress`: where the loader mapped the executable itself.
-    /// Available even while the process is suspended, because the kernel does
-    /// that mapping inside `NtCreateUserProcess`.
+/// `PEB->ImageBaseAddress`: where the loader mapped the executable itself.
+/// Available even while the process is suspended, because the kernel does
+/// that mapping inside `NtCreateUserProcess`.
     pub fn image_base(&self) -> Result<u64> {
         let peb = self.peb()?;
         self.read_u64(peb + PEB_IMAGE_BASE_OFFSET)
+    }
+
+    /// The target's `PEB->ProcessParameters->ConsoleHandle`.
+    ///
+    /// Read from the host so the "no console host for descendants" claim can be
+    /// asserted directly instead of inferred. A null value means the target
+    /// believes it has no console and will allocate one for anything it spawns.
+    pub fn console_handle(&self) -> Result<u64> {
+        let peb = self.peb()?;
+        // SAFETY: our own offsets, validated by the target-side self test; every
+        // read is bounds-checked by ReadProcessMemory failing loudly.
+        let params = self.read_u64(peb + PEB_PROCESS_PARAMETERS_OFFSET)?;
+        if params == 0 {
+            bail!("target has no RTL_USER_PROCESS_PARAMETERS");
+        }
+        self.read_u64(params + PROCESS_PARAMETERS_CONSOLE_HANDLE_OFFSET)
     }
 
     /// Reserves `size` bytes as close to `near` as possible.

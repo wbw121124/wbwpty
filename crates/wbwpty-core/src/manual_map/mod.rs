@@ -103,7 +103,7 @@ pub fn inject_bytes(child: &Child, image: &[u8], entry_symbol: &str) -> Result<I
     // `CreateRemoteThread` start routine (that would pass `rcx=lpParameter`,
     // `rdx=flags`), so we reuse the already unit-tested stub with an empty
     // patch list: all it does is set up the three arguments and call through.
-    let job = stub::build_job(base, entry_rva, &[]);
+    let job = stub::build_job(base, entry_rva);
     let job_addr = proc.allocate(job.len())?;
     proc.write_bytes(job_addr, &job)?;
     let stub_addr = proc.allocate(stub::build_stub(0).len())?;
@@ -208,7 +208,7 @@ fn resolve_entry_rva(pe: &PeImage, image: &[u8], entry_symbol: &str) -> Result<u
 ///
 /// Everything is read through [`PeImage::read_rva`] because export data lives
 /// in sections, where an RVA is not a file offset.
-fn find_export_rva(image: &[u8], name: &str) -> Result<Option<u32>> {
+pub fn find_export_rva(image: &[u8], name: &str) -> Result<Option<u32>> {
     let pe = PeImage::parse(image)?;
     let Some(dir) = pe.info.directory(pe::DIRECTORY_ENTRY_EXPORT) else {
         return Ok(None);
@@ -533,7 +533,12 @@ mod tests {
                 // `jmp self`: reaching it would hang instead of exiting cleanly,
                 // so a clean exit proves the entry point was never executed.
                 proc.write_bytes(scratch, &[0xeb, 0xfe]).unwrap();
-                let patch = stub::build_entry_patch(scratch, oep).unwrap();
+                // Hand-assemble `E9 rel32`; the encoder that used to live here
+                // went away with the dispatcher, and this test is about the
+                // *consequence* of patching, not about encoding it.
+                let rel = (scratch as i64 - (oep as i64 + 5)) as i32;
+                let mut patch = [0xe9u8; 5];
+                patch[1..].copy_from_slice(&rel.to_le_bytes());
                 proc.write_bytes(oep, &patch).unwrap();
             }
 
@@ -569,6 +574,50 @@ mod tests {
             "rewriting the entry point must not be assumed to work: see README 5.3"
         );
     }
+    /// Bisect probe: mapping the image and running a trivial export must work.
+    ///
+    /// `wbwpty_probe` only stores a magic into the payload's own data, so a
+    /// failure here localises the fault to the manual map itself (relocations,
+    /// section copying, or the remote call) rather than to anything `DllMain`
+    /// does.
+    #[test]
+    fn mapped_image_runs_a_trivial_export() {
+        use crate::manual_map::remote::RemoteProcess;
+
+        let Some(dll) = payload_dll_path() else {
+            eprintln!("skipping: wbwpty_redirect.dll not built yet");
+            return;
+        };
+        let file = std::fs::read(&dll).unwrap();
+        let pe = PeImage::parse(&file).unwrap();
+        let status_rva = find_export_rva(&file, "WBWPTY_STATUS")
+            .expect("payload must export WBWPTY_STATUS")
+            .expect("WBWPTY_STATUS must be in the export table");
+
+                // The target must outlive the injection, and a `cmd.exe` with no stdin
+        // exits immediately, so it gets a pipe nobody ever writes to.
+        let mut pipes = crate::pipe::PipePair::new(0x11_0004).unwrap();
+        let mut stdio = pipes.open_target_stdio().unwrap();
+        let child = Child::spawn(&ChildSpec::new("cmd.exe").stdio(Stdio {
+            stdin: stdio.stdin,
+            stdout: stdio.stdout,
+            stderr: stdio.stderr,
+        }))
+        .unwrap();
+        stdio.release();
+        let report = inject_into_child(&child, &dll, "wbwpty_probe").expect("probe injection");
+
+        let proc = RemoteProcess::new(child.process_handle());
+        let value = proc.read_bytes(report.image_base + status_rva as u64, 4).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(value.try_into().unwrap()),
+            0xc0de_cafe,
+            "probe ran but left the wrong marker"
+        );
+        assert!(child.is_running(), "target survived");
+        let _ = child.terminate();
+    }
+
     /// Locates `wbwpty_redirect.dll` next to the test executable (cargo puts unit
     /// test binaries in `target/<profile>/deps`, the payload in
     /// `target/<profile>`).
