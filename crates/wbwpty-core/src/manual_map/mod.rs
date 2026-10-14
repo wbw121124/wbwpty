@@ -57,8 +57,8 @@ pub struct InjectionReport {
 /// (`DllMainCRTStartup`, from mingw) expects an initialised C runtime, which a
 /// manually mapped image has not had.
 pub fn inject_dll(child: &Child, dll: &Path, entry_symbol: &str) -> Result<InjectionReport> {
-    let file = std::fs::read(dll)
-        .with_context(|| format!("reading redirect DLL {}", dll.display()))?;
+    let file =
+        std::fs::read(dll).with_context(|| format!("reading redirect DLL {}", dll.display()))?;
     inject_bytes(child, &file, entry_symbol)
 }
 
@@ -70,27 +70,33 @@ pub fn inject_bytes(child: &Child, image: &[u8], entry_symbol: &str) -> Result<I
     let proc = RemoteProcess::new(child.process_handle());
     let pe = PeImage::parse(image)?;
     if !pe.info.is_dll {
-        bail!("{} is not a DLL (IMAGE_FILE_DLL is not set)", child_image_hint(image));
+        bail!(
+            "{} is not a DLL (IMAGE_FILE_DLL is not set)",
+            child_image_hint(image)
+        );
     }
     let entry_rva = resolve_entry_rva(&pe, image, entry_symbol)?;
 
-    // Wait for `LdrpInitializeProcess` to publish `PEB->Ldr`. That single event
-    // is the whole synchronisation problem solved: before it the target has
-    // nothing mapped to resolve imports against, and we are not allowed to
+    // Wait for `LdrpInitializeProcess` to finish linking modules. That single
+    // event is the whole synchronisation problem solved: before it the target
+    // has nothing mapped to resolve imports against, and we are not allowed to
     // hook the entry point to catch the moment (README 5.3).
     let loader_wait = std::time::Duration::from_secs(10);
     let started = std::time::Instant::now();
-    proc.wait_until_loader_ready(loader_wait)
+    let modules = proc
+        .stable_modules(loader_wait, std::time::Duration::from_millis(50))
         .with_context(|| format!("waiting for the loader in pid {}", child.pid))?;
     let loader_wait_ms = started.elapsed().as_millis() as u64;
 
-    let modules = RemoteModules::discover(&proc)?;
+    // The settled snapshot is the one we resolve against: walking again would
+    // race the target loading more DLLs.
+    let discovered = RemoteModules::from_snapshot(modules);
     let (base, reloc_delta) = allocate_image(&proc, &pe)?;
     let mut mapped = pe.map(reloc_delta)?;
     // Imports are written straight into the mapped image, so the payload is
     // fully self-contained by the time `DllMain` is called and the in-target
     // trampoline only has to make the call.
-    let patch_count = resolve_imports(&proc, &modules, &pe, &mut mapped)?;
+    let patch_count = resolve_imports(&proc, &discovered, &pe, &mut mapped)?;
     proc.write_bytes(base, &mapped)?;
 
     // `DllMain(hinst, DLL_PROCESS_ATTACH, NULL)` cannot be expressed as a
@@ -112,8 +118,8 @@ pub fn inject_bytes(child: &Child, image: &[u8], entry_symbol: &str) -> Result<I
         entry_rva,
         patch_count,
         reloc_delta,
-        module_count: modules.len(),
-        module_source: modules.source(),
+        module_count: discovered.len(),
+        module_source: discovered.source(),
         loader_wait_ms,
     })
 }
@@ -127,7 +133,6 @@ pub fn inject_into_child(child: &Child, dll: &Path, entry_symbol: &str) -> Resul
     child.resume()?;
     inject_dll(child, dll, entry_symbol)
 }
-
 
 /// Reserves the mapped base and returns it with the relocation delta it implies.
 ///
@@ -227,8 +232,10 @@ fn find_export_rva(image: &[u8], name: &str) -> Result<Option<u32>> {
         let entry = pe.read_rva_clamped(name_ptr, 512)?;
         let end = entry.iter().position(|&b| b == 0).unwrap_or(0);
         if &entry[..end] == name.as_bytes() {
-            let rva =
-                pe::u32_at(pe.read_rva(functions_rva + (ordinal_index as u32) * 4, 4)?, 0)?;
+            let rva = pe::u32_at(
+                pe.read_rva(functions_rva + (ordinal_index as u32) * 4, 4)?,
+                0,
+            )?;
             return Ok(Some(rva));
         }
     }
@@ -277,13 +284,17 @@ fn resolve_imports(
             format!("resolving imports of {module_name} (descriptor {descriptor_rva:#x})")
         })?;
 
-// IMAGE_THUNK_DATA64 is exactly one u64 wide: AddressOfData (or the
-            // ordinal flag) followed by the reserved slot that only exists as a
-            // separate field in the 32-bit layout.
-            let lookup_rva = if original_first_thunk != 0 { original_first_thunk } else { first_thunk };
-            let mut index = 0usize;
-            loop {
-                let thunk_off = lookup_rva as usize + index * THUNK_SIZE;
+        // IMAGE_THUNK_DATA64 is exactly one u64 wide: AddressOfData (or the
+        // ordinal flag) followed by the reserved slot that only exists as a
+        // separate field in the 32-bit layout.
+        let lookup_rva = if original_first_thunk != 0 {
+            original_first_thunk
+        } else {
+            first_thunk
+        };
+        let mut index = 0usize;
+        loop {
+            let thunk_off = lookup_rva as usize + index * THUNK_SIZE;
             let value = pe::u64_at(mapped, thunk_off)?;
             if value == 0 {
                 break;
@@ -342,7 +353,11 @@ struct ImportResolver<'a> {
 
 impl<'a> ImportResolver<'a> {
     fn new(proc: &'a RemoteProcess, modules: &'a RemoteModules) -> Self {
-        Self { proc, modules, exports: HashMap::new() }
+        Self {
+            proc,
+            modules,
+            exports: HashMap::new(),
+        }
     }
 
     fn module_base_for(&mut self, name: &str) -> Result<u64> {
@@ -375,12 +390,7 @@ impl<'a> ImportResolver<'a> {
         self.resolve_depth(base, what, 0)
     }
 
-    fn resolve_depth(
-        &mut self,
-        base: u64,
-        what: &exports::ImportBy,
-        depth: u32,
-    ) -> Result<u64> {
+    fn resolve_depth(&mut self, base: u64, what: &exports::ImportBy, depth: u32) -> Result<u64> {
         if depth > 4 {
             bail!("forwarder chain too deep for {}", what.describe());
         }
@@ -395,9 +405,9 @@ impl<'a> ImportResolver<'a> {
             exports::ExportTarget::Rva(rva) => Ok(base + rva as u64),
             exports::ExportTarget::Forwarder(text) => {
                 let (dll, symbol) = exports::split_forwarder(&text)?;
-                let target = self.module_base_for(&dll).with_context(|| {
-                    format!("forwarder {text} points at an unmapped module")
-                })?;
+                let target = self
+                    .module_base_for(&dll)
+                    .with_context(|| format!("forwarder {text} points at an unmapped module"))?;
                 self.resolve_depth(target, &exports::ImportBy::Name(symbol), depth + 1)
             }
         }
@@ -412,7 +422,7 @@ mod tests {
     /// `GetExitCodeProcess` reports this for a process that has not exited yet.
     const STILL_ACTIVE: u32 = 259;
 
-/// A full round trip against a real child process: parse the built DLL, map
+    /// A full round trip against a real child process: parse the built DLL, map
     /// it, and run its `DllMain`.
     ///
     /// The target is an interactive `cmd.exe` whose stdin is a pipe nobody ever
@@ -440,12 +450,22 @@ mod tests {
         let report = inject_into_child(&child, &dll, "DllMain").expect("manual map failed");
 
         assert!(report.image_base != 0, "image must be mapped somewhere");
-        assert!(report.patch_count > 0, "KERNEL32/msvcrt imports must be patched");
+        assert!(
+            report.patch_count > 0,
+            "KERNEL32/msvcrt imports must be patched"
+        );
         assert!(report.entry_rva != 0);
-        assert_eq!(report.module_source, ModuleSource::Peb, "imports come from the target PEB");
+        assert_eq!(
+            report.module_source,
+            ModuleSource::Peb,
+            "imports come from the target PEB"
+        );
 
         // The payload must not have taken the target down with it.
-        assert!(child.is_running(), "target died after the payload's DllMain ran");
+        assert!(
+            child.is_running(),
+            "target died after the payload's DllMain ran"
+        );
         child.terminate().unwrap();
     }
 
@@ -473,7 +493,9 @@ mod tests {
             .expect("loader never initialised in the target");
 
         let modules = proc.walk_modules().unwrap();
-        assert!(modules.iter().any(|m| m.base_name.eq_ignore_ascii_case("kernel32.dll")));
+        assert!(modules
+            .iter()
+            .any(|m| m.base_name.eq_ignore_ascii_case("kernel32.dll")));
         let _ = child.terminate();
     }
 
@@ -500,8 +522,7 @@ mod tests {
         use crate::manual_map::remote::RemoteProcess;
 
         let run = |patch_entry: bool| -> u32 {
-            let child =
-                Child::spawn(&ChildSpec::new("cmd.exe").args(["/c", "exit", "0"])).unwrap();
+            let child = Child::spawn(&ChildSpec::new("cmd.exe").args(["/c", "exit", "0"])).unwrap();
             let proc = RemoteProcess::new(child.process_handle());
             if patch_entry {
                 let image_base = proc.image_base().unwrap();
@@ -537,15 +558,17 @@ mod tests {
             exit
         };
 
-        assert_eq!(run(false), 0, "an untouched suspended target runs to completion");
+        assert_eq!(
+            run(false),
+            0,
+            "an untouched suspended target runs to completion"
+        );
         assert_ne!(
             run(true),
             0,
             "rewriting the entry point must not be assumed to work: see README 5.3"
         );
     }
-
-
     /// Locates `wbwpty_redirect.dll` next to the test executable (cargo puts unit
     /// test binaries in `target/<profile>/deps`, the payload in
     /// `target/<profile>`).
@@ -555,6 +578,9 @@ mod tests {
             exe.with_file_name("wbwpty_redirect.dll"),
             exe.parent()?.join("..").join("wbwpty_redirect.dll"),
         ];
-        candidates.iter().find(|c| c.is_file()).map(|c| c.canonicalize().unwrap_or_else(|_| c.clone()))
+        candidates
+            .iter()
+            .find(|c| c.is_file())
+            .map(|c| c.canonicalize().unwrap_or_else(|_| c.clone()))
     }
 }

@@ -68,8 +68,12 @@ pub fn load_exports(proc: &RemoteProcess, module: &RemoteModule) -> Result<Expor
 
     let base = module.base;
     let at = |rva: u32, len: usize| -> Result<Vec<u8>> {
-        proc.read_bytes(base + rva as u64, len)
-            .with_context(|| format!("reading {:#x} bytes at rva {rva:#x} of {}", len, module.base_name))
+        proc.read_bytes(base + rva as u64, len).with_context(|| {
+            format!(
+                "reading {:#x} bytes at rva {rva:#x} of {}",
+                len, module.base_name
+            )
+        })
     };
 
     // IMAGE_EXPORT_DIRECTORY header.
@@ -82,10 +86,16 @@ pub fn load_exports(proc: &RemoteProcess, module: &RemoteModule) -> Result<Expor
     let ordinals_rva = u32_at(&header, 0x24)?;
 
     if number_of_functions == 0 || number_of_functions > MAX_EXPORTS {
-        bail!("implausible export function count {number_of_functions} in {}", module.base_name);
+        bail!(
+            "implausible export function count {number_of_functions} in {}",
+            module.base_name
+        );
     }
     if number_of_names > MAX_EXPORTS {
-        bail!("implausible export name count {number_of_names} in {}", module.base_name);
+        bail!(
+            "implausible export name count {number_of_names} in {}",
+            module.base_name
+        );
     }
 
     let functions = at(functions_rva, number_of_functions * 4)?;
@@ -159,7 +169,10 @@ fn read_export_directory(
     if virtual_address == 0 || size < 0x28 {
         return Ok(None);
     }
-    Ok(Some(DataDirectory { virtual_address, size }))
+    Ok(Some(DataDirectory {
+        virtual_address,
+        size,
+    }))
 }
 
 /// Splits `KERNELBASE.WriteConsoleW` into `(module, symbol)`.

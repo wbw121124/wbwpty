@@ -22,7 +22,7 @@ use windows_sys::Win32::System::Memory::{
     PAGE_EXECUTE_READWRITE,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateRemoteThread, GetExitCodeThread, LPTHREAD_START_ROUTINE, WaitForSingleObject, INFINITE,
+    CreateRemoteThread, GetExitCodeThread, WaitForSingleObject, INFINITE, LPTHREAD_START_ROUTINE,
 };
 
 use crate::error::last_error_text;
@@ -118,18 +118,34 @@ pub struct RemoteModules {
 }
 
 impl RemoteModules {
+    /// Wraps a snapshot that the caller already knows is settled.
+    ///
+    /// Preferred over [`Self::discover`] whenever the snapshot was taken with
+    /// [`RemoteProcess::stable_modules`], because walking the list a second time
+    /// races a target that is still loading DLLs.
+    pub fn from_snapshot(modules: Vec<RemoteModule>) -> Self {
+        Self {
+            source: ModuleSource::Peb,
+            modules,
+        }
+    }
+
     /// Prefers the PEB walk and falls back to the shared system mapping.
     pub fn discover(proc: &RemoteProcess) -> Result<Self> {
         match proc.walk_modules() {
-            Ok(modules) => {
-                Ok(Self { source: ModuleSource::Peb, modules })
-            }
+            Ok(modules) => Ok(Self {
+                source: ModuleSource::Peb,
+                modules,
+            }),
             Err(peb_error) => {
                 // Only the "no loader yet" case is acceptable to fall back
                 // from; anything else (implausible links, missing known DLLs)
                 // means our offsets are wrong and we must not paper over it.
                 if proc.peb_ldr_is_null()? {
-                    Ok(Self { source: ModuleSource::HostShared, modules: Vec::new() })
+                    Ok(Self {
+                        source: ModuleSource::HostShared,
+                        modules: Vec::new(),
+                    })
                 } else {
                     Err(peb_error)
                 }
@@ -179,9 +195,7 @@ impl RemoteModules {
         // address, otherwise a write would corrupt it.
         let magic = proc.read_bytes(host_base, 2)?;
         if &magic != b"MZ" {
-            bail!(
-                "host base {host_base:#x} for {name} does not map to an image in the target"
-            );
+            bail!("host base {host_base:#x} for {name} does not map to an image in the target");
         }
         Ok(host_base)
     }
@@ -225,7 +239,10 @@ impl RemoteProcess {
             )
         };
         if ok == 0 || got != len {
-            bail!("ReadProcessMemory({addr:#x}, {len}) failed: {}", last_error_text());
+            bail!(
+                "ReadProcessMemory({addr:#x}, {len}) failed: {}",
+                last_error_text()
+            );
         }
         Ok(buf)
     }
@@ -377,12 +394,16 @@ impl RemoteProcess {
     /// starting up. Link validation is unchanged.
     fn walk_modules_allow_empty(&self) -> Result<Vec<RemoteModule>> {
         let peb = self.peb()?;
-        let ldr = self.read_u64(peb + PEB_LDR_OFFSET).context("reading PEB->Ldr")?;
+        let ldr = self
+            .read_u64(peb + PEB_LDR_OFFSET)
+            .context("reading PEB->Ldr")?;
         if ldr == 0 {
             return Ok(Vec::new());
         }
         let head = ldr + PEB_LDR_IN_MEMORY_ORDER_LIST_OFFSET;
-        let first = self.read_u64(head).context("reading InMemoryOrderModuleList.Flink")?;
+        let first = self
+            .read_u64(head)
+            .context("reading InMemoryOrderModuleList.Flink")?;
 
         let mut modules = Vec::with_capacity(64);
         let mut node = first;
@@ -402,7 +423,12 @@ impl RemoteProcess {
             let full_name = self.read_unicode_string(entry + LDR_ENTRY_FULL_DLL_NAME_OFFSET)?;
             let base_name = self.read_unicode_string(entry + LDR_ENTRY_BASE_DLL_NAME_OFFSET)?;
 
-            modules.push(RemoteModule { base, size, full_name, base_name });
+            modules.push(RemoteModule {
+                base,
+                size,
+                full_name,
+                base_name,
+            });
 
             let blink = self.read_u64(node + 8)?;
             if blink != previous {
@@ -429,8 +455,12 @@ impl RemoteProcess {
     /// `PEB->Ldr` before any entry exists, so this may only be applied once the
     /// list is non-empty.
     fn looks_like_a_real_module_list(modules: &[RemoteModule]) -> bool {
-        modules.iter().any(|m| m.base_name.eq_ignore_ascii_case("ntdll.dll"))
-            && modules.iter().any(|m| m.base_name.eq_ignore_ascii_case("kernel32.dll"))
+        modules
+            .iter()
+            .any(|m| m.base_name.eq_ignore_ascii_case("ntdll.dll"))
+            && modules
+                .iter()
+                .any(|m| m.base_name.eq_ignore_ascii_case("kernel32.dll"))
     }
 
     fn read_u32(&self, addr: u64) -> Result<u32> {
@@ -485,47 +515,59 @@ impl RemoteProcess {
                 }
             }
         }
-        bail!("could not allocate {size} bytes near {near:#x}: {}", last_error_text())
+        bail!(
+            "could not allocate {size} bytes near {near:#x}: {}",
+            last_error_text()
+        )
     }
 
-    /// Blocks until the target's loader has mapped its imports.
+    /// Blocks until the target's module list has stopped changing, and returns the
+    /// settled snapshot.
     ///
-    /// A `CREATE_SUSPENDED` target starts with `PEB->Ldr == NULL`; the kernel
-    /// builds that list inside `LdrpInitializeProcess`, which only the resumed
-    /// initial thread ever runs. Polling `PEB->Ldr` is therefore the signal
-    /// that import resolution in the host can be trusted - it is the moment the
-    /// "inject after loader init" strategy waits for (README 5.4).
+    /// Readiness cannot be "the list is non-empty" or even "it contains
+    /// `ntdll`/`kernel32`": `LdrpInitializeProcess` publishes `PEB->Ldr` first and
+    /// then links entries in one at a time, so those two appear long before the CRT
+    /// DLLs the payload imports against are mapped. Walking the list mid-flight also
+    /// trips the double-link validation.
     ///
-    /// This replaces the old entry-point trampoline, which needed the entry
-    /// point itself to be writable and is fatal on `GUARD_CF` images.
-    pub fn wait_until_loader_ready(&self, timeout: std::time::Duration) -> Result<()> {
+    /// So the only trustworthy signal is quiescence: take a snapshot, wait a settle
+    /// interval, take another, and accept only when the two agree. The returned
+    /// value is the snapshot the caller must keep using, so no second, racy walk is
+    /// needed afterwards.
+    pub fn stable_modules(
+        &self,
+        timeout: std::time::Duration,
+        settle: std::time::Duration,
+    ) -> Result<Vec<RemoteModule>> {
         let deadline = std::time::Instant::now() + timeout;
+
         loop {
-            // Readiness means the list is populated *and* complete. Both
-            // conditions are racy during `LdrpInitializeProcess`: `PEB->Ldr`
-            // is published before any entry exists, and entries appear one by
-            // one as DLLs are mapped. So a walk that returns an empty or
-            // incomplete list is retried, not treated as a hard error.
-            match self.walk_modules_allow_empty() {
-                Ok(modules)
-                    if !modules.is_empty()
-                        && Self::looks_like_a_real_module_list(&modules) =>
-                {
-                    return Ok(())
+            let first = self.walk_modules_allow_empty()?;
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "target module list never settled within {}ms ({} entries seen)",
+                    timeout.as_millis(),
+                    first.len()
+                );
+            }
+            std::thread::sleep(settle);
+
+            // Re-walk: the first snapshot may have been taken while a node was being
+            // linked, in which case this one legitimately fails.
+            if let Ok(second) = self.walk_modules_allow_empty() {
+                if same_modules(&first, &second) && Self::looks_like_a_real_module_list(&second) {
+                    return Ok(second);
                 }
-                Ok(_) => {
-                    if std::time::Instant::now() >= deadline {
-                        bail!(
-                            "target loader list never became complete within {}ms \
-                             (was the child resumed?)",
-                            timeout.as_millis()
-                        );
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(err) => return Err(err).context("reading the target module list"),
             }
         }
+    }
+
+    /// Blocks until the target's loader has published a complete module list.
+    /// Thin wrapper over [`Self::stable_modules`] for callers that only need to
+    /// know *when* the loader is usable, not the list itself.
+    pub fn wait_until_loader_ready(&self, timeout: std::time::Duration) -> Result<()> {
+        self.stable_modules(timeout, std::time::Duration::from_millis(50))?;
+        Ok(())
     }
 
     /// Runs `start_address` in the target on a new thread and waits for it to
@@ -536,8 +578,9 @@ impl RemoteProcess {
     /// signature, so the caller is expected to point this at a small trampoline
     /// (see [`crate::manual_map::stub`]) rather than at the entry itself.
     pub fn run_thread(&self, start_address: u64) -> Result<u32> {
-        let start: LPTHREAD_START_ROUTINE =
-            Some(unsafe { std::mem::transmute::<u64, unsafe extern "system" fn(*mut c_void) -> u32>(start_address) });
+        let start: LPTHREAD_START_ROUTINE = Some(unsafe {
+            std::mem::transmute::<u64, unsafe extern "system" fn(*mut c_void) -> u32>(start_address)
+        });
         let mut thread_id = 0u32;
         // SAFETY: `start` is machine code the host wrote into the target, and
         // the process handle carries full access because we created it.
@@ -553,7 +596,10 @@ impl RemoteProcess {
             )
         };
         if thread.is_null() {
-            bail!("CreateRemoteThread({start_address:#x}) failed: {}", last_error_text());
+            bail!(
+                "CreateRemoteThread({start_address:#x}) failed: {}",
+                last_error_text()
+            );
         }
 
         // SAFETY: valid handle; INFINITE is acceptable because the trampolines
@@ -565,7 +611,10 @@ impl RemoteProcess {
         // SAFETY: we own the thread handle.
         unsafe { CloseHandle(thread) };
         if wait != 0 || ok == 0 {
-            bail!("remote thread at {start_address:#x} failed (wait {wait}): {}", last_error_text());
+            bail!(
+                "remote thread at {start_address:#x} failed (wait {wait}): {}",
+                last_error_text()
+            );
         }
         Ok(code)
     }
@@ -584,7 +633,10 @@ impl RemoteProcess {
             bail!("implausible UNICODE_STRING buffer {buffer:#x}");
         }
         let raw = self.read_bytes(buffer, length)?;
-        let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
         Ok(String::from_utf16_lossy(&units))
     }
 }
@@ -593,6 +645,14 @@ fn is_canonical(addr: u64) -> bool {
     // x64 user space canonical form: bits 63..48 must all match bit 47.
     let high = addr >> 48;
     high == 0 || high == 0xffff
+}
+
+/// True when two module snapshots describe the same mapped set.
+fn same_modules(a: &[RemoteModule], b: &[RemoteModule]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.base == y.base && x.size == y.size)
 }
 
 /// Builds a `BOOL` for APIs that return `TRUE`/`FALSE`.

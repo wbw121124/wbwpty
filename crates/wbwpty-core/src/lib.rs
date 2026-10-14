@@ -13,10 +13,13 @@
 
 pub mod child;
 pub mod error;
+pub mod inspect;
 pub mod manual_map;
 pub mod pipe;
+pub mod session;
 
 pub use anyhow::{Error, Result};
-pub use child::ChildSpec;
+pub use child::{ChildSpec, Stdio};
 pub use error::Handle;
 pub use pipe::{PipePair, ReadEvent};
+pub use session::{Session, SessionConfig};

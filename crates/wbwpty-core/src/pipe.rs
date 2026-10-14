@@ -19,16 +19,24 @@
 //! will never complete.
 
 use std::io;
+use std::sync::Mutex;
 
 use anyhow::{bail, Result};
 use windows_sys::Win32::Foundation::{
-    GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    GetLastError, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
     WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND};
+use windows_sys::Win32::Storage::FileSystem::{
+    ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
+    PIPE_ACCESS_OUTBOUND,
+};
+use windows_sys::Win32::System::Pipes::{
+    CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, ResetEvent, WaitForSingleObject, INFINITE,
+};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
-use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT};
-use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject, INFINITE};
 
 use crate::error::{last_error_text, Handle};
 
@@ -82,11 +90,11 @@ impl PipeEnd {
                 wide.as_ptr(),
                 access | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                1,                          // max instances: one target
+                1, // max instances: one target
                 PIPE_BUFFER,
                 PIPE_BUFFER,
-                0,                          // default timeout
-                std::ptr::null(),           // default security
+                0,                // default timeout
+                std::ptr::null(), // default security
             )
         };
 
@@ -106,7 +114,12 @@ impl PipeEnd {
         let mut ov = Box::new(OVERLAPPED::default());
         ov.hEvent = event.as_raw() as HANDLE;
 
-        Ok(Self { name: name.to_owned(), handle, event, ov })
+        Ok(Self {
+            name: name.to_owned(),
+            handle,
+            event,
+            ov,
+        })
     }
 
     pub fn name(&self) -> &str {
@@ -138,6 +151,15 @@ impl PipeEnd {
             );
         }
         Ok(Handle::from_raw(h as isize))
+    }
+
+    /// Closes this server handle immediately.
+    ///
+    /// For the `-in` server this is what delivers "stdin at EOF" to the target:
+    /// an in-flight write completes, and the target's next `ReadFile` returns 0
+    /// bytes once our own copy is gone.
+    pub fn close(&mut self) {
+        self.handle.close();
     }
 
     fn reset_overlapped(&mut self) {
@@ -176,7 +198,11 @@ impl PipeEnd {
                 {
                     return Ok(ReadEvent::Eof);
                 }
-                bail!("ReadFile({}) failed: {err} ({})", self.name, last_error_text());
+                bail!(
+                    "ReadFile({}) failed: {err} ({})",
+                    self.name,
+                    last_error_text()
+                );
             }
 
             match WaitForSingleObject(self.event.as_raw() as HANDLE, timeout_ms) {
@@ -188,7 +214,11 @@ impl PipeEnd {
                         if err == windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE {
                             return Ok(ReadEvent::Eof);
                         }
-                        bail!("GetOverlappedResult({}) failed: {}", self.name, last_error_text());
+                        bail!(
+                            "GetOverlappedResult({}) failed: {}",
+                            self.name,
+                            last_error_text()
+                        );
                     }
                     if transferred == 0 {
                         Ok(ReadEvent::Eof)
@@ -236,14 +266,23 @@ impl PipeEnd {
                         {
                             bail!("target closed {}", self.name);
                         }
-                        bail!("WriteFile({}) failed: {err} ({})", self.name, last_error_text());
+                        bail!(
+                            "WriteFile({}) failed: {err} ({})",
+                            self.name,
+                            last_error_text()
+                        );
                     }
-                    if WaitForSingleObject(self.event.as_raw() as HANDLE, INFINITE) != WAIT_OBJECT_0 {
+                    if WaitForSingleObject(self.event.as_raw() as HANDLE, INFINITE) != WAIT_OBJECT_0
+                    {
                         bail!("write to {} never completed", self.name);
                     }
                     let mut transferred: u32 = 0;
                     if GetOverlappedResult(h, &*self.ov, &mut transferred, 0) == 0 {
-                        bail!("GetOverlappedResult({}) failed: {}", self.name, last_error_text());
+                        bail!(
+                            "GetOverlappedResult({}) failed: {}",
+                            self.name,
+                            last_error_text()
+                        );
                     }
                     if transferred == 0 {
                         bail!("write to {} transferred nothing", self.name);
@@ -267,6 +306,32 @@ pub struct PipePair {
     input: PipeEnd,
     output: PipeEnd,
 }
+
+/// `PipePair` shared between the session's input and output pumps.
+///
+/// The handles themselves are ordinary process handles; what stops this from
+/// being `Send` on its own is the `OVERLAPPED` struct pinned inside each
+/// [`PipeEnd`]. It is safe to move between threads precisely because every
+/// access is serialised by the `Mutex` this wrapper carries, so the pinned
+/// addresses can never be used concurrently.
+pub struct SharedPipes(Mutex<PipePair>);
+
+impl SharedPipes {
+    pub fn new(pair: PipePair) -> Self {
+        Self(Mutex::new(pair))
+    }
+
+    /// Runs `f` with exclusive access, propagating a poisoned lock as `None`
+    /// rather than panicking inside a pump thread.
+    pub fn with<R>(&self, f: impl FnOnce(&mut PipePair) -> R) -> Option<R> {
+        self.0.lock().ok().map(|mut guard| f(&mut guard))
+    }
+}
+
+// SAFETY: the inner value is only reachable through `with`, which serialises
+// every access to the pinned `OVERLAPPED` slots.
+unsafe impl Send for SharedPipes {}
+unsafe impl Sync for SharedPipes {}
 
 impl PipePair {
     /// Builds names from the host pid plus a caller supplied nonce so that two
@@ -332,7 +397,10 @@ impl PipePair {
                 )
             };
             if ok == 0 {
-                bail!("SetHandleInformation(HANDLE_FLAG_INHERIT) failed: {}", last_error_text());
+                bail!(
+                    "SetHandleInformation(HANDLE_FLAG_INHERIT) failed: {}",
+                    last_error_text()
+                );
             }
         }
 
@@ -342,6 +410,20 @@ impl PipePair {
             stderr: stderr.as_raw() as HANDLE,
             _handles: vec![stdin, stdout, stderr],
         })
+    }
+}
+
+impl InheritableStdio {
+    /// Drops the host's copies of the target's std handles.
+    ///
+    /// This must happen as soon as the child exists. The host opened these
+    /// handles only to hand them over, and keeping them alive would leave a
+    /// writer attached to the `-out` pipe forever: EOF is defined by *every*
+    /// writer closing, so a session would wait for output that can never arrive.
+    pub fn release(&mut self) {
+        for h in &mut self._handles {
+            h.close();
+        }
     }
 }
 

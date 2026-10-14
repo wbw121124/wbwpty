@@ -205,11 +205,11 @@ pub fn build_entry_dispatcher(slot_rel_disp: i32) -> Vec<u8> {
     code.extend_from_slice(&[0x4d, 0x8b, 0x43, 0x20]); // mov r8, [r11+0x20]
     code.extend_from_slice(&[0x4d, 0x8b, 0x4b, 0x18]); // mov r9, [r11+0x18]
     code.extend_from_slice(&[0x4d, 0x89, 0x01]); // mov [r9], r8
-    // call the payload entry point with hinst = image base
+                                                 // call the payload entry point with hinst = image base
     code.extend_from_slice(&[0x49, 0x8b, 0x4b, 0x00]); // mov rcx, [r11+0x00]
     code.extend_from_slice(&[0x4d, 0x8b, 0x53, 0x10]); // mov r10, [r11+0x10]
     code.extend_from_slice(&[0x41, 0xff, 0xd2]); // call r10
-    // jump to the original entry point
+                                                 // jump to the original entry point
     code.extend_from_slice(&[0x4d, 0x8b, 0x4b, 0x18]); // mov r9, [r11+0x18]
     code.extend_from_slice(&[0x41, 0xff, 0xe1]); // jmp r9
 
@@ -223,7 +223,13 @@ pub fn build_entry_patch(dispatcher_addr: u64, oep_addr: u64) -> Option<[u8; 5]>
     let delta = dispatcher_addr as i64 - (oep_addr as i64 + 5);
     let delta = i32::try_from(delta).ok()?;
     let rel = delta as i32;
-    Some([0xe9, rel.to_le_bytes()[0], rel.to_le_bytes()[1], rel.to_le_bytes()[2], rel.to_le_bytes()[3]])
+    Some([
+        0xe9,
+        rel.to_le_bytes()[0],
+        rel.to_le_bytes()[1],
+        rel.to_le_bytes()[2],
+        rel.to_le_bytes()[3],
+    ])
 }
 
 /// Convenience view used by the tests.
@@ -293,18 +299,39 @@ mod tests {
             0x7ff0_0000_0000,
             0x1234,
             &[
-                Patch { iat_rva: 0x2000, address: 0xdead },
-                Patch { iat_rva: 0x2008, address: 0xbeef },
+                Patch {
+                    iat_rva: 0x2000,
+                    address: 0xdead,
+                },
+                Patch {
+                    iat_rva: 0x2008,
+                    address: 0xbeef,
+                },
             ],
         );
         assert_eq!(job.len(), job_size(2));
-        assert_eq!(u64::from_le_bytes(job[0..8].try_into().unwrap()), 0x7ff0_0000_0000);
+        assert_eq!(
+            u64::from_le_bytes(job[0..8].try_into().unwrap()),
+            0x7ff0_0000_0000
+        );
         assert_eq!(u64::from_le_bytes(job[8..16].try_into().unwrap()), 0x1234);
         assert_eq!(u64::from_le_bytes(job[0x10..0x18].try_into().unwrap()), 2);
-        assert_eq!(u64::from_le_bytes(job[0x18..0x20].try_into().unwrap()), 0x2000);
-        assert_eq!(u64::from_le_bytes(job[0x20..0x28].try_into().unwrap()), 0xdead);
-        assert_eq!(u64::from_le_bytes(job[0x28..0x30].try_into().unwrap()), 0x2008);
-        assert_eq!(u64::from_le_bytes(job[0x30..0x38].try_into().unwrap()), 0xbeef);
+        assert_eq!(
+            u64::from_le_bytes(job[0x18..0x20].try_into().unwrap()),
+            0x2000
+        );
+        assert_eq!(
+            u64::from_le_bytes(job[0x20..0x28].try_into().unwrap()),
+            0xdead
+        );
+        assert_eq!(
+            u64::from_le_bytes(job[0x28..0x30].try_into().unwrap()),
+            0x2008
+        );
+        assert_eq!(
+            u64::from_le_bytes(job[0x30..0x38].try_into().unwrap()),
+            0xbeef
+        );
     }
 
     /// The dispatcher is real machine code too: it must spin, then restore the
@@ -318,7 +345,12 @@ mod tests {
 
         // Layout: [0x00..0x28] slot, [0x28..] dispatcher code, +0x200 payload.
         let page = unsafe {
-            VirtualAlloc(std::ptr::null_mut(), 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+            VirtualAlloc(
+                std::ptr::null_mut(),
+                0x1000,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
         } as u64;
 
         let slot = page;
@@ -326,14 +358,19 @@ mod tests {
         let code = build_entry_dispatcher((slot as i64 - (code_at + 7) as i64) as i32);
 
         // Payload stand-in at +0x200: mov dword [rcx+0x300], 0x1234 ; ret.
-        let payload: [u8; 11] =
-            [0xc7, 0x81, 0x00, 0x03, 0x00, 0x00, 0x34, 0x12, 0x00, 0x00, 0xc3];
+        let payload: [u8; 11] = [
+            0xc7, 0x81, 0x00, 0x03, 0x00, 0x00, 0x34, 0x12, 0x00, 0x00, 0xc3,
+        ];
         // The "original" entry point is a bare `ret` followed by padding, so the
         // dispatcher's final jump lands somewhere that returns to Rust.
         let original: u64 = 0x9090_9090_9090_90c3;
 
         unsafe {
-            std::ptr::copy_nonoverlapping(payload.as_ptr(), (page + 0x200) as *mut u8, payload.len());
+            std::ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                (page + 0x200) as *mut u8,
+                payload.len(),
+            );
             std::ptr::copy_nonoverlapping(code.as_ptr(), code_at as *mut u8, code.len());
 
             let put = |off: usize, v: u64| ((page + off as u64) as *mut u64).write_unaligned(v);
@@ -357,8 +394,16 @@ mod tests {
                 put(SLOT_READY, 1);
             });
 
-            assert_eq!(get(0x300), 0x1234, "payload entry must have run with hinst = base");
-            assert_eq!(get(0x100) & 0xffff_ffff, original & 0xffff_ffff, "entry bytes restored");
+            assert_eq!(
+                get(0x300),
+                0x1234,
+                "payload entry must have run with hinst = base"
+            );
+            assert_eq!(
+                get(0x100) & 0xffff_ffff,
+                original & 0xffff_ffff,
+                "entry bytes restored"
+            );
             VirtualFree(page as *mut core::ffi::c_void, 0, MEM_RELEASE);
         }
     }

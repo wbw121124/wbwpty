@@ -174,7 +174,10 @@ impl<'a> PeImage<'a> {
             if rva as usize >= start && rva as usize + len <= start + size {
                 let delta = rva as usize - start;
                 if delta + len > s.size_of_raw_data as usize {
-                    bail!("rva {rva:#x} is in the zero-filled tail of section {}", s.name);
+                    bail!(
+                        "rva {rva:#x} is in the zero-filled tail of section {}",
+                        s.name
+                    );
                 }
                 return slice(self.data, s.pointer_to_raw_data as usize + delta, len)
                     .with_context(|| format!("reading rva {rva:#x}"));
@@ -193,8 +196,12 @@ impl<'a> PeImage<'a> {
             if offset >= start && offset < start + size {
                 let delta = offset - start;
                 let available = (size - delta).min(s.size_of_raw_data as usize - delta);
-                return slice(self.data, s.pointer_to_raw_data as usize + delta, available.min(max))
-                    .with_context(|| format!("reading rva {rva:#x}"));
+                return slice(
+                    self.data,
+                    s.pointer_to_raw_data as usize + delta,
+                    available.min(max),
+                )
+                .with_context(|| format!("reading rva {rva:#x}"));
             }
         }
         bail!("rva {rva:#x} is not inside any section")
@@ -230,13 +237,13 @@ impl<'a> PeImage<'a> {
         Ok(out)
     }
 
-/// Walks `IMAGE_BASE_RELOCATION` blocks and patches the absolute-address slots.
-///
-/// Both relocation kinds are supported because real toolchains use each of them
-/// depending on the architecture: `IMAGE_REL_BASED_HIGHLOW` (3) for 32-bit
-/// fields and `IMAGE_REL_BASED_DIR64` (10) for the 64-bit absolute pointers an
-/// x64 image is full of.
-pub fn apply_relocations(&self, image: &mut [u8], delta: i64) -> Result<()> {
+    /// Walks `IMAGE_BASE_RELOCATION` blocks and patches the absolute-address slots.
+    ///
+    /// Both relocation kinds are supported because real toolchains use each of them
+    /// depending on the architecture: `IMAGE_REL_BASED_HIGHLOW` (3) for 32-bit
+    /// fields and `IMAGE_REL_BASED_DIR64` (10) for the 64-bit absolute pointers an
+    /// x64 image is full of.
+    pub fn apply_relocations(&self, image: &mut [u8], delta: i64) -> Result<()> {
         if delta == 0 {
             return Ok(());
         }
@@ -312,7 +319,9 @@ pub fn u32_at(data: &[u8], off: usize) -> Result<u32> {
 
 pub fn u64_at(data: &[u8], off: usize) -> Result<u64> {
     let b = slice(data, off, 8)?;
-    Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    Ok(u64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
 }
 
 #[cfg(test)]
@@ -367,14 +376,14 @@ mod tests {
         d[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // sections
         d[0x94..0x96].copy_from_slice(&240u16.to_le_bytes()); // size of optional header
         d[0x96..0x98].copy_from_slice(&0x2000u16.to_le_bytes()); // DLL
-        // optional header
+                                                                 // optional header
         d[0x98..0x9a].copy_from_slice(&IMAGE_NT_OPTIONAL_HDR64_MAGIC.to_le_bytes());
         d[0xa8..0xac].copy_from_slice(&0x1000u32.to_le_bytes()); // entry rva
         d[0xb0..0xb8].copy_from_slice(&0x1_8000_0000u64.to_le_bytes());
         d[0xd0..0xd4].copy_from_slice(&0x4000u32.to_le_bytes()); // size of image
         d[0xd4..0xd8].copy_from_slice(&0x400u32.to_le_bytes()); // size of headers
         d[0x104..0x108].copy_from_slice(&16u32.to_le_bytes()); // number of data dirs
-        // section header at 0x98 + 240 = 0x188
+                                                               // section header at 0x98 + 240 = 0x188
         let sh = 0x188;
         d[sh..sh + 8].copy_from_slice(b".text\0\0\0");
         d[sh + 0x0c..sh + 0x10].copy_from_slice(&0x1000u32.to_le_bytes());
@@ -415,10 +424,8 @@ mod tests {
         // entries: HIGHLOW@0x20, DIR64@0x28, ABSOLUTE padding.
         d[0x300..0x304].copy_from_slice(&0x1000u32.to_le_bytes());
         d[0x304..0x308].copy_from_slice(&24u32.to_le_bytes());
-        d[0x308..0x30a]
-            .copy_from_slice(&((IMAGE_REL_BASED_HIGHLOW << 12) | 0x20).to_le_bytes());
-        d[0x30a..0x30c]
-            .copy_from_slice(&((IMAGE_REL_BASED_DIR64 << 12) | 0x28).to_le_bytes());
+        d[0x308..0x30a].copy_from_slice(&((IMAGE_REL_BASED_HIGHLOW << 12) | 0x20).to_le_bytes());
+        d[0x30a..0x30c].copy_from_slice(&((IMAGE_REL_BASED_DIR64 << 12) | 0x28).to_le_bytes());
         d[0x30c..0x30e].copy_from_slice(&0u16.to_le_bytes());
         d[0x30e..0x310].copy_from_slice(&0u16.to_le_bytes());
         d[0x310..0x312].copy_from_slice(&0u16.to_le_bytes());

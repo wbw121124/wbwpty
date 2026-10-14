@@ -19,11 +19,11 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, GetExitCodeThread, ResumeThread, TerminateProcess,
-    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, INFINITE,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, INFINITE, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 use crate::error::{last_error_text, Handle};
@@ -51,7 +51,8 @@ pub mod contract {
 }
 
 /// Creation flags shared by every target launch.
-pub const TARGET_CREATION_FLAGS: u32 = DETACHED_PROCESS | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
+pub const TARGET_CREATION_FLAGS: u32 =
+    DETACHED_PROCESS | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
 
 /// The three standard handles handed to the target at creation time.
 ///
@@ -67,6 +68,7 @@ pub struct Stdio {
 }
 
 /// What to run and how to hand it its configuration.
+#[derive(Debug, Clone)]
 pub struct ChildSpec {
     pub program: OsString,
     pub args: Vec<OsString>,
@@ -161,7 +163,10 @@ impl ChildSpec {
             }
         }
 
-        bail!("program not found on PATH: {}", self.program.to_string_lossy())
+        bail!(
+            "program not found on PATH: {}",
+            self.program.to_string_lossy()
+        )
     }
 }
 
@@ -260,6 +265,11 @@ impl Child {
         Ok(())
     }
 
+    /// True once [`Self::resume`] has been called on this child.
+    pub fn is_resumed(&self) -> bool {
+        self.resumed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// True while the target process has not exited yet.
     pub fn is_running(&self) -> bool {
         let mut code = 0u32;
@@ -273,16 +283,40 @@ impl Child {
         // SAFETY: we own `process`.
         let wr = unsafe { WaitForSingleObject(self.process.as_raw() as HANDLE, INFINITE) };
         if wr != 0 {
-            bail!("WaitForSingleObject(process) returned {wr}: {}", last_error_text());
+            bail!(
+                "WaitForSingleObject(process) returned {wr}: {}",
+                last_error_text()
+            );
         }
-        // `GetExitCodeThread` works on the primary thread handle; the target may
-        // have exited with its thread handle already signalled.
+        self.exit_code()
+    }
+
+    /// Waits up to `timeout` for the target to exit.
+    ///
+    /// `Ok(None)` means it is still running, which is a normal outcome for an
+    /// interactive session rather than an error.
+    pub fn wait_timeout(&self, timeout: std::time::Duration) -> Result<Option<u32>> {
+        // SAFETY: we own `process`.
+        let wr = unsafe {
+            WaitForSingleObject(self.process.as_raw() as HANDLE, timeout.as_millis() as u32)
+        };
+        Ok(match wr {
+            WAIT_OBJECT_0 => Some(self.exit_code()?),
+            WAIT_TIMEOUT => None,
+            other => bail!(
+                "WaitForSingleObject(process) returned {other}: {}",
+                last_error_text()
+            ),
+        })
+    }
+
+    /// The exit code of an already terminated target.
+    fn exit_code(&self) -> Result<u32> {
         let mut code = 0u32;
-        // SAFETY: valid handles, `code` is a live local.
-        let ok = unsafe { GetExitCodeThread(self.thread.as_raw() as HANDLE, &mut code) };
-        if ok == 0 && code == 0 {
-            // Fall back to the process handle (STILL_ACTIVE == 259).
-            return Ok(259);
+        // SAFETY: we own the process handle and `code` is a live local.
+        let ok = unsafe { GetExitCodeProcess(self.process.as_raw() as HANDLE, &mut code) };
+        if ok == 0 {
+            bail!("GetExitCodeProcess failed: {}", last_error_text());
         }
         Ok(code)
     }
@@ -325,9 +359,9 @@ pub fn build_command_line(image: &Path, args: &[OsString]) -> Vec<u16> {
 fn append_quoted(out: &mut Vec<u16>, arg: &OsStr) {
     let wide: Vec<u16> = arg.encode_wide().collect();
     let needs_quotes = wide.is_empty()
-        || wide.iter().any(|&c| {
-            c == b' ' as u16 || c == b'\t' as u16 || c == b'"' as u16 || c < 0x20
-        });
+        || wide
+            .iter()
+            .any(|&c| c == b' ' as u16 || c == b'\t' as u16 || c == b'"' as u16 || c < 0x20);
 
     if !needs_quotes {
         out.extend_from_slice(&wide);
@@ -446,8 +480,9 @@ mod tests {
     fn environment_overrides_win_over_inherited() {
         let block = build_environment_block(&[("PATH".into(), "Z:\\only".into())]).unwrap();
         assert!(block.ends_with(&[0, 0]));
-        let text: String =
-            String::from_utf16(&block[..block.len() - 1]).unwrap().replace('\0', "\n");
+        let text: String = String::from_utf16(&block[..block.len() - 1])
+            .unwrap()
+            .replace('\0', "\n");
         assert!(text.lines().any(|l| l == "PATH=Z:\\only"), "{text}");
     }
 

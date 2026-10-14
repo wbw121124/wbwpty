@@ -68,6 +68,16 @@ impl Handle {
         self.0
     }
 
+    /// Releases the handle early; the wrapper stays usable but inert, and the
+    /// `Drop` below will not close anything twice.
+    pub fn close(&mut self) {
+        if self.is_valid() {
+            // SAFETY: we own this handle and close it exactly once.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0 as _) };
+            self.0 = 0;
+        }
+    }
+
     /// `DuplicateHandle` onto the current process.
     ///
     /// The copy does *not* inherit the `HANDLE_FLAG_INHERIT` attribute of the
