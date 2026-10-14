@@ -1,0 +1,26 @@
+# ---- Rust ----
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# ---- Build artifacts ----
+*.dll
+*.lib
+*.pdb
+*.a
+*.exp
+*.ilk
+build/
+out/
+
+# ---- Runtime / logs ----
+logs/
+*.log
+*.tmp
+
+# ---- Editors / OS ----
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

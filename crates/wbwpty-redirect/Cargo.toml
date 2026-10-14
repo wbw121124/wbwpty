@@ -1,0 +1,19 @@
+[package]
+name = "wbwpty-redirect"
+description = "Injected DLL: redirects the target process stdio onto wbwpty named pipes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "wbwpty_redirect"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+# `no_std` cdylib: there is nothing to unit test through the default harness.
+test = false
+doctest = false
+
+[dependencies]
+iced-x86.workspace = true

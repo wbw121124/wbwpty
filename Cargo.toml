@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wbwpty-core",
+    "crates/wbwpty",
+    "crates/wbwpty-redirect",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/wbw121124/wbwpty"
+
+[workspace.dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+windows-sys = "0.61"
+# `no_std` flavour: the injected DLL has no allocator (AGENTS.md rule 3).
+iced-x86 = { version = "1.21", default-features = false, features = ["no_std"] }
+
+# The injected DLL is `no_std`, which requires `panic = "abort"`. Cargo only
+# accepts `panic` in root profiles, so it is set workspace wide; the `test`
+# profile opts back into unwinding so `cargo test` keeps a working harness.
+[profile.dev]
+panic = "abort"
+
+[profile.test]
+panic = "unwind"
+
+[profile.release]
+panic = "abort"

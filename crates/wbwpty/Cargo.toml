@@ -1,0 +1,18 @@
+[package]
+name = "wbwpty"
+description = "CLI front-end for the wbwpty terminal core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wbwpty"
+path = "src/main.rs"
+
+[dependencies]
+wbwpty-core = { path = "../wbwpty-core" }
+anyhow.workspace = true
+clap.workspace = true
+windows-sys.workspace = true
