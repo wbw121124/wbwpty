@@ -1,0 +1,8 @@
+# The whole project (host + injected DLL) is built with the MinGW gnu toolchain:
+# this machine has no MSVC linker, and the `no_std` cdylib is linked by MinGW ld.
+# `default-target` is what actually pins every `cargo build` in this repo to
+# `x86_64-pc-windows-gnu`; writing it explicitly avoids inheriting the
+# `x86_64-pc-windows-msvc` default host of the rustup installation.
+[toolchain]
+channel = "stable-x86_64-pc-windows-gnu"
+default-target = "x86_64-pc-windows-gnu"

@@ -490,6 +490,9 @@ mod tests {
     use super::*;
     use crate::child::ChildSpec;
 
+    /// `GetExitCodeProcess` reports this for a process that has not exited yet.
+    const STILL_ACTIVE: u32 = 259;
+
 /// A full round trip against a real, suspended child process: parse the
     /// built DLL, map it, run its `DllMain`.
     ///
@@ -540,6 +543,75 @@ mod tests {
         assert!(modules.iter().any(|m| m.base_name.eq_ignore_ascii_case("kernel32.dll")));
         let _ = child.terminate();
     }
+
+    /// Pins the hard constraint the injector is built around: a target's entry
+    /// point may NOT be rewritten while the process is suspended.
+    ///
+    /// Measured on Windows 11 / cmd.exe (a `GUARD_CF` image):
+    ///
+    /// | what the host writes into the suspended target | exit code |
+    /// | --- | --- |
+    /// | nothing | `0` |
+    /// | RWX page + dispatcher code near the image | `0` |
+    /// | 8 bytes anywhere in `.text` (restored afterwards) | `0` |
+    /// | `E9 rel32` at the entry point | `0x103` (`STATUS_POSSIBLE_DEADLOCK`) |
+    ///
+    /// So the entry point specifically is off limits until the loader has run,
+    /// which rules out the "patch the entry point, resume, let the loader stop
+    /// there" trampoline. Injection therefore happens *after* `PEB->Ldr`
+    /// becomes walkable (see [`inject_bytes`]); std handles are handed over by
+    /// `STARTF_USESTDHANDLES` so nothing depends on winning a race with the
+    /// target's CRT.
+    #[test]
+    fn suspended_entry_point_cannot_be_rewritten() {
+        use crate::manual_map::remote::RemoteProcess;
+
+        let run = |patch_entry: bool| -> u32 {
+            let child =
+                Child::spawn(&ChildSpec::new("cmd.exe").args(["/c", "exit", "0"])).unwrap();
+            let proc = RemoteProcess::new(child.process_handle());
+            if patch_entry {
+                let image_base = proc.image_base().unwrap();
+                let exe_bytes = std::fs::read(&child.image).unwrap();
+                let exe = PeImage::parse(&exe_bytes).unwrap();
+                let oep = image_base + exe.info.entry_rva as u64;
+                let scratch = proc.allocate_near(oep, 0x1000).unwrap();
+                // `jmp self`: reaching it would hang instead of exiting cleanly,
+                // so a clean exit proves the entry point was never executed.
+                proc.write_bytes(scratch, &[0xeb, 0xfe]).unwrap();
+                let patch = stub::build_entry_patch(scratch, oep).unwrap();
+                proc.write_bytes(oep, &patch).unwrap();
+            }
+
+            child.resume().unwrap();
+            let mut exit = 0u32;
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                // SAFETY: live handle, live out parameter.
+                unsafe {
+                    windows_sys::Win32::System::Threading::GetExitCodeProcess(
+                        proc.handle(),
+                        &mut exit,
+                    )
+                };
+                if exit != STILL_ACTIVE {
+                    break;
+                }
+            }
+            if exit == STILL_ACTIVE {
+                let _ = child.terminate();
+            }
+            exit
+        };
+
+        assert_eq!(run(false), 0, "an untouched suspended target runs to completion");
+        assert_ne!(
+            run(true),
+            0,
+            "rewriting the entry point must not be assumed to work: see README 5.3"
+        );
+    }
+
 
     /// Locates `wbwpty_redirect.dll` next to the test executable (cargo puts unit
     /// test binaries in `target/<profile>/deps`, the payload in

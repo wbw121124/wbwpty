@@ -225,25 +225,48 @@ cargo test --release
 7. 宿主工具链是 **MinGW gnu**（无 MSVC）。`no_std` cdylib 需要自己提供
    `rust_eh_personality`，因为 sysroot 里的 `core` 是按 unwind 编译的。
 
-### 5.3 当前阻塞点（ignored 的那个测试）
+### 5.3 Stage-3 阻塞点的**根因**（已定位，方案已定）
 
-`manual_map::tests::injects_into_a_suspended_cmd`：
-入口点确实被改写成功（读回 `E9 xx xx xx xx`），但 `cmd.exe` **15 秒内没有走到
-入口点**，进程仍然存活（`GetExitCodeProcess` 返回 `259 = STILL_ACTIVE`）。
-入口地址本身已用 objdump 交叉核对（`cmd.exe` start address `0x140018090`，
-`PEB->ImageBaseAddress 0x7ff672c60000 + 0x18090`）。
+`manual_map::tests::injects_into_a_suspended_cmd`（入口 trampoline 方案）失败，
+`cmd.exe` 永不进入口点。把注入动作拆开逐个测（本机实测，`cmd.exe /c exit 0`，
+单测 `suspended_entry_point_cannot_be_rewritten` 已把结论钉住）：
 
-排查方向（按性价比排序）：
-1. 先排除"是不是我们的注入导致的"：把 dispatcher 换成什么都不做的版本，
-   看 `cmd.exe` 是否同样进不了入口点。
-2. 对比 `CREATE_NO_WINDOW` / `DETACHED_PROCESS`、以及
-   `STARTF_USESTDHANDLES + 可继承句柄` 几种组合下 `cmd.exe` 的启动行为。
-3. 用 `ntdll!LdrpInitialize` 的思路排查 loader 是否卡在某个等待点
-   （挂起 + 三个 std handle 全 NULL 可能是诱因）。
-4. 备选注入窗口：`DEBUG_PROCESS` + 初始断点（loader 初始化完成的确定性时机），
-   代价是要跑一个调试事件循环。
+| 宿主对"挂起中的目标"做了什么 | 目标退出码 |
+| --- | --- |
+| 什么都不写 | `0` |
+| 在映像旁分配 RWX 页 + 写 dispatcher 代码 | `0` |
+| 在 `.text` 里任意位置（入口点 −64 KiB）写 8 字节再还原 | `0` |
+| **在入口点写 `E9 rel32`** | **`0x103` = `STATUS_POSSIBLE_DEADLOCK`** |
+| **在入口点写 `EB FE`（跳自己自旋）** | **`0x103`** |
 
-### 5.4 待评估的外部可复用模块
+结论：**只有"改写入口点字节"这一件事会杀死目标**，而且目标死在 loader 里、
+根本没走到入口点（自旋的 `EB FE` 从未执行）。其它一切（写 `.text`、分配 RWX、
+重定位、解析导入）都安全。`cmd.exe` 是 `GUARD_CF` 映像
+（`DllCharacteristics = 0xc160`），入口点是 loader 初始化期间唯一不允许
+被改写的区域。
+
+→ **"挂起 → 改写入口点 → resume → dispatcher 自旋等宿主"这条路在 Windows 上是死的**，
+README 旧版 5.3 的猜测（std handle 为 NULL / conhost 之类）全部排除。
+
+### 5.4 新的注入时机（已定，开始实现）
+
+放弃入口点 trampoline，改成"**loader 跑完再注入**"：
+
+1. 目标 `CreateProcessW(DETACHED_PROCESS | CREATE_SUSPENDED)`，std handle 通过
+   **`STARTF_USESTDHANDLES` + 可继承管道句柄**直接交给目标——这让重定向**完全不需要
+   抢在目标 CRT 之前**（`ucrtbase!__acrt_initialize_stdio` 初始化时拿到的就是真管道，
+   只是缓冲策略是全缓冲，这由 Stage 7 的 `setvbuf(_IOLBF)` 事后修）。
+2. `ResumeThread`。宿主轮询目标的 `PEB->Ldr`，**一旦非 NULL 就说明 loader 已映射完导入**
+   （`peb_walk_works_once_the_target_is_running` 已证该走法可行）。
+3. 此时再走已验证的手工映射：重定位 → 从目标 PEB 解析导入 → 写整块镜像 →
+   `CreateRemoteThread(base + DllMain)`。**不再需要自旋 dispatcher、不再需要改写
+   任何目标代码**（stub 只需 `CreateRemoteThread` 天然提供的"调到入口"语义）。
+4. DLL 负责剩下的语义补丁：`ConsoleHandle` 哨兵（让孙进程不再分配 console）、
+   控制台 API shim、CRT 行缓冲。这些不依赖"早于 CRT 初始化"。
+
+这样保住了项目目标（零 conhost、无 ConPTY/winpty/WSL/SSH），并且去掉了唯一
+一个跨不过去的时序假设。`EntryTrap` / `build_entry_dispatcher` /
+`build_entry_patch` 随本方案作废。
 
 `wbw121124/wbwtty` 的 `feature/pty-win10-early` 分支含一个渲染模块：
 <https://github.com/wbw121124/wbwtty/tree/feature/pty-win10-early>
