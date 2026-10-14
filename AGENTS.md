@@ -135,6 +135,7 @@ cargo test --release                  # 相关测试必须全绿
 8. **`VirtualQueryEx` 报告 `MEM_FREE` 不代表可写**：必须用 `VirtualAllocEx` 真正 commit，否则 `WriteProcessMemory` 返回 `ERROR_INVALID_ADDRESS (998)`。
 9. **x64 `IMAGE_THUNK_DATA64` 步进是 8 字节**：旧的 import resolver 按 16 字节步进，读取的 RVA 全是垃圾，表现成 `"string at 0x65e0ac22 is outside the image"`。
 10. **`STARTF_USESTDHANDLES` 传管道句柄后，宿主必须立刻释放自己的客户端副本**：否则 `-out` 管道的 writer 永远不为空，`pump_output` 死等 EOF。
+11. **`dlog!()` 在 loader lock 下会触发 AV**：`dlog!` 的格式化代码（`core::fmt`）在 no_std DLL 中会访问 PEB 偏移 `params+0x80`，超出 `RTL_USER_PROCESS_PARAMETERS` 实际大小（~0x60），导致 `STATUS_ACCESS_VIOLATION`。**DllMain 内禁止调用 `dlog!`**，改用直接写 `WBWPTY_STATUS` 状态字。
 
 ## 10. 外部可复用模块（评估过再用）
 

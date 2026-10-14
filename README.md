@@ -215,11 +215,16 @@ cargo test --release
 9. **stub 传参：Win64 ABI 第 2 参数在 `rdx`，不是 `r9`**。`mov r9d, 1` 编译无错但 `DllMain` 拿到的 `fdwReason` 是残留垃圾值，整条 attach 路径静默跳过；必须用 `mov edx, 1`。
 10. **宿主工具链是 MinGW gnu（无 MSVC）**。`no_std` cdylib 需要自己导出 `rust_eh_personality`。
 
-### 5.3 当前阻塞点
+### 5.3 当前状态（截至本次提交）
 
-`DllMain` 在执行 `stdio::install()`（含 `init_from_env`、`dlog!`、`peb::patch_console_state`）时**仍然报 `STATUS_ACCESS_VIOLATION (0xc0000005)`**。`mapped_image_runs_a_trivial_export`（调用 `wbwpty_probe`，只写 magic 不回读）已验证手工映射本身完全正确；故障被精确隔离在 DllMain 内部。下一步用 `PROBE_MARKER` + status word 在关键入口加埋点，定位哪条 FFI 调用越界。
+`DllMain` **已能正常跑通**：之前 `patch_console_state()` 内的 `dlog!()` 在 loader lock 下触发 PEB 越界读取（`params+0x80` 超出 `RTL_USER_PROCESS_PARAMETERS` 大小），导致 `STATUS_ACCESS_VIOLATION`。移除 `dlog!` 后 DllMain 顺利执行，`ConsoleHandle` 哨兵补丁已注入目标 PEB。
 
-### 5.2 关键技术发现（全部本机实测，恢复工作时不要推翻）
+下一步：
+- Stage 7：CRT 行缓冲修复（`setvbuf(_IOLBF)`）—— 目前目标 stdout 是全缓冲，大输出会延迟。
+- Stage 8：KernelBase 内联 hook（console API shim）。
+- Stage 9：端到端测试（孙进程无 conhost、python、大输出）。
+
+### 5.4 关键技术发现（全部本机实测，恢复工作时不要推翻）
 
 1. **只有 `DETACHED_PROCESS` 不拉 conhost**（微软 Terminal `doc/specs/#7335` 原文佐证）。
 2. **挂起进程的 `PEB->Ldr` 是 NULL**：`CREATE_SUSPENDED` 时 loader 还没跑，
