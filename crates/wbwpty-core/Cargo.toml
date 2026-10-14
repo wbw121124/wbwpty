@@ -13,6 +13,7 @@ windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
     "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
@@ -21,4 +22,8 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+# Host-side tests disassemble the remote stub. `iced-x86` is shared with the
+# DLL through `[workspace.dependencies]`; its `std` and `no_std` features are
+# mutually exclusive, so both crates must use the same (no_std) flavour.
+iced-x86.workspace = true
 tempfile = "3"

@@ -176,21 +176,80 @@ cargo test --release
 
 ---
 
-## 5. 实施计划（阶段 / 提交序列）
+## 5. 实施计划与当前进度
 
-| # | 阶段 | 内容 | commit |
-| --- | --- | --- | --- |
-| 0 | 骨架 | workspace / `.gitignore` / README / AGENTS / git 身份 | `chore: bootstrap cargo workspace for wbwpty` |
-| 1 | 管道层 | 命名管道传输层（overlapped + pump） | `feat(pipe): named-pipe transport with overlapped io` |
-| 2 | 子进程 | 挂起 + `DETACHED_PROCESS` 创建、环境块 | `feat(child): launch target suspended and detached without conhost` |
-| 3 | 注入器 | PEB 遍历手工映射（PE 解析/重定位/导入/stub） | `feat(inject): manual-map injector via peb module walk` |
-| 4 | DLL v1 | 开管道 + `SetStdHandle` + 可继承标记 | `feat(dll): redirect std handles to named pipes` |
-| 5 | CLI | 会话循环：双泵 / EOF / 退出码 / Ctrl+C | `feat(cli): interactive session over redirected stdio` |
-| 6 | PEB | 控制台语义补丁 + 偏移运行时自检 | `feat(dll): fake attached-console state in peb process parameters` |
-| 7 | CRT | `_open_osfhandle`/`_dup2`/`setvbuf`/`_flushall` | `feat(dll): repair and line-buffer the ucrt stdio streams` |
-| 8 | shim | 内联跳板 + console API shim + 键入翻译 + resize | `feat(dll): console api shim via kernelbase inline hooks` |
-| 9 | 测试 | cmd/python/大输出/stderr/无 conhost/孙进程 | `test: add integration coverage and conhost assertions` |
-| 10 | 文档 | README 定稿 + push | `docs: document architecture, build, usage and limitations` |
+| # | 阶段 | 内容 | commit | 状态 |
+| --- | --- | --- | --- | --- |
+| 0 | 骨架 | workspace / `.gitignore` / README / AGENTS / git 身份 | `chore: bootstrap cargo workspace for wbwpty` | ✅ |
+| 1 | 管道层 | 命名管道传输层（overlapped + pump） | `feat(pipe): named-pipe transport with overlapped io` | ✅ |
+| 2 | 子进程 | 挂起 + `DETACHED_PROCESS` 创建、环境块 | `feat(child): launch target suspended and detached without conhost` | ✅ |
+| 3 | 注入器 | PE 解析 / 重定位 / 导出解析 / PEB 遍历 / 入口 trampoline | `feat(inject): manual-map injector via peb module walk` | 🟡 进行中 |
+| 4 | DLL v1 | 开管道 + `SetStdHandle` + 可继承标记 | `feat(dll): redirect std handles to named pipes` | ⏳ |
+| 5 | CLI | 会话循环：双泵 / EOF / 退出码 / Ctrl+C | `feat(cli): interactive session over redirected stdio` | ⏳ |
+| 6 | PEB | 控制台语义补丁 + 偏移运行时自检 | `feat(dll): fake attached-console state in peb process parameters` | ⏳ |
+| 7 | CRT | `_open_osfhandle`/`_dup2`/`setvbuf`/`_flushall` | `feat(dll): repair and line-buffer the ucrt stdio streams` | ⏳ |
+| 8 | shim | 内联跳板 + console API shim + 键入翻译 + resize | `feat(dll): console api shim via kernelbase inline hooks` | ⏳ |
+| 9 | 测试 | cmd/python/大输出/stderr/无 conhost/孙进程 | `test: add integration coverage and conhost assertions` | ⏳ |
+| 10 | 文档 | README 定稿 + push | `docs: document architecture, build, usage and limitations` | ⏳ |
+
+### 5.1 已完成部分的实际状态
+
+- `cargo build` 绿；`cargo test --workspace` = **18 passed / 1 ignored / 0 failed**
+- `wbwpty_redirect.dll` 可构建：`no_std` + `panic=abort` cdylib，导出 `DllMain`（RVA 见 objdump）
+- 手工映射注入器的**每一段机器码都被执行验证过**（不是只比对字节）：
+  入口 dispatcher 的"自旋 → 还原入口字节 → 调 DllMain → 跳回原入口"全流程有单测
+- 唯一 ignored 的测试就是下面的阻塞点
+
+### 5.2 关键技术发现（全部本机实测，恢复工作时不要推翻）
+
+1. **只有 `DETACHED_PROCESS` 不拉 conhost**（微软 Terminal `doc/specs/#7335` 原文佐证）。
+2. **挂起进程的 `PEB->Ldr` 是 NULL**：`CREATE_SUSPENDED` 时 loader 还没跑，
+   目标进程里除 exe 自身和 ntdll 外**什么都没映射**。实测在宿主的
+   `KERNEL32.dll` 基址读目标内存会 `ERROR_PARTIAL_COPY`。
+   → "先注入 → 再从目标解析导入" 这条路走不通，必须让 loader 先跑起来。
+   → 同时说明 `PEB->Ldr` 遍历在**运行中**的进程上是正常的（有单测覆盖）。
+3. **注入时机方案（已实现）**：在挂起状态下把目标 exe 的入口改成
+   `jmp dispatcher`（`E9 rel32`），然后 resume。loader 跑完、走到入口时
+   dispatcher 自旋等宿主；宿主此刻 PEB 遍历可用，于是完成
+   重定位 → 导入解析 → 写镜像 → 填 slot → 放行；dispatcher 还原入口字节、
+   调 `DllMain`、再跳回真入口。
+   **不用调试器、无竞态，且 `DllMain` 早于目标 CRT 初始化**（正是"重定向能在
+   CRT 之前生效"所需要的）。
+4. **x64 PE 的重定位类型是 `IMAGE_REL_BASED_DIR64`(10)，不是 `HIGHLOW`(3)**。
+   最初只实现了 HIGHLOW，被"解析真实产物"的单测当场抓出来；现在两种都实现。
+5. 本机 `ucrtbase.dll` 导出表实测：`setvbuf`/`_setmode`/`_open_osfhandle`/
+   `_dup2`/`_flushall`/`__acrt_iob_func` 可用；
+   `__acrt_lowio_set_osfhandle`/`_setvbuf` **未导出** → CRT 修复只能走公开 API。
+6. `kernel32` 的控制台导出只是 **6 字节 `jmp [rip+disp32]` 桩**，真实实现在
+   `KernelBase.dll` → console shim 只需 hook `KernelBase`。
+7. 宿主工具链是 **MinGW gnu**（无 MSVC）。`no_std` cdylib 需要自己提供
+   `rust_eh_personality`，因为 sysroot 里的 `core` 是按 unwind 编译的。
+
+### 5.3 当前阻塞点（ignored 的那个测试）
+
+`manual_map::tests::injects_into_a_suspended_cmd`：
+入口点确实被改写成功（读回 `E9 xx xx xx xx`），但 `cmd.exe` **15 秒内没有走到
+入口点**，进程仍然存活（`GetExitCodeProcess` 返回 `259 = STILL_ACTIVE`）。
+入口地址本身已用 objdump 交叉核对（`cmd.exe` start address `0x140018090`，
+`PEB->ImageBaseAddress 0x7ff672c60000 + 0x18090`）。
+
+排查方向（按性价比排序）：
+1. 先排除"是不是我们的注入导致的"：把 dispatcher 换成什么都不做的版本，
+   看 `cmd.exe` 是否同样进不了入口点。
+2. 对比 `CREATE_NO_WINDOW` / `DETACHED_PROCESS`、以及
+   `STARTF_USESTDHANDLES + 可继承句柄` 几种组合下 `cmd.exe` 的启动行为。
+3. 用 `ntdll!LdrpInitialize` 的思路排查 loader 是否卡在某个等待点
+   （挂起 + 三个 std handle 全 NULL 可能是诱因）。
+4. 备选注入窗口：`DEBUG_PROCESS` + 初始断点（loader 初始化完成的确定性时机），
+   代价是要跑一个调试事件循环。
+
+### 5.4 待评估的外部可复用模块
+
+`wbw121124/wbwtty` 的 `feature/pty-win10-early` 分支含一个渲染模块：
+<https://github.com/wbw121124/wbwtty/tree/feature/pty-win10-early>
+
+恢复工作时**先评估能否直接复用它的渲染/虚拟屏层**，避免重复实现 VT 渲染、
+光标管理、ANSI 解析等与注入无关的部分。
 
 ---
 

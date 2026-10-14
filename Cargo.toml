@@ -18,7 +18,13 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 windows-sys = "0.61"
 # `no_std` flavour: the injected DLL has no allocator (AGENTS.md rule 3).
-iced-x86 = { version = "1.21", default-features = false, features = ["no_std"] }
+# `decoder`/`instr_info` expose the Instruction API the inline hook and the
+# host-side stub tests rely on.
+iced-x86 = { version = "1.21", default-features = false, features = [
+    "no_std",
+    "decoder",
+    "instr_info",
+] }
 
 # The injected DLL is `no_std`, which requires `panic = "abort"`. Cargo only
 # accepts `panic` in root profiles, so it is set workspace wide; the `test`

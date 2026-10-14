@@ -297,6 +297,7 @@ name = "wbwpty-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "iced-x86",
  "tempfile",
  "windows-sys",
 ]

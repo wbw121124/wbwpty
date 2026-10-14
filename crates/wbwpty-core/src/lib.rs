@@ -13,6 +13,7 @@
 
 pub mod child;
 pub mod error;
+pub mod manual_map;
 pub mod pipe;
 
 pub use anyhow::{Error, Result};

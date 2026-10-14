@@ -113,3 +113,28 @@ cargo test --release                  # 相关测试必须全绿
 | 输出要等 4KB 才出现 | CRT 全缓冲；检查 `setvbuf(_IOLBF)` 与"读输入前 `_flushall`"是否生效 |
 | 子进程又冒出 conhost | `ConsoleHandle` 补丁是否生效（阶段 6）；std handle 是否标记可继承 |
 | `iced-x86` 在 no_std 下编译失败 | 退回手写 x64 长度解码器（在 `hook.rs` 里已留降级分支） |
+| `ReadProcessMemory` 报 `ERROR_PARTIAL_COPY` | **目标里还没映射这个模块**。挂起进程只有 exe + ntdll，必须等 loader 跑完（见规则 7） |
+| 目标一直不进入口点 | 见 README 5.3；先确认是不是"我们没动它也进不去" |
+
+## 7'. 已踩过的坑（别再踩）
+
+1. **挂起进程的 `PEB->Ldr` 是 NULL**。`CREATE_SUSPENDED` 时 loader 尚未运行，
+   目标里除 exe 与 ntdll 外无任何映射，宿主与目标的 `KERNEL32.dll` 基址也不同
+   （Shared mapping 只在同一 boot 的"已加载"进程间共享）。
+   → 所以"挂起 → 手工映射 → 从目标解析导入"这条路是死的，
+   现有方案是 **入口点 trampoline**（patch `AddressOfEntryPoint` → resume →
+   loader 跑完停在 dispatcher → 宿主再解析导入 → 放行）。
+2. **x64 PE 的重定位是 `IMAGE_REL_BASED_DIR64`(10)**，不是 `HIGHLOW`(3)。两个都要实现。
+3. **手写 x64 机器码时 REX 前缀的 R/B 位极易写错**，而且错得很隐蔽
+   （`mov r10, [r9]` 曾被编码成 `mov r9, [r9]`，`mov rcx, r11` 编成 `mov rcx, r9`）。
+   → 每个 stub 都必须有**真正执行它**的单测（分配 RWX 页 + 真实跳转），
+   光比对字节不够；字节比对再叠一层防回归。
+4. `no_std` cdylib 必须自己导出 `rust_eh_personality`（sysroot 的 `core` 按 unwind 编译）。
+5. 读 PE 数据目录/名字字符串要用 RVA→文件偏移的映射（`PeImage::read_rva`），
+   直接拿 RVA 当文件偏移会读到垃圾。
+
+## 10. 外部可复用模块（评估过再用）
+
+- `wbw121124/wbwtty` 分支 `feature/pty-win10-early`：含渲染模块。
+  恢复工作时优先评估复用它的渲染/虚拟屏层，而不是自己重写 VT 渲染。
+  <https://github.com/wbw121124/wbwtty/tree/feature/pty-win10-early>
