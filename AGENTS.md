@@ -143,17 +143,27 @@ cargo test --release                  # 相关测试必须全绿
 13. **`ConsoleHandle` 哨兵挡不住孙进程**（2026-10 实测推翻 README 1.2）：即使每 5ms 连续重申
     `0x123`，`cmd /c` 的孙进程照样拿到 9001×120 的 conhost。证据：进程树
     `wbwpty → cmd → cmd → conhost.exe`，以及孙进程自己的 `mode con` 有输出而顶层目标没有。
-    参见 README §1.2，修复只能从拦截 `CreateProcess` 入手。
-14. **别用 `cmd.exe` 的输入回显来判断"孙进程有输出"**：交互式 cmd 会把你喂进去的命令行原样
+    **真正的开关是 `DETACHED_PROCESS` + `STARTF_USESTDHANDLES`，两半缺一不可**
+    （完整矩阵见 README §1.2 与 `tests/descendant_creation.rs`）。
+14. **`GetStdHandle(0..2)` 可能返回 `INVALID_HANDLE_VALUE`**，哪怕该进程的 stdout 是完全可用的
+    管道。拿它去填子进程的 `STARTUPINFOW` = 传三个坏句柄，子进程立刻 exit 1。
+    要传"本进程真正在写的句柄"就用 CRT 的 `as_raw_handle`。
+15. **别用 `cmd.exe` 的输入回显来判断"孙进程有输出"**：交互式 cmd 会把你喂进去的命令行原样
     回显到 stdout。如果回显文本里含断言用的标记串，测试就会假阳性。
     `grandchild_output_reaches_the_pipe` 之前就是这么"通过"的。
     现在标记串用 `for %i in (NEU) do @echo %i7Q2K5` 拼出来，命令行里只有字面量 `%i`。
-15. **计数 conhost 判据容易被短命进程骗过**：孙进程活得比采样还短时，`after` 与 `before`
-    差值是竞态。要归因就抓进程树（`Win32_Process` 的 `ParentProcessId`），
-    或者让孙进程自己把 `mode con` 写进文件。
-16. **`SystemTime::now()` 在 Windows 上约 15.6ms 分辨率**：同一 tick 内两次取样会得到相同值，
+16. **计数 conhost 判据容易被短命进程骗过**：孙进程活得比采样还短时，`after` 与 `before`
+    差值是竞态。要归因就抓进程树（`PROCESSENTRY32W::th32ParentProcessID`），
+    并把子进程 pid 落盘以便归属；`inspect::conhost_parents()` 提供这个能力。
+17. **测试里清理 console host 必须精确到自己的子进程**：早先版本杀掉"所有非基线 conhost 的
+    父进程"，并行跑时把别的测试的 fixture 也杀了，表现为两个无关测试随机失败——
+    看起来像被测对象有并发 bug。
+18. **测试夹具之间不要共享进程级状态**：pidfile 走环境变量时，4 个并行测试互相覆盖；
+    改走命令行参数。同理，夹具的失败必须用**不同的退出码**区分
+    （spawn 失败 / wait 失败 / 取退出码失败），否则都表现为"exit 0"。
+19. **`SystemTime::now()` 在 Windows 上约 15.6ms 分辨率**：同一 tick 内两次取样会得到相同值，
     拿它当 session nonce 会让两个会话撞管道名。`nonce()` 里混了原子计数器。
-17. **`stable_modules()` 里第一次遍历失败不等于失败**：`LdrpInitializeProcess` 是逐个挂链的，
+20. **`stable_modules()` 里第一次遍历失败不等于失败**：`LdrpInitializeProcess` 是逐个挂链的，
     跨过挂链点的遍历会触发 doubly-linked 校验失败。机器一忙就复现。
     现在两种遍历失败都当作"还没就绪"重试到超时。
 

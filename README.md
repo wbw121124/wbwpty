@@ -28,43 +28,74 @@
 
 因此本项目**必须**用 `DETACHED_PROCESS | CREATE_SUSPENDED` 创建目标进程。
 
-### 1.2 `ConsoleHandle` 补丁：**实测不成立**（2026-10 复核）
+### 1.2 孙进程必须用 `DETACHED_PROCESS` + `STARTF_USESTDHANDLES` 创建
 
 这一节原本声称：`PEB->ProcessParameters->ConsoleHandle` 为空 → base API 给孙进程
 新分配 console → 冒出 `conhost.exe`；把它写成非空哨兵（`0x123`）就能让整棵进程树
 都不再分配 console。
 
-**本机实测推翻了这个说法。**（Windows 10 19045，`cmd.exe`，x64）
+**本机实测推翻了这个说法**（Windows 10 19045，`cmd.exe`，x64），并找到了真正的开关。
 
-| 测量 | 结果 |
-| --- | --- |
-| 直接子进程 | 无 console，stdio 走管道 ✅（项目核心目标成立） |
-| 孙进程 | **有自己的 console**，输出进了那个 console，永远不进我们的管道 ❌ |
-| 证据 1 | 进程树：`wbwpty → cmd → cmd → conhost.exe` |
-| 证据 2 | 孙进程自己的 `mode con` 报告 `行数 9001 / 列数 120`（conhost 的默认缓冲）；顶层目标的 `mode con` 什么都没有 |
+孙进程现状：它**有自己的 console**，输出进了那个 console，永远不进我们的管道。
+两条独立证据：
 
-试过并**全部无效**的干预手段：
+- 进程树：`wbwpty → cmd → cmd → conhost.exe`
+- 孙进程自己的 `mode con` 报告 `行数 9001 / 列数 120`（conhost 默认缓冲），
+  而顶层目标的 `mode con` 什么都没有
+
+试过并**全部无效**的干预：
 
 | 干预 | 结果 |
 | --- | --- |
 | 目标启动前把 `ConsoleHandle` 写成 `0x123` | **目标直接死**：`STATUS_DLL_INIT_FAILED (0xC0000142)` |
-| 目标启动前把 `ConsoleHandle` 写成它自己的 `StandardOutput`（真实句柄） | 同样 `0xC0000142` |
-| 注入后写 `0x123` | 写进去了，能稳住整个会话（`console_handle=0x123` 持续 3 秒不变） |
-| 注入后**每 5ms 连续重申** `0x123` 2 秒 | 孙进程**仍然**拿到 9001×120 的 console |
-| `ConsoleFlags \|= STARTF_USETDHANDLES`（0x100） | 无任何可观测差异，故未写入活进程 |
+| 目标启动前把它写成自己的 `StandardOutput`（真实句柄） | 同样 `0xC0000142` |
+| 注入后写 `0x123` | 写进去了，能稳住整个会话 |
+| 注入后**每 5ms 连续重申** `0x123` 两秒 | 孙进程**仍然**拿到 9001×120 的 console |
+| `ConsoleFlags \|= STARTF_USESTDHANDLES`（0x100） | 无任何可观测差异，故未写入活进程 |
 
 内核给 `DETACHED_PROCESS` + `STARTF_USESTDHANDLES` 创建的子进程
 `ConsoleHandle = INVALID_HANDLE_VALUE`、`ConsoleFlags = 0x1`；
 目标会在自己启动过程中（约 100 ms）把 `ConsoleHandle` 归一化成 `0`。
 
-**结论**：孙进程拿 console 这件事，目前在本项目里解决不了——能写的时机（启动后）
-太晚，起作用的东西又还没找到。要让孙进程可用，下一步必须去拦截目标自己的
-`CreateProcess`，显式填 `STARTF_USESTDHANDLES` + 父进程的 std handle
-（Stage 8 的 `KernelBase` hook），或者找到 base API 真正看的那一个字段。
+#### 真正有效的组合（实测矩阵）
 
-回归测试见 `crates/wbwpty-core/src/session.rs` 里被 `#[ignore]` 的
-`grandchild_output_reaches_the_pipe`，以及
-`rewriting_the_console_handle_before_startup_kills_the_target`。
+`crates/wbwpty-core/tests/descendant_creation.rs` 用 `wbwpty-spawn-probe`
+把 `CreateProcessW` 的创建标志 × `STARTF_USESTDHANDLES` 全跑了一遍：
+
+| 创建方式 | 会冒 conhost | 输出进管道 |
+| --- | --- | --- |
+| 纯句柄继承 | 是 | 否 |
+| 纯句柄继承（不继承句柄） | 是 | 否 |
+| `STARTF_USESTDHANDLES` | 是 | **是** |
+| `STARTF_USESTDHANDLES`（不继承句柄） | 是 | 否 |
+| `DETACHED_PROCESS` | **否** | 否 |
+| **`DETACHED_PROCESS` + `STARTF_USESTDHANDLES`** | **否** | **是** |
+| `DETACHED_PROCESS`（不继承句柄） | 否 | 否 |
+| `CREATE_NO_WINDOW` | 是 | 否 |
+| `CREATE_NO_WINDOW` + `STARTF_USESTDHANDLES` | 是 | **是** |
+| `CREATE_NEW_CONSOLE` | 是 | 否 |
+
+**两半是独立的，只有一行同时满足两个承诺：**
+
+- `STARTF_USESTDHANDLES` 负责**输出**——光靠句柄继承不行，这正是孙进程输出丢失的原因。
+- `DETACHED_PROCESS` 负责**不冒 conhost**——光有显式标准句柄**不够**，
+  这就是为什么 `cmd /c "cmd /c echo hi > file"`（重定向走的就是 `STARTF_USESTDHANDLES`）
+  照样会弹出 conhost。
+
+**因此 Stage 8 的方案已经确定**：在目标进程内拦截 `CreateProcess*`，同时做两件事——
+把 `DETACHED_PROCESS` 或进 `dwCreationFlags`，并用父进程的 std handle 填
+`STARTF_USESTDHANDLES`。只做其中一件，另一半承诺就是破的。
+
+回归测试见 `tests/descendant_creation.rs`
+（`detached_process_with_std_handles_is_what_a_descendant_needs` 断言的就是这一行），
+以及 `session.rs` 里被 `#[ignore]` 的 `grandchild_output_reaches_the_pipe`——
+它要等 hook 落地才能转绿。
+
+#### 顺带测到的坑
+
+`GetStdHandle(0..2)` 在某些进程里返回 `INVALID_HANDLE_VALUE`，尽管该进程的 stdout
+是一个完全可用的管道。往子进程传这三个值等于传三个坏句柄，子进程立刻 exit 1。
+要拿"本进程真正在写的句柄"，用 CRT 的 `as_raw_handle`，不要用 `GetStdHandle`。
 
 ### 1.3 注入时机
 
@@ -212,7 +243,7 @@ cargo test --release
 | 5 | CLI | 会话循环：双泵 / EOF / 退出码 / `--dump-conhost` / `--verbose` | （同上） | ✅ |
 | 6 | PEB | 宿主侧（挂起态 + 注入后各一次）读/写目标 `ConsoleHandle`，偏移断言 + 运行时自检；**实测无法阻止孙进程分配 console**，见 §1.2 | `fix(peb): own the console state from the host side` | ✅（机制被证伪，已记录） |
 | 7 | CRT | `_open_osfhandle`/`_dup2`/`setvbuf(_IOLBF)`/`_flushall` | ⏳ |
-| 8 | shim | KernelBase 内联 hook（`GetConsoleMode`/`WriteConsoleW`/`ReadConsoleW`/`GetConsoleScreenBufferInfo`）——**孙进程问题只能从这里解决** | ⏳ |
+| 8 | shim | KernelBase 内联 hook：`CreateProcess*` 拦截（`DETACHED_PROCESS` + `STARTF_USESTDHANDLES`，见 §1.2）+ console API shim | ⏳ |
 | 9 | 测试 | cmd/python/大输出/stderr/无 conhost/孙进程 | ⏳ |
 | 10 | 文档 | README 定稿 | ⏳ |
 
@@ -222,8 +253,9 @@ cargo test --release
 - `wbwpty.exe --dump-conhost -- cmd.exe /c echo hello` 实测：**hello 原样输出，exit=0，conhost.exe 数量不变**，stderr 干净。
 - 手工映射每一段机器码都有**真正执行**的单测（不是只比对字节），`stub.rs` 已简化为只负责"调 DllMain"，不再携带死代码。
 - 核心注入失败根因已定位：**stub 用 `r9d` 而不是 `edx` 传 `DLL_PROCESS_ATTACH`**（Win64 第 2 参数在 `rdx`），导致 `DllMain` 拿到假 reason 直接 return TRUE 而不做任何事；修完后 stub 调用真实成功。
-- **本轮把 Stage 6 的前提证伪了**（见 §1.2）：`ConsoleHandle` 哨兵挡不住孙进程拿到 console。
-  孙进程的输出去向已由两条独立证据钉死（进程树 + `mode con`），但**还没修好**。
+- **本轮把 Stage 6 的前提证伪了，并找到了真正的开关**（见 §1.2）：`ConsoleHandle` 哨兵
+  挡不住孙进程拿到 console；实测矩阵表明只有 `DETACHED_PROCESS` + `STARTF_USESTDHANDLES`
+  同时满足"不冒 conhost"和"输出进管道"，两半缺一不可。方案已定，**尚未实现**。
 - `cmd /c <短命令>` 这类目标**基本永远注不进去**：`stable_modules` 需要 ~100ms 稳定窗口，
   而目标几毫秒就退出。stdio 走 `STARTF_USESTDHANDLES` 所以不影响它工作，但任何注入侧的
   语义补丁（哨兵、shim、CRT）对它都不生效。
@@ -259,9 +291,10 @@ wbwpty: pid 4328 sentinel Written(ConsoleState { console_handle: 291, console_fl
 wbwpty: pid 4328 payload stage=ConsoleAlreadySet reason=1 attach_path_ran=true
 ```
 
-**孙进程问题没有解决**，原因见 §1.2。下一步：
-- Stage 8 里的 `CreateProcess` 拦截：给孙进程显式填 `STARTF_USESTDHANDLES`，
-  否则输出永远进不了管道（同时也要让它们别再拿到 console）。
+**孙进程问题还没修好，但方案已经测出来了**（§1.2）。下一步：
+- **Stage 8 里的 `CreateProcess` 拦截**：同时做两件事——`dwCreationFlags |= DETACHED_PROCESS`，
+  并用父进程的 std handle 填 `STARTF_USESTDHANDLES`。两半缺一不可，都有实测支撑。
+  注意句柄要取自 CRT（`as_raw_handle`），不能取 `GetStdHandle`。
 - Stage 7：CRT 行缓冲修复（`setvbuf(_IOLBF)`）—— 目前目标 stdout 是全缓冲，大输出会延迟。
 - Stage 9：端到端测试（python、大输出、stderr）。
 

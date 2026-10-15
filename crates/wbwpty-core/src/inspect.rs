@@ -63,6 +63,66 @@ pub fn conhost_count() -> Result<usize> {
     Ok(conhosts)
 }
 
+/// Live `conhost.exe` processes as `(pid, parent pid)`.
+///
+/// The `conhost.exe` a console gets is spawned as a child of the process that
+/// owns the console, so the parent is what makes the difference between "this
+/// process tree caused a console host" and "the machine already had one".
+/// Counting alone cannot tell those apart: a test harness runs inside a console,
+/// and a machine with anything else running moves the count for unrelated
+/// reasons. Measured against a short-lived child it is worse than useless - the
+/// child is often gone before the "after" count is taken, and the delta is a
+/// coin flip.
+pub fn conhost_parents() -> Result<Vec<(u32, u32)>> {
+    // SAFETY: the snapshot handle and entry buffer are owned by this function.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    let snapshot = Handle::from_raw(snapshot as isize);
+    if !snapshot.is_valid() {
+        return Err(anyhow::anyhow!(
+            "CreateToolhelp32Snapshot: {}",
+            last_error_text()
+        ));
+    }
+
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+    let mut hosts = Vec::new();
+    // SAFETY: `snapshot` is live; `entry` is correctly sized.
+    let mut ok = unsafe { Process32FirstW(snapshot.as_raw() as _, &mut entry) };
+    while ok != 0 {
+        if name_equals(&entry.szExeFile, "conhost.exe") {
+            hosts.push((entry.th32ProcessID, entry.th32ParentProcessID));
+        }
+        // SAFETY: same handles.
+        ok = unsafe { Process32NextW(snapshot.as_raw() as _, &mut entry) };
+    }
+    Ok(hosts)
+}
+
+/// Terminates a process by pid, so a test can clean up after a fixture that
+/// deliberately spawns something.
+///
+/// Exists because the fixtures here spawn children on purpose, and a child that
+/// got a console of its own leaves a visible `conhost.exe` window behind it.
+/// That is the very thing the project exists to prevent, so a test that provokes
+/// it has to be the one to take it down again.
+pub fn terminate(pid: u32) -> Result<bool> {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    // SAFETY: `PROCESS_TERMINATE` is the only access requested and the returned
+    // handle is closed before returning.
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        return Ok(false);
+    }
+    let handle = Handle::from_raw(handle as isize);
+    // SAFETY: the handle was just opened with terminate access.
+    let ok = unsafe { TerminateProcess(handle.as_raw() as HANDLE, 0) } != 0;
+    Ok(ok)
+}
+
 /// `PROCESSENTRY32W::szExeFile` is a fixed `[u16; MAX_PATH]` that is not NUL
 /// terminated in pathological cases.
 fn name_equals(buffer: &[u16], expected: &str) -> bool {

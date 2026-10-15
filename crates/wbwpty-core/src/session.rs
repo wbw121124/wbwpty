@@ -309,6 +309,12 @@ impl Session {
         }
     }
 
+    /// The session's pipes, for a caller that wants to read the output itself
+    /// instead of having it mirrored onto the host's stdout.
+    pub fn pipes(&self) -> &Arc<SharedPipes> {
+        &self.pipes
+    }
+
     /// Starts a thread mirroring the host's stdin into the `-in` pipe.
     ///
     /// Host stdin EOF must reach the target as a *pipe* EOF, which only happens
@@ -716,12 +722,25 @@ mod tests {
     /// console we do not own and cannot read. README 1.2's mechanism - a
     /// non-null `ConsoleHandle` sentinel - was supposed to prevent exactly this
     /// and **does not**: enforced continuously from after startup it changes
-    /// nothing. `ConsoleFlags |= STARTF_USESTDHANDLES` likewise does nothing.
-    /// What does work is narrowing the gap: `ConsoleHandle` cannot be rewritten
-    /// before the target starts at all (see
-    /// `rewriting_the_console_handle_before_startup_kills_the_target`), so the
-    /// window in which a startup-time descendant can grab a console cannot be
-    /// closed from outside the process.
+    /// nothing. `ConsoleFlags |= STARTF_USESTDHANDLES` likewise does nothing,
+    /// and `ConsoleHandle` cannot be rewritten before the target starts at all
+    /// (see `rewriting_the_console_handle_before_startup_kills_the_target`).
+    ///
+    /// # What does work
+    ///
+    /// `tests/descendant_creation.rs` measures the whole matrix of
+    /// `CreateProcessW` flags against `STARTF_USESTDHANDLES`. The two halves are
+    /// independent and only one row satisfies both promises:
+    ///
+    /// | flags | console host | output |
+    /// | --- | --- | --- |
+    /// | `STARTF_USESTDHANDLES` only | **spawns one** | yes |
+    /// | `DETACHED_PROCESS` only | none | **no** |
+    /// | **`DETACHED_PROCESS` + `STARTF_USESTDHANDLES`** | none | yes |
+    ///
+    /// So the fix is to intercept `CreateProcess` in the target and do both:
+    /// OR `DETACHED_PROCESS` into `dwCreationFlags`, and fill in
+    /// `STARTF_USESTDHANDLES` with the parent's handles. That is Stage 8.
     ///
     /// `#[ignore]`d rather than deleted so the moment it starts passing is
     /// obvious.

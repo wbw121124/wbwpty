@@ -744,7 +744,7 @@ impl RemoteProcess {
         settle: std::time::Duration,
     ) -> Result<Vec<RemoteModule>> {
         let deadline = std::time::Instant::now() + timeout;
-        let mut last_error: Option<anyhow::Error> = None;
+        let mut last_error: Option<anyhow::Error>;
         let mut best_effort = 0usize;
 
         loop {
