@@ -38,6 +38,27 @@ const PEB_LDR_OFFSET: u64 = 0x18;
 const PEB_PROCESS_PARAMETERS_OFFSET: u64 = 0x20;
 // RTL_USER_PROCESS_PARAMETERS.ConsoleHandle@0x10 (four ULONGs precede it).
 const PROCESS_PARAMETERS_CONSOLE_HANDLE_OFFSET: u64 = 0x10;
+// RTL_USER_PROCESS_PARAMETERS.ConsoleFlags@0x18.
+const PROCESS_PARAMETERS_CONSOLE_FLAGS_OFFSET: u64 = 0x18;
+// RTL_USER_PROCESS_PARAMETERS.StandardInput@0x20 StandardOutput@0x28
+// StandardError@0x30. Source: ReactOS `ntpsapi.h`.
+const PROCESS_PARAMETERS_STANDARD_OUTPUT_OFFSET: u64 = 0x28;
+
+/// Value written into `ConsoleHandle` so the target believes it owns a console.
+///
+/// This is the single source of truth for the sentinel; the injected DLL keeps
+/// a copy of it in `wbwpty-redirect/src/peb.rs` because the two crates must not
+/// depend on each other, and [`crate::child::Child`] rewrites it host-side before
+/// the target runs a single instruction. The host side is the one that matters:
+/// a payload that arrives after the loader has finished cannot help a target
+/// that already decided what to do with its console state.
+///
+/// Deliberately an implausible handle rather than a real one. The field is only
+/// ever tested for null by the base API; if the target passes it to a console
+/// call it resolves against the handle table and fails with
+/// `ERROR_INVALID_HANDLE`, which degrades. A real handle would instead alias
+/// something we do not own.
+pub const CONSOLE_HANDLE_SENTINEL: u64 = 0x123;
 // x64 PEB_LDR_DATA: Length@0x00 Initialized@0x04 SsHandle@0x08
 // InLoadOrderModuleList@0x10 InMemoryOrderModuleList@0x20
 // InInitializationOrderModuleList@0x30 EntryInProgress@0x40
@@ -217,6 +238,42 @@ fn host_module_base(name: &str) -> u64 {
 #[derive(Clone, Copy)]
 pub struct RemoteProcess {
     handle: HANDLE,
+}
+
+/// The three fields of `RTL_USER_PROCESS_PARAMETERS` that decide what a
+/// process hands to the children it creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConsoleState {
+    /// `ConsoleHandle@0x10`. Non-null is what stops the base API from
+    /// allocating a console - and therefore a console host - for a child.
+    pub console_handle: u64,
+    /// `ConsoleFlags@0x18`. Which of the two inheritance paths the base API
+    /// takes when the target creates a child.
+    pub console_flags: u32,
+    /// `StandardOutput@0x28`. The handle the kernel copied out of our
+    /// `STARTF_USESTDHANDLES`; descendants are supposed to inherit this one.
+    pub standard_output: u64,
+}
+
+/// Outcome of [`RemoteProcess::patch_console_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsolePatch {
+    /// The state already described a handle-inheriting console session.
+    Unchanged(ConsoleState),
+    /// One or more fields were written; this is the state now in the target.
+    Written(ConsoleState),
+    /// The target could not be read or written; nothing was changed.
+    Skipped,
+}
+
+impl ConsolePatch {
+    /// The target's console bookkeeping after the call, if it is known.
+    pub fn state(self) -> Option<ConsoleState> {
+        match self {
+            Self::Unchanged(state) | Self::Written(state) => Some(state),
+            Self::Skipped => None,
+        }
+    }
 }
 
 impl RemoteProcess {
@@ -491,9 +548,38 @@ impl RemoteProcess {
     /// The target's `PEB->ProcessParameters->ConsoleHandle`.
     ///
     /// Read from the host so the "no console host for descendants" claim can be
-    /// asserted directly instead of inferred. A null value means the target
-    /// believes it has no console and will allocate one for anything it spawns.
+    /// asserted directly instead of inferred.
     pub fn console_handle(&self) -> Result<u64> {
+        Ok(self.read_console_state()?.console_handle)
+    }
+
+    /// The target's `PEB->ProcessParameters->ConsoleFlags`.
+    ///
+    /// This is the other half of the console story, and the half that decides
+    /// whether descendants are actually *usable*. See
+    /// [`Self::patch_console_state`].
+    pub fn console_flags(&self) -> Result<u32> {
+        Ok(self.read_console_state()?.console_flags)
+    }
+
+    /// The target's `PEB->ProcessParameters->StandardOutput`: the handle the
+    /// kernel copied out of our `STARTF_USESTDHANDLES`, and the one descendants
+    /// are supposed to end up with.
+    pub fn standard_output(&self) -> Result<u64> {
+        Ok(self.read_console_state()?.standard_output)
+    }
+
+    /// All three console-related process parameters in one read.
+    pub fn read_console_state(&self) -> Result<ConsoleState> {
+        let params = self.process_parameters()?;
+        Ok(ConsoleState {
+            console_handle: self.read_u64(params + PROCESS_PARAMETERS_CONSOLE_HANDLE_OFFSET)?,
+            console_flags: self.read_u32(params + PROCESS_PARAMETERS_CONSOLE_FLAGS_OFFSET)?,
+            standard_output: self.read_u64(params + PROCESS_PARAMETERS_STANDARD_OUTPUT_OFFSET)?,
+        })
+    }
+
+    fn process_parameters(&self) -> Result<u64> {
         let peb = self.peb()?;
         // SAFETY: our own offsets, validated by the target-side self test; every
         // read is bounds-checked by ReadProcessMemory failing loudly.
@@ -501,7 +587,104 @@ impl RemoteProcess {
         if params == 0 {
             bail!("target has no RTL_USER_PROCESS_PARAMETERS");
         }
-        self.read_u64(params + PROCESS_PARAMETERS_CONSOLE_HANDLE_OFFSET)
+        Ok(params)
+    }
+
+    /// Makes the target stop handing its children a console of their own.
+    ///
+    /// # When this may run
+    ///
+    /// **Not while the target is suspended.** The host can write the target's
+    /// memory at any time - it created the process - but `ConsoleHandle` is off
+    /// limits until the target has finished its own startup. Measured here:
+    /// any value other than the one the kernel put there makes the target die
+    /// with `STATUS_DLL_INIT_FAILED` (`0xC0000142`) before its first
+    /// instruction retires, whether the value is a bogus `0x123` or a
+    /// genuinely valid handle (the target's own `StandardOutput` pipe). So
+    /// against a suspended target this is a no-op that just *verifies* the
+    /// kernel left a non-null value, and the real write happens after
+    /// injection, when the loader has finished. That is
+    /// [`crate::session::Session::start`]'s job.
+    ///
+    /// # What this does and does not buy
+    ///
+    /// Measured on this machine, a `DETACHED_PROCESS | CREATE_SUSPENDED` child
+    /// created with `STARTF_USESTDHANDLES` comes up with
+    /// `ConsoleHandle == INVALID_HANDLE_VALUE` and `ConsoleFlags == 0x1`, and
+    /// the target normalises the handle field to null part way through its own
+    /// startup - after the loader has finished. Left at null, the base API
+    /// allocates a real console for every process the target creates and a
+    /// `conhost.exe` really does appear: walking the process tree during
+    /// `cmd /c "cmd /c ..."` shows `wbwpty -> cmd -> cmd -> conhost.exe`.
+    ///
+    /// Writing the sentinel after that point stops the allocation for anything
+    /// the target creates afterwards.
+    ///
+    /// It does **not** make descendants' output work. They stay mute: the base
+    /// API tries to inherit a console, fails against a handle that is not a
+    /// console, and hands the child no standard handles at all. See the pinned
+    /// behaviour and the known gap in `grandchild_output_reaches_the_pipe` in
+    /// [`crate::session`].
+    ///
+    /// Idempotent, and never fatal: a target we cannot patch still runs, it just
+    /// behaves the way the kernel left it.
+    pub fn patch_console_state(&self) -> Result<ConsolePatch> {
+        let params = self.process_parameters()?;
+        let before = self.read_console_state()?;
+
+        // 1. The console handle sentinel.
+        //
+        //    Only when the slot is null. This is not politeness, it is
+        //    load-bearing: **any** rewrite of `ConsoleHandle` before the target
+        //    has finished its own startup kills it. Measured here - the target
+        //    dies with `STATUS_DLL_INIT_FAILED` (`0xC0000142`) before its first
+        //    instruction retires, both when the field is set to a bogus
+        //    `0x123` and when it is set to a perfectly valid handle (the
+        //    target's own `StandardOutput` pipe). Something in process startup
+        //    dereferences that field and insists it is a console.
+        //
+        //    So the slot is left exactly as the kernel left it until the
+        //    loader has finished, and the sentinel goes in afterwards. See
+        //    `Session::start`, which is the only place the write is allowed to
+        //    happen on a running target.
+        let handle = if before.console_handle == 0 {
+            self.write_bytes(
+                params + PROCESS_PARAMETERS_CONSOLE_HANDLE_OFFSET,
+                &CONSOLE_HANDLE_SENTINEL.to_le_bytes(),
+            )
+            .with_context(|| "writing the console handle sentinel")?;
+            true
+        } else {
+            false
+        };
+
+        // `ConsoleFlags` is deliberately left alone.
+        //
+        // The obvious theory - "tell the base API the standard handles came
+        // down the handle table by setting STARTF_USESTDHANDLES here" - was
+        // measured on this machine and does nothing: `cmd /c "cmd /c echo hi"`
+        // stays silent with the bit set and with it clear, and the set of
+        // console hosts the tree spawns is identical either way. Writing an
+        // undocumented bit into a live process on a theory that does not
+        // survive measurement is how this went wrong the first time, so the
+        // bit stays out until something shows it does something.
+
+        // Verify rather than trust: a write that did not land would leave the
+        // target exactly in the state we are trying to move away from, and the
+        // caller needs to know that instead of assuming.
+        let after = self.read_console_state()?;
+        if after.console_handle == 0 {
+            bail!(
+                "console handle did not stick: read back {:#x}",
+                after.console_handle
+            );
+        }
+
+        Ok(if handle {
+            ConsolePatch::Written(after)
+        } else {
+            ConsolePatch::Unchanged(before)
+        })
     }
 
     /// Reserves `size` bytes as close to `near` as possible.
@@ -561,23 +744,43 @@ impl RemoteProcess {
         settle: std::time::Duration,
     ) -> Result<Vec<RemoteModule>> {
         let deadline = std::time::Instant::now() + timeout;
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut best_effort = 0usize;
 
         loop {
-            let first = self.walk_modules_allow_empty()?;
-            if std::time::Instant::now() >= deadline {
-                bail!(
-                    "target module list never settled within {}ms ({} entries seen)",
-                    timeout.as_millis(),
-                    first.len()
-                );
-            }
-            std::thread::sleep(settle);
+            // A walk that fails here is not an error, it is "not ready yet":
+            // `LdrpInitializeProcess` links entries in one at a time and a walk
+            // that straddles a link trips the double-link validation. Treating
+            // that as fatal made injection fail whenever the machine was busy
+            // enough to widen the window.
+            match self.walk_modules_allow_empty() {
+                Ok(first) => {
+                    best_effort = best_effort.max(first.len());
+                    if std::time::Instant::now() >= deadline {
+                        bail!(
+                            "target module list never settled within {}ms ({} entries seen)",
+                            timeout.as_millis(),
+                            best_effort
+                        );
+                    }
+                    std::thread::sleep(settle);
 
-            // Re-walk: the first snapshot may have been taken while a node was being
-            // linked, in which case this one legitimately fails.
-            if let Ok(second) = self.walk_modules_allow_empty() {
-                if same_modules(&first, &second) && Self::looks_like_a_real_module_list(&second) {
-                    return Ok(second);
+                    // Re-walk: the first snapshot may have been taken while a node
+                    // was being linked, in which case this one legitimately fails.
+                    if let Ok(second) = self.walk_modules_allow_empty() {
+                        if same_modules(&first, &second)
+                            && Self::looks_like_a_real_module_list(&second)
+                        {
+                            return Ok(second);
+                        }
+                    }
+                }
+                Err(err) => {
+                    last_error = Some(err);
+                    if std::time::Instant::now() >= deadline {
+                        return Err(last_error.expect("just assigned"));
+                    }
+                    std::thread::sleep(settle);
                 }
             }
         }

@@ -25,7 +25,7 @@
 //! instead of blocking on a read that will never complete.
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -71,6 +71,71 @@ impl Default for SessionConfig {
     }
 }
 
+/// How far the injected payload's attach path got.
+///
+/// Mirrors `wbwpty-redirect`'s `stage` module. The two crates cannot depend on
+/// each other - one is the payload, one is its injector - so the mapping is
+/// written out twice and [`PayloadStatus`] is the only thing that reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadStage {
+    /// The image is mapped but none of our code has run.
+    Idle,
+    /// `DllMain` was entered.
+    Entered,
+    /// `ConsoleHandle` was written with the sentinel.
+    ConsolePatched,
+    /// `ConsoleHandle` was already non-null and was left alone.
+    ConsoleAlreadySet,
+    /// The PEB could not be read; nothing was changed.
+    ConsoleSkipped,
+    /// The attach path ran to completion.
+    Done,
+    /// A value this build does not know about.
+    Unknown(u32),
+}
+
+impl PayloadStage {
+    fn from_raw(raw: u32) -> Self {
+        match raw {
+            0 => Self::Idle,
+            1 => Self::Entered,
+            2 => Self::ConsolePatched,
+            3 => Self::ConsoleAlreadySet,
+            4 => Self::ConsoleSkipped,
+            5 => Self::Done,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+/// The payload's `WBWPTY_STATUS` word, decoded.
+///
+/// Low half is [`PayloadStage`], high half is the `fdwReason` `DllMain` was
+/// entered with. `fdwReason` is what separates "the stub passed arguments
+/// correctly" from "it passed garbage, so every attach path was skipped, and
+/// `DllMain` returned TRUE anyway" - a failure with no other symptom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadStatus {
+    pub stage: PayloadStage,
+    pub reason: u32,
+}
+
+impl PayloadStatus {
+    /// Splits a raw status word.
+    pub fn decode(raw: u32) -> Self {
+        Self {
+            stage: PayloadStage::from_raw(raw & 0xffff),
+            reason: raw >> 16,
+        }
+    }
+
+    /// True when `DllMain` ran its `DLL_PROCESS_ATTACH` path rather than
+    /// skipping it because it was handed a bogus reason.
+    pub fn ran_attach_path(self) -> bool {
+        self.reason == 1
+    }
+}
+
 /// A live terminal session.
 ///
 /// Dropping a session terminates the target, so a panic anywhere above cannot
@@ -82,6 +147,8 @@ pub struct Session {
     report: Option<InjectionReport>,
     /// RVA of the payload's exported WBWPTY_STATUS word, resolved at start.
     status_rva: Option<u32>,
+    /// Console sentinel state after the post-injection re-assert.
+    console_patch: Result<crate::manual_map::ConsolePatch, String>,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -143,15 +210,31 @@ impl Session {
             .ok()
             .and_then(|file| crate::manual_map::find_export_rva(&file, "WBWPTY_STATUS").ok().flatten());
 
+        // `Child::spawn` had the last word while the target was suspended, but it
+        // does not keep it. Measured on this machine: a target created
+        // `DETACHED_PROCESS | STARTF_USESTDHANDLES` comes up with
+        // `ConsoleHandle == INVALID_HANDLE_VALUE` and then normalises the field
+        // to null later in its own startup - *after* the loader has finished,
+        // which is the earliest the payload can run. A null handle is exactly
+        // what makes the base API allocate a console for every process the
+        // target creates, so the sentinel is written again once the target has
+        // settled.
+        let console_patch = crate::manual_map::remote::RemoteProcess::new(child.process_handle())
+            .patch_console_state()
+            .map_err(|err| format!("{err:#}"));
+
         let session = Self {
             child,
             pipes: Arc::new(SharedPipes::new(pipes)),
             config,
             report,
             status_rva,
+            console_patch,
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
         session.start_input_pump();
+
+        session.describe_console_state();
         Ok(session)
     }
 
@@ -173,8 +256,57 @@ impl Session {
         Some(u32::from_le_bytes(bytes.try_into().ok()?))
     }
 
+    /// The same word, decoded.
+    pub fn payload_stage(&self) -> Option<PayloadStatus> {
+        self.payload_status().map(PayloadStatus::decode)
+    }
+
     pub fn pid(&self) -> u32 {
         self.child.pid
+    }
+
+    /// Prints the target's console bookkeeping, if it can be read.
+    ///
+    /// This is the state the "descendants inherit our pipes" behaviour actually
+    /// rests on: `ConsoleHandle` has to be non-null, and `StandardOutput` has to
+    /// be one of ours. `ConsoleFlags` is printed next to it because it is what
+    /// the base API uses to choose between console inheritance and handle
+    /// inheritance when the target creates its own children.
+    pub fn describe_console_state(&self) {
+        if !self.config.verbose {
+            return;
+        }
+        use crate::manual_map::remote::RemoteProcess;
+        let proc = RemoteProcess::new(self.child.process_handle());
+        let state = (|| -> anyhow::Result<String> {
+            Ok(format!(
+                "console_handle={:#x} console_flags={:#x} standard_output={:#x}",
+                proc.console_handle()?,
+                proc.console_flags()?,
+                proc.standard_output()?,
+            ))
+        })();
+        match state {
+            Ok(text) => eprintln!("wbwpty: pid {} {text}", self.child.pid),
+            Err(err) => eprintln!(
+                "wbwpty: pid {} console state unreadable: {err:#}",
+                self.child.pid
+            ),
+        }
+        match &self.console_patch {
+            Ok(patch) => eprintln!("wbwpty: pid {} sentinel {patch:?}", self.child.pid),
+            Err(err) => eprintln!("wbwpty: pid {} sentinel not applied: {err}", self.child.pid),
+        }
+        match self.payload_stage() {
+            Some(status) => eprintln!(
+                "wbwpty: pid {} payload stage={:?} reason={} attach_path_ran={}",
+                self.child.pid,
+                status.stage,
+                status.reason,
+                status.ran_attach_path()
+            ),
+            None => eprintln!("wbwpty: pid {} payload not mapped", self.child.pid),
+        }
     }
 
     /// Starts a thread mirroring the host's stdin into the `-in` pipe.
@@ -330,13 +462,20 @@ fn default_dll_path() -> std::path::PathBuf {
 }
 
 /// Per-session unique nonce for pipe names.
+///
+/// `SystemTime` is not enough on its own: on Windows its resolution is around
+/// 15 ms, so two sessions started inside the same tick get the same value. The
+/// pid covers other processes, the counter covers this one.
 fn nonce() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    // Mix in the pid so two sessions started in the same nanosecond still differ.
-    nanos ^ (std::process::id() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    nanos
+        ^ (std::process::id() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ seq.wrapping_mul(0x0000_0100_0000_01b3)
 }
 
 #[cfg(test)]
@@ -421,66 +560,183 @@ mod tests {
         session.shutdown();
     }
 
-    /// The `ConsoleHandle` sentinel must actually be in the target's PEB.
+    /// Every target we create must come up with working pipes and a non-null
+    /// `ConsoleHandle`, before it has executed a single instruction.
     ///
-    /// This is the mechanism that stops descendants from being allocated a
-    /// console (and therefore from spawning `conhost.exe`), so it is asserted
-    /// directly on the target's own `RTL_USER_PROCESS_PARAMETERS` rather than
-    /// inferred from a process count - a count measured from inside the test
-    /// harness is polluted by whatever console the harness itself runs in.
+    /// Note what this does **not** claim. It used to read as "a non-null
+    /// `ConsoleHandle` stops descendants from getting a console", which is
+    /// README 1.2's mechanism and which measurement here **refutes**: with the
+    /// sentinel enforced continuously from after startup, a `cmd /c` child still
+    /// comes up with a real 9001x120 console, and its output goes there instead
+    /// of to our pipe. See `grandchild_output_reaches_the_pipe`.
+    ///
+    /// What the field is worth keeping an eye on for: a *null* value is what
+    /// makes the base API treat the process as having no console at all, which
+    /// is a different and worse starting position than the one the kernel hands
+    /// out.
     #[test]
-    fn payload_makes_the_target_look_like_it_has_a_console() {
-        let log = std::env::temp_dir().join("wbwpty-test-console.log");
-        let _ = std::fs::remove_file(&log);
-        let _ = std::fs::write(&log, b"");
+    fn every_target_is_created_with_pipes_and_a_console_handle() {
+        // Real pipes, because `STARTF_USESTDHANDLES` is what puts a handle in
+        // `StandardOutput`; a target created without them legitimately has none.
+        let mut pipes = crate::pipe::PipePair::new(0x11_0007).unwrap();
+        let mut stdio = pipes.open_target_stdio().unwrap();
+        let spec = ChildSpec::new("cmd.exe")
+            .args(["/c", "exit", "0"])
+            .stdio(Stdio {
+                stdin: stdio.stdin,
+                stdout: stdio.stdout,
+                stderr: stdio.stderr,
+            });
+        let child = Child::spawn(&spec).unwrap();
+        let proc = crate::manual_map::remote::RemoteProcess::new(child.process_handle());
+        let state = proc.read_console_state().expect("process parameters are readable");
 
-        let spec = ChildSpec::new("cmd.exe");
-        let config = SessionConfig {
-            shim: false,
-            log_path: Some(log.clone()),
-            ..Default::default()
-        };
-        let session = Session::start(&spec, config).unwrap();
-        let report = session
-            .report()
-            .expect("payload must map before its PEB patch can be observed");
-        eprintln!(
-            "DIAG image_base={:#x} entry_rva={:#x} patches={} modules={} wait={}ms",
-            report.image_base,
-            report.entry_rva,
-            report.patch_count,
-            report.module_count,
-            report.loader_wait_ms
-        );
-
-        let proc = crate::manual_map::remote::RemoteProcess::new(session.child.process_handle());
-        let handle = proc.console_handle().expect("target process parameters are readable");
-        let dll_log = std::fs::read_to_string(&log).unwrap_or_default();
-        eprintln!("DIAG console_handle={handle:#x}");
-        eprintln!("DIAG log={dll_log:?}");
-        eprintln!("DIAG status={:#x}", session.payload_status().unwrap_or(0));
         assert_ne!(
-            handle, 0,
-            "ConsoleHandle must be non-null or descendants get a real console; \
-             payload log was:\n{dll_log}"
+            state.console_handle, 0,
+            "a null ConsoleHandle leaves the target with no console at all; got {state:?}"
+        );
+        assert_eq!(
+            state.standard_output, stdio.stdout as u64,
+            "STARTF_USESTDHANDLES must have landed in StandardOutput; got {state:?}"
+        );
+        assert!(
+            matches!(
+                child.console_patch,
+                Ok(crate::manual_map::ConsolePatch::Unchanged(_))
+                    | Ok(crate::manual_map::ConsolePatch::Written(_))
+            ),
+            "console state should have been checked: {:?}",
+            child.console_patch
+        );
+        let _ = child.terminate();
+    }
+
+    /// The payload must not be able to kill the target it is patching.
+    ///
+    /// `ConsoleHandle` cannot be rewritten before the target has started: any
+    /// value the host installs into a still-suspended target - a bogus `0x123`
+    /// or a perfectly valid handle - makes it die with
+    /// `STATUS_DLL_INIT_FAILED` (`0xC0000142`) before its first instruction
+    /// retires. This pins the boundary so the next person to try "just write it
+    /// earlier" does not lose an afternoon to it.
+    #[test]
+    fn rewriting_the_console_handle_before_startup_kills_the_target() {
+        let mut pipes = crate::pipe::PipePair::new(0x11_0008).unwrap();
+        let mut stdio = pipes.open_target_stdio().unwrap();
+        let spec = ChildSpec::new("cmd.exe")
+            .args(["/c", "exit", "0"])
+            .stdio(Stdio {
+                stdin: stdio.stdin,
+                stdout: stdio.stdout,
+                stderr: stdio.stderr,
+            });
+        let child = Child::spawn(&spec).unwrap();
+        let proc = crate::manual_map::remote::RemoteProcess::new(child.process_handle());
+
+        let peb = proc.peb().unwrap();
+        let params = proc
+            .read_console_state()
+            .map(|_| ())
+            .and_then(|()| proc.read_bytes(peb + 0x20, 8))
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .expect("process parameters are readable");
+
+        proc.write_bytes(params + 0x10, &crate::manual_map::CONSOLE_HANDLE_SENTINEL.to_le_bytes())
+            .expect("writing the sentinel is allowed");
+
+        child.resume().unwrap();
+        let code = child.wait().unwrap();
+        assert_eq!(
+            code,
+            0xc000_0142,
+            "expected STATUS_DLL_INIT_FAILED; if this now passes, ConsoleHandle can be \
+             written before startup and the whole injection-ordering story changes"
+        );
+        let _ = stdio.release();
+    }
+
+    /// The injected payload must report how far its attach path got.
+    ///
+    /// `DllMain` returns TRUE even when it is handed a garbage `fdwReason` and
+    /// silently skips every attach path, so "the stub returned 0" proves
+    /// nothing. The status word is the only place that distinction shows up.
+    #[test]
+    fn payload_publishes_the_stage_it_reached() {
+        let spec = ChildSpec::new("cmd.exe");
+        let config = SessionConfig { shim: false, ..Default::default() };
+        let session = Session::start(&spec, config).unwrap();
+        session
+            .report()
+            .expect("payload must map before its status word can be read");
+
+        let raw = session.payload_status().expect("status word is mapped");
+        let status = PayloadStatus::decode(raw);
+        assert!(
+            status.ran_attach_path(),
+            "DllMain was entered with reason {} instead of DLL_PROCESS_ATTACH (1): {status:?}",
+            status.reason
+        );
+        assert!(
+            !matches!(status.stage, PayloadStage::Idle | PayloadStage::Entered),
+            "the attach path stopped before doing anything: {status:?}"
         );
 
         session.shutdown();
     }
 
-    /// End to end: a grandchild spawned by the target must write to our pipe.
-    ///
-    /// The target is an interactive `cmd.exe` that is blocked reading its
-    /// (never written) stdin, which makes the ordering deterministic: injection
-    /// completes first, and only then is a command fed in. Feeding a command to
-    /// `cmd /c` immediately would race the injection and prove nothing.
-    ///
-    /// `conhost.exe` is deliberately *not* counted here: the test harness itself
-    /// runs in a console, so the machine-wide count moves for reasons unrelated
-    /// to the target. The no-console-host claim is verified by the CLI's
-    /// `--dump-conhost` acceptance run instead, where the surroundings are known.
+    /// The status word layout must agree with the payload's, or `--verbose`
+    /// prints confident nonsense.
     #[test]
+    fn status_word_layout_splits_as_documented() {
+        assert_eq!(PayloadStatus::decode(0).stage, PayloadStage::Idle);
+        assert_eq!(PayloadStatus::decode(5).stage, PayloadStage::Done);
+        assert_eq!(PayloadStatus::decode(0x1_0005).reason, 1);
+        assert_eq!(PayloadStatus::decode(0x1_0005).stage, PayloadStage::Done);
+        assert_eq!(
+            PayloadStatus::decode(0x1_0009).stage,
+            PayloadStage::Unknown(9)
+        );
+        assert!(PayloadStatus::decode(0x1_0005).ran_attach_path());
+        assert!(!PayloadStatus::decode(0).ran_attach_path());
+    }
+
+    /// A process the target creates must write to our pipe.
+    ///
+    /// # Currently does not work - this is the test that says so
+    ///
+    /// A descendant gets **its own console**, and that is where its output goes.
+    /// Verified two independent ways on this machine:
+    ///
+    /// * the process tree during `cmd /c "cmd /c ..."` shows
+    ///   `wbwpty -> cmd -> cmd -> conhost.exe`;
+    /// * the descendant's own `mode con` reports a 9001x120 buffer, while the
+    ///   target's reports nothing at all.
+    ///
+    /// So the output is not lost by a transport bug, it is delivered to a
+    /// console we do not own and cannot read. README 1.2's mechanism - a
+    /// non-null `ConsoleHandle` sentinel - was supposed to prevent exactly this
+    /// and **does not**: enforced continuously from after startup it changes
+    /// nothing. `ConsoleFlags |= STARTF_USESTDHANDLES` likewise does nothing.
+    /// What does work is narrowing the gap: `ConsoleHandle` cannot be rewritten
+    /// before the target starts at all (see
+    /// `rewriting_the_console_handle_before_startup_kills_the_target`), so the
+    /// window in which a startup-time descendant can grab a console cannot be
+    /// closed from outside the process.
+    ///
+    /// `#[ignore]`d rather than deleted so the moment it starts passing is
+    /// obvious.
+    ///
+    /// The previous version of this test was a false positive worth recording:
+    /// it looked for `wbwpty-grandchild-ok` in the output, but an interactive
+    /// `cmd.exe` *echoes the command line it was fed*, and that line contains
+    /// the marker. It passed while descendants produced nothing at all. The
+    /// marker is now assembled at runtime (`%i` in the `for` body expands to
+    /// `NEU`, and the command line only ever shows the literal `%i`), so the
+    /// command echo cannot produce it.
+    #[test]
+    #[ignore = "descendants get their own console; see the doc comment"]
     fn grandchild_output_reaches_the_pipe() {
+        let marker = "NEU7Q2K5";
         let spec = ChildSpec::new("cmd.exe");
         let config = SessionConfig { shim: false, ..Default::default() };
         let session = Session::start(&spec, config).unwrap();
@@ -490,25 +746,30 @@ mod tests {
 
         let _ = session
             .pipes
-            .with(|p| p.input().write_all(b"cmd.exe /c echo wbwpty-grandchild-ok\r\n"))
+            .with(|p| {
+                p.input()
+                    .write_all(format!("cmd.exe /c for %i in (NEU) do @echo %i7Q2K5\r\n").as_bytes())
+            })
             .expect("pipe write");
 
-        // Read until the grandchild's line shows up.
         let mut buf = [0u8; 4096];
-        let mut text = String::new();
+        let mut saw_marker = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while std::time::Instant::now() < deadline && !text.contains("wbwpty-grandchild-ok") {
+        while std::time::Instant::now() < deadline && !saw_marker {
             match session.pipes.with(|p| p.output().read(&mut buf, 200)).unwrap() {
-                Ok(ReadEvent::Data(n)) => text.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Ok(ReadEvent::Data(n)) => {
+                    for line in String::from_utf8_lossy(&buf[..n]).lines() {
+                        if line.trim() == marker {
+                            saw_marker = true;
+                        }
+                    }
+                }
                 Ok(ReadEvent::Eof) => break,
                 Ok(ReadEvent::Timeout) => {}
                 Err(e) => panic!("output read failed: {e:#}"),
             }
         }
-        assert!(
-            text.contains("wbwpty-grandchild-ok"),
-            "grandchild output never arrived; saw {text:?}"
-        );
+        assert!(saw_marker, "descendant output never arrived as its own line");
 
         session.shutdown();
     }

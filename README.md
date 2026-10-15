@@ -28,19 +28,43 @@
 
 因此本项目**必须**用 `DETACHED_PROCESS | CREATE_SUSPENDED` 创建目标进程。
 
-### 1.2 `ConsoleHandle = 0x123` 这类补丁的真实价值
+### 1.2 `ConsoleHandle` 补丁：**实测不成立**（2026-10 复核）
 
-`PEB->ProcessParameters->ConsoleHandle` **不是**决定 "要不要 conhost" 的开关（那在创建时已定），
-它的价值在**子孙进程**：
+这一节原本声称：`PEB->ProcessParameters->ConsoleHandle` 为空 → base API 给孙进程
+新分配 console → 冒出 `conhost.exe`；把它写成非空哨兵（`0x123`）就能让整棵进程树
+都不再分配 console。
 
-当我们的目标进程（`cmd.exe` / `python.exe`）再去 `CreateProcess` 时，base API 会检查
-**父进程** 的 `ProcessParameters->ConsoleHandle`：
+**本机实测推翻了这个说法。**（Windows 10 19045，`cmd.exe`，x64）
 
-- 为空 → 认为"父进程没有 console" → 给子进程**新分配** console → **又冒出 conhost.exe**
-- 非空 → 认为"父进程有 console" → 子进程**继承**（沿用父的 std handle）→ 不冒 conhost
+| 测量 | 结果 |
+| --- | --- |
+| 直接子进程 | 无 console，stdio 走管道 ✅（项目核心目标成立） |
+| 孙进程 | **有自己的 console**，输出进了那个 console，永远不进我们的管道 ❌ |
+| 证据 1 | 进程树：`wbwpty → cmd → cmd → conhost.exe` |
+| 证据 2 | 孙进程自己的 `mode con` 报告 `行数 9001 / 列数 120`（conhost 的默认缓冲）；顶层目标的 `mode con` 什么都没有 |
 
-所以把 `ConsoleHandle` 打成一个非空的哨兵值（`0x123`），可以让整棵进程树都不再分配 console。
-这正是 winpty 之外的"零 conhost"方案所依赖的关键技巧，本项目在 `peb.rs` 中实现并带偏移自检。
+试过并**全部无效**的干预手段：
+
+| 干预 | 结果 |
+| --- | --- |
+| 目标启动前把 `ConsoleHandle` 写成 `0x123` | **目标直接死**：`STATUS_DLL_INIT_FAILED (0xC0000142)` |
+| 目标启动前把 `ConsoleHandle` 写成它自己的 `StandardOutput`（真实句柄） | 同样 `0xC0000142` |
+| 注入后写 `0x123` | 写进去了，能稳住整个会话（`console_handle=0x123` 持续 3 秒不变） |
+| 注入后**每 5ms 连续重申** `0x123` 2 秒 | 孙进程**仍然**拿到 9001×120 的 console |
+| `ConsoleFlags \|= STARTF_USETDHANDLES`（0x100） | 无任何可观测差异，故未写入活进程 |
+
+内核给 `DETACHED_PROCESS` + `STARTF_USESTDHANDLES` 创建的子进程
+`ConsoleHandle = INVALID_HANDLE_VALUE`、`ConsoleFlags = 0x1`；
+目标会在自己启动过程中（约 100 ms）把 `ConsoleHandle` 归一化成 `0`。
+
+**结论**：孙进程拿 console 这件事，目前在本项目里解决不了——能写的时机（启动后）
+太晚，起作用的东西又还没找到。要让孙进程可用，下一步必须去拦截目标自己的
+`CreateProcess`，显式填 `STARTF_USESTDHANDLES` + 父进程的 std handle
+（Stage 8 的 `KernelBase` hook），或者找到 base API 真正看的那一个字段。
+
+回归测试见 `crates/wbwpty-core/src/session.rs` 里被 `#[ignore]` 的
+`grandchild_output_reaches_the_pipe`，以及
+`rewriting_the_console_handle_before_startup_kills_the_target`。
 
 ### 1.3 注入时机
 
@@ -186,18 +210,23 @@ cargo test --release
 | 3 | 注入器 | PE 解析 / 重定位 / 导出解析 / PEB 遍历；**loader 跑完再注入**，废弃入口 trampoline | `feat(inject): map the payload once the target loader has finished` | ✅ |
 | 4 | stdio | **`STARTF_USESTDHANDLES` + 可继承管道句柄**，重定向不再依赖 DLL 注入时机 | `feat(session): run a target over pipes with no console host` | ✅ |
 | 5 | CLI | 会话循环：双泵 / EOF / 退出码 / `--dump-conhost` / `--verbose` | （同上） | ✅ |
-| 6 | PEB | `ConsoleHandle` 哨兵补丁（阻止孙进程分配 console），偏移 `offset_of!` 断言 + 运行时自检 | `in progress` | 🟡 |
+| 6 | PEB | 宿主侧（挂起态 + 注入后各一次）读/写目标 `ConsoleHandle`，偏移断言 + 运行时自检；**实测无法阻止孙进程分配 console**，见 §1.2 | `fix(peb): own the console state from the host side` | ✅（机制被证伪，已记录） |
 | 7 | CRT | `_open_osfhandle`/`_dup2`/`setvbuf(_IOLBF)`/`_flushall` | ⏳ |
-| 8 | shim | KernelBase 内联 hook（`GetConsoleMode`/`WriteConsoleW`/`ReadConsoleW`/`GetConsoleScreenBufferInfo`）| ⏳ |
+| 8 | shim | KernelBase 内联 hook（`GetConsoleMode`/`WriteConsoleW`/`ReadConsoleW`/`GetConsoleScreenBufferInfo`）——**孙进程问题只能从这里解决** | ⏳ |
 | 9 | 测试 | cmd/python/大输出/stderr/无 conhost/孙进程 | ⏳ |
 | 10 | 文档 | README 定稿 | ⏳ |
 
 ### 5.1 已完成部分的实际状态（截至本次提交）
 
-- `cargo build --release` 绿；`cargo test --workspace` = **26 passed / 0 failed / 0 ignored**（`stub_calls_the_entry_with_dllmain_arguments` 执行验证了 stub 参数，`mapped_image_runs_a_trivial_export` 验证了手工映射本身正确，`injects_into_a_running_cmd` 验证了完整链路）。
-- `wbwpty.exe --dump-conhost -- cmd.exe /c echo hello` 实测：**hello 原样输出，exit=0，conhost.exe before=10 after=10 delta=0**，stderr 干净。
+- `cargo build --release` 绿；`cargo test --release` = **30 passed / 0 failed / 1 ignored**（ignored 的是下面 §1.2 那个已知缺口）。
+- `wbwpty.exe --dump-conhost -- cmd.exe /c echo hello` 实测：**hello 原样输出，exit=0，conhost.exe 数量不变**，stderr 干净。
 - 手工映射每一段机器码都有**真正执行**的单测（不是只比对字节），`stub.rs` 已简化为只负责"调 DllMain"，不再携带死代码。
 - 核心注入失败根因已定位：**stub 用 `r9d` 而不是 `edx` 传 `DLL_PROCESS_ATTACH`**（Win64 第 2 参数在 `rdx`），导致 `DllMain` 拿到假 reason 直接 return TRUE 而不做任何事；修完后 stub 调用真实成功。
+- **本轮把 Stage 6 的前提证伪了**（见 §1.2）：`ConsoleHandle` 哨兵挡不住孙进程拿到 console。
+  孙进程的输出去向已由两条独立证据钉死（进程树 + `mode con`），但**还没修好**。
+- `cmd /c <短命令>` 这类目标**基本永远注不进去**：`stable_modules` 需要 ~100ms 稳定窗口，
+  而目标几毫秒就退出。stdio 走 `STARTF_USESTDHANDLES` 所以不影响它工作，但任何注入侧的
+  语义补丁（哨兵、shim、CRT）对它都不生效。
 
 ### 5.2 关键技术发现（全部本机实测，恢复工作时不要推翻）
 
@@ -214,42 +243,29 @@ cargo test --release
 8. **`STARTF_USESTDHANDLES` + 可继承句柄**是让 stdio 在 CRT 初始化之前接管的标准做法；宿主必须立刻释放自己持有的客户端副本，否则 `-out` 管道的 writer 永远不为空 → 死等 EOF。
 9. **stub 传参：Win64 ABI 第 2 参数在 `rdx`，不是 `r9`**。`mov r9d, 1` 编译无错但 `DllMain` 拿到的 `fdwReason` 是残留垃圾值，整条 attach 路径静默跳过；必须用 `mov edx, 1`。
 10. **宿主工具链是 MinGW gnu（无 MSVC）**。`no_std` cdylib 需要自己导出 `rust_eh_personality`。
+11. **目标启动完成前不能碰 `ConsoleHandle`**，见 §1.2 与 AGENTS 坑 12。
+12. **`ConsoleHandle` 哨兵挡不住孙进程**，见 §1.2 与 AGENTS 坑 13。
 
 ### 5.3 当前状态（截至本次提交）
 
-`DllMain` **已能正常跑通**：之前 `patch_console_state()` 内的 `dlog!()` 在 loader lock 下触发 PEB 越界读取（`params+0x80` 超出 `RTL_USER_PROCESS_PARAMETERS` 大小），导致 `STATUS_ACCESS_VIOLATION`。移除 `dlog!` 后 DllMain 顺利执行，`ConsoleHandle` 哨兵补丁已注入目标 PEB。
+`DllMain` 已能正常跑通，且 `WBWPTY_STATUS` 现在会回报它走到了哪一步
+（低 16 位 = 阶段，高 16 位 = `fdwReason`），`wbwpty.exe --verbose` 会打印
+目标的 `ConsoleHandle` / `ConsoleFlags` / `StandardOutput` 以及注入结果。
+`--verbose` 输出示例：
 
-下一步：
+```text
+wbwpty: pid 4328 console_handle=0x123 console_flags=0x1 standard_output=0xcc
+wbwpty: pid 4328 sentinel Written(ConsoleState { console_handle: 291, console_flags: 1, standard_output: 204 })
+wbwpty: pid 4328 payload stage=ConsoleAlreadySet reason=1 attach_path_ran=true
+```
+
+**孙进程问题没有解决**，原因见 §1.2。下一步：
+- Stage 8 里的 `CreateProcess` 拦截：给孙进程显式填 `STARTF_USESTDHANDLES`，
+  否则输出永远进不了管道（同时也要让它们别再拿到 console）。
 - Stage 7：CRT 行缓冲修复（`setvbuf(_IOLBF)`）—— 目前目标 stdout 是全缓冲，大输出会延迟。
-- Stage 8：KernelBase 内联 hook（console API shim）。
-- Stage 9：端到端测试（孙进程无 conhost、python、大输出）。
+- Stage 9：端到端测试（python、大输出、stderr）。
 
-### 5.4 关键技术发现（全部本机实测，恢复工作时不要推翻）
-
-1. **只有 `DETACHED_PROCESS` 不拉 conhost**（微软 Terminal `doc/specs/#7335` 原文佐证）。
-2. **挂起进程的 `PEB->Ldr` 是 NULL**：`CREATE_SUSPENDED` 时 loader 还没跑，
-   目标进程里除 exe 自身和 ntdll 外**什么都没映射**。实测在宿主的
-   `KERNEL32.dll` 基址读目标内存会 `ERROR_PARTIAL_COPY`。
-   → "先注入 → 再从目标解析导入" 这条路走不通，必须让 loader 先跑起来。
-   → 同时说明 `PEB->Ldr` 遍历在**运行中**的进程上是正常的（有单测覆盖）。
-3. **注入时机方案（已实现）**：在挂起状态下把目标 exe 的入口改成
-   `jmp dispatcher`（`E9 rel32`），然后 resume。loader 跑完、走到入口时
-   dispatcher 自旋等宿主；宿主此刻 PEB 遍历可用，于是完成
-   重定位 → 导入解析 → 写镜像 → 填 slot → 放行；dispatcher 还原入口字节、
-   调 `DllMain`、再跳回真入口。
-   **不用调试器、无竞态，且 `DllMain` 早于目标 CRT 初始化**（正是"重定向能在
-   CRT 之前生效"所需要的）。
-4. **x64 PE 的重定位类型是 `IMAGE_REL_BASED_DIR64`(10)，不是 `HIGHLOW`(3)**。
-   最初只实现了 HIGHLOW，被"解析真实产物"的单测当场抓出来；现在两种都实现。
-5. 本机 `ucrtbase.dll` 导出表实测：`setvbuf`/`_setmode`/`_open_osfhandle`/
-   `_dup2`/`_flushall`/`__acrt_iob_func` 可用；
-   `__acrt_lowio_set_osfhandle`/`_setvbuf` **未导出** → CRT 修复只能走公开 API。
-6. `kernel32` 的控制台导出只是 **6 字节 `jmp [rip+disp32]` 桩**，真实实现在
-   `KernelBase.dll` → console shim 只需 hook `KernelBase`。
-7. 宿主工具链是 **MinGW gnu**（无 MSVC）。`no_std` cdylib 需要自己提供
-   `rust_eh_personality`，因为 sysroot 里的 `core` 是按 unwind 编译的。
-
-### 5.3 Stage-3 阻塞点的**根因**（已定位，方案已定）
+### 5.4 Stage-3 阻塞点的**根因**（已定位，方案已定）
 
 `manual_map::tests::injects_into_a_suspended_cmd`（入口 trampoline 方案）失败，
 `cmd.exe` 永不进入口点。把注入动作拆开逐个测（本机实测，`cmd.exe /c exit 0`，
@@ -272,7 +288,7 @@ cargo test --release
 → **"挂起 → 改写入口点 → resume → dispatcher 自旋等宿主"这条路在 Windows 上是死的**，
 README 旧版 5.3 的猜测（std handle 为 NULL / conhost 之类）全部排除。
 
-### 5.4 新的注入时机（已定，开始实现）
+### 5.5 新的注入时机（**已实现**）
 
 放弃入口点 trampoline，改成"**loader 跑完再注入**"：
 
@@ -285,8 +301,8 @@ README 旧版 5.3 的猜测（std handle 为 NULL / conhost 之类）全部排�
 3. 此时再走已验证的手工映射：重定位 → 从目标 PEB 解析导入 → 写整块镜像 →
    `CreateRemoteThread(base + DllMain)`。**不再需要自旋 dispatcher、不再需要改写
    任何目标代码**（stub 只需 `CreateRemoteThread` 天然提供的"调到入口"语义）。
-4. DLL 负责剩下的语义补丁：`ConsoleHandle` 哨兵（让孙进程不再分配 console）、
-   控制台 API shim、CRT 行缓冲。这些不依赖"早于 CRT 初始化"。
+4. DLL 负责剩下的语义补丁：控制台 API shim、CRT 行缓冲。这些不依赖"早于 CRT 初始化"。
+   （`ConsoleHandle` 哨兵原本也在这条路上，但 §1.2 实测它对孙进程无效。）
 
 这样保住了项目目标（零 conhost、无 ConPTY/winpty/WSL/SSH），并且去掉了唯一
 一个跨不过去的时序假设。`EntryTrap` / `build_entry_dispatcher` /

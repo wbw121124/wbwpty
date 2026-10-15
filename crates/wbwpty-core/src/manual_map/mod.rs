@@ -29,7 +29,10 @@ use anyhow::{bail, Context, Result};
 use crate::child::Child;
 
 pub use pe::PeImage;
-pub use remote::{ModuleSource, RemoteModule, RemoteModules, RemoteProcess};
+pub use remote::{
+    ConsolePatch, ConsoleState, ModuleSource, RemoteModule, RemoteModules, RemoteProcess,
+    CONSOLE_HANDLE_SENTINEL,
+};
 
 /// What the injector did, for logging and for tests.
 #[derive(Debug, Clone)]

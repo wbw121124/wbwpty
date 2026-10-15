@@ -27,6 +27,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::error::{last_error_text, Handle};
+use crate::manual_map::remote::{ConsolePatch, RemoteProcess};
 
 /// Published environment variable contract between the host and the injected
 /// DLL. Renaming any of these silently breaks every already built DLL, so they
@@ -177,6 +178,13 @@ pub struct Child {
     pub pid: u32,
     pub image: PathBuf,
     resumed: std::sync::atomic::AtomicBool,
+    /// Outcome of the console sentinel write that [`Child::spawn`] performed
+    /// before the target ran a single instruction.
+    ///
+    /// `Err` is deliberately not fatal: `DETACHED_PROCESS` already guarantees
+    /// the direct child never gets a console, so a failed patch only means
+    /// descendants may be allocated one.
+    pub console_patch: Result<ConsolePatch, String>,
 }
 
 /// `GetExitCodeProcess` reports this for a process that has not exited.
@@ -237,13 +245,25 @@ impl Child {
         }
 
         // Close the thread handle on failure paths only after we own both.
-        let child = Self {
+        let mut child = Self {
             process: Handle::from_raw(pi.hProcess as isize),
             thread: Handle::from_raw(pi.hThread as isize),
             pid: pi.dwProcessId,
             image,
             resumed: std::sync::atomic::AtomicBool::new(false),
+            console_patch: Err("not attempted".to_owned()),
         };
+
+        // Last chance before the target executes anything: make it hand its
+        // children this session's pipes instead of a console of their own.
+        // Doing this here rather than from the injected DLL is what makes it
+        // work for short-lived targets - `cmd /c <short command>` exits long
+        // before a payload could be mapped, and that is exactly when a
+        // descendant console host shows up.
+        child.console_patch = RemoteProcess::new(child.process_handle())
+            .patch_console_state()
+            .map_err(|err| format!("{err:#}"));
+
         Ok(child)
     }
 

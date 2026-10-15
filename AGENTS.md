@@ -136,6 +136,26 @@ cargo test --release                  # 相关测试必须全绿
 9. **x64 `IMAGE_THUNK_DATA64` 步进是 8 字节**：旧的 import resolver 按 16 字节步进，读取的 RVA 全是垃圾，表现成 `"string at 0x65e0ac22 is outside the image"`。
 10. **`STARTF_USESTDHANDLES` 传管道句柄后，宿主必须立刻释放自己的客户端副本**：否则 `-out` 管道的 writer 永远不为空，`pump_output` 死等 EOF。
 11. **`dlog!()` 在 loader lock 下会触发 AV**：`dlog!` 的格式化代码（`core::fmt`）在 no_std DLL 中会访问 PEB 偏移 `params+0x80`，超出 `RTL_USER_PROCESS_PARAMETERS` 实际大小（~0x60），导致 `STATUS_ACCESS_VIOLATION`。**DllMain 内禁止调用 `dlog!`**，改用直接写 `WBWPTY_STATUS` 状态字。
+12. **目标启动前改写 `ConsoleHandle` 会直接杀死目标**：`0xC0000142`（`STATUS_DLL_INIT_FAILED`）。
+    写成假句柄 `0x123` 会死，写成目标自己 `StandardOutput` 那种真实句柄**也**会死。
+    启动过程中碰这个字段的唯一安全时机是 loader 跑完之后。
+    回归测试：`session::tests::rewriting_the_console_handle_before_startup_kills_the_target`。
+13. **`ConsoleHandle` 哨兵挡不住孙进程**（2026-10 实测推翻 README 1.2）：即使每 5ms 连续重申
+    `0x123`，`cmd /c` 的孙进程照样拿到 9001×120 的 conhost。证据：进程树
+    `wbwpty → cmd → cmd → conhost.exe`，以及孙进程自己的 `mode con` 有输出而顶层目标没有。
+    参见 README §1.2，修复只能从拦截 `CreateProcess` 入手。
+14. **别用 `cmd.exe` 的输入回显来判断"孙进程有输出"**：交互式 cmd 会把你喂进去的命令行原样
+    回显到 stdout。如果回显文本里含断言用的标记串，测试就会假阳性。
+    `grandchild_output_reaches_the_pipe` 之前就是这么"通过"的。
+    现在标记串用 `for %i in (NEU) do @echo %i7Q2K5` 拼出来，命令行里只有字面量 `%i`。
+15. **计数 conhost 判据容易被短命进程骗过**：孙进程活得比采样还短时，`after` 与 `before`
+    差值是竞态。要归因就抓进程树（`Win32_Process` 的 `ParentProcessId`），
+    或者让孙进程自己把 `mode con` 写进文件。
+16. **`SystemTime::now()` 在 Windows 上约 15.6ms 分辨率**：同一 tick 内两次取样会得到相同值，
+    拿它当 session nonce 会让两个会话撞管道名。`nonce()` 里混了原子计数器。
+17. **`stable_modules()` 里第一次遍历失败不等于失败**：`LdrpInitializeProcess` 是逐个挂链的，
+    跨过挂链点的遍历会触发 doubly-linked 校验失败。机器一忙就复现。
+    现在两种遍历失败都当作"还没就绪"重试到超时。
 
 ## 10. 外部可复用模块（评估过再用）
 
