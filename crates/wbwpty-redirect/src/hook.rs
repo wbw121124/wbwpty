@@ -63,6 +63,18 @@ pub static mut WBWPTY_STD_HANDLES: [usize; 3] = [0, 0, 0];
 #[no_mangle]
 pub static mut WBWPTY_HOOK_STATS: u32 = 0;
 
+/// The flags this hook actually handed to the kernel.
+///
+/// `calls` is the number of children created through the substitution, and
+/// `creation_flags` is the `dwCreationFlags` value passed to the real
+/// `CreateProcessW` on the most recent one. Publishing it exists because the
+/// host cannot otherwise tell "the substitution was installed and forced
+/// `DETACHED_PROCESS`" from "the substitution was installed and something
+/// downstream changed the flags" - and those two look identical from outside,
+/// right down to the console appearing anyway.
+#[no_mangle]
+pub static mut WBWPTY_HOOK_FLAGS: [DWORD; 2] = [0, 0];
+
 type CreateProcessW = unsafe extern "system" fn(
     lp_application_name: *const u16,
     lp_command_line: *mut u16,
@@ -156,6 +168,8 @@ pub unsafe extern "system" fn create_process_w(
     (*si).hStdError = handles[2] as HANDLE;
 
     let flags = (dw_creation_flags & !ffi::CREATE_NEW_CONSOLE) | ffi::DETACHED_PROCESS;
+
+    WBWPTY_HOOK_FLAGS = [flags, WBWPTY_HOOK_FLAGS[1] + 1];
 
     let ok = original(
         lp_application_name,

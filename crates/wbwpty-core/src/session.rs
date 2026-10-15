@@ -192,6 +192,8 @@ pub struct Session {
     crt_detail_rva: Option<u32>,
     /// RVA of the payload's exported WBWPTY_HOOK_STATS word.
     hook_stats_rva: Option<u32>,
+    /// RVA of the payload's exported WBWPTY_HOOK_FLAGS word.
+    hook_flags_rva: Option<u32>,
     /// Console sentinel state after the post-injection re-assert.
     console_patch: Result<crate::manual_map::ConsolePatch, String>,
     /// What the `CreateProcessW` substitution did, if it happened.
@@ -250,12 +252,24 @@ impl Session {
             }
         };
 
-        // Resolve the status word RVA once so `payload_status()` can read it later.
+        // Where the payload came from, and the RVAs of the words it publishes.
+        // Resolved once: three of the four reads below want the same file, and
+        // `find_export_rva` re-parses the PE on every call.
         let dll_path = config
             .dll
             .clone()
             .or_else(|| std::env::var("WBWPTY_DLL").ok().map(std::path::PathBuf::from))
             .unwrap_or_else(default_dll_path);
+        let dll_image = std::fs::read(&dll_path).ok();
+        let export_rva = |name: &str| -> Option<u32> {
+            dll_image
+                .as_ref()
+                .and_then(|file| crate::manual_map::find_export_rva(file, name).ok().flatten())
+        };
+        let status_rva = export_rva("WBWPTY_STATUS");
+        let crt_detail_rva = export_rva("WBWPTY_CRT_DETAIL");
+        let hook_stats_rva = export_rva("WBWPTY_HOOK_STATS");
+        let hook_flags_rva = export_rva("WBWPTY_HOOK_FLAGS");
 
         // Substitution goes in after the payload is mapped, because it points
         // into it. A target that does not import `CreateProcessW` is not an
@@ -283,22 +297,6 @@ impl Session {
                 (None, Some(format!("{err:#}")))
             }
         };
-        let dll_path = config
-            .dll
-            .clone()
-            .or_else(|| std::env::var("WBWPTY_DLL").ok().map(std::path::PathBuf::from))
-            .unwrap_or_else(default_dll_path);
-        let status_rva = std::fs::read(&dll_path)
-            .ok()
-            .and_then(|file| crate::manual_map::find_export_rva(&file, "WBWPTY_STATUS").ok().flatten());
-        let crt_detail_rva = std::fs::read(&dll_path)
-            .ok()
-            .and_then(|file| {
-                crate::manual_map::find_export_rva(&file, "WBWPTY_CRT_DETAIL").ok().flatten()
-            });
-        let hook_stats_rva = std::fs::read(&dll_path).ok().and_then(|file| {
-            crate::manual_map::find_export_rva(&file, "WBWPTY_HOOK_STATS").ok().flatten()
-        });
 
         // `Child::spawn` had the last word while the target was suspended, but it
         // does not keep it. Measured on this machine: a target created
@@ -321,6 +319,7 @@ impl Session {
             status_rva,
             crt_detail_rva,
             hook_stats_rva,
+            hook_flags_rva,
             console_patch,
             hook,
             hook_error,
@@ -423,6 +422,27 @@ impl Session {
         Some(((raw >> 8) & 0xffff, raw & 0xff))
     }
 
+    /// The `dwCreationFlags` the substitution handed to `CreateProcessW`, and
+    /// how many children went through it.
+    ///
+    /// The host cannot work this out for itself: it knows which flags it forced,
+    /// not which flags reached the kernel. When the two disagree - a target that
+    /// asks for a console it should not have, a hook that stops forcing anything
+    /// - the only evidence is here.
+    pub fn payload_hook_flags(&self) -> Option<(u32, u32)> {
+        use crate::manual_map::remote::RemoteProcess;
+        let report = self.report.as_ref()?;
+        let proc = RemoteProcess::new(self.child.process_handle());
+        let bytes = proc
+            .read_bytes(report.image_base + self.hook_flags_rva? as u64, 8)
+            .ok()?;
+        let raw: [u8; 8] = bytes.try_into().ok()?;
+        Some((
+            u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+            u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
+        ))
+    }
+
     fn payload_word(&self, rva: Option<u32>) -> Option<u32> {
         use crate::manual_map::remote::RemoteProcess;
         let report = self.report.as_ref()?;
@@ -435,6 +455,16 @@ impl Session {
 
     pub fn pid(&self) -> u32 {
         self.child.pid
+    }
+
+    /// The target's process handle.
+    ///
+    /// For callers that inspect the target themselves: which address an import
+    /// slot actually holds, or whether a word the payload published can be read
+    /// back. Both are questions only the host can answer, and both have an
+    /// answer that looks exactly like success when it is wrong.
+    pub fn process_handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.child.process_handle()
     }
 
     /// Prints the target's console bookkeeping, if it can be read.

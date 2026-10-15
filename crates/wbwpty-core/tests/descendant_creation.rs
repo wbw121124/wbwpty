@@ -22,6 +22,16 @@
 //! * Giving the child explicit `STARTF_USESTDHANDLES` - which is what
 //!   intercepting `CreateProcess` would do - routes its output correctly but
 //!   **still** leaves a `conhost.exe` behind. Both halves have to be solved.
+//!
+//! # Most of this file is ignored by default
+//!
+//! Measuring "this creation style causes a console host" means causing one, on
+//! the operator's desktop. Three of the tests here do that on purpose, so they
+//! carry `#[ignore]` and run only when asked:
+//! `cargo test --release --test descendant_creation -- --ignored`.
+//!
+//! The one that does *not* provoke anything - the row that is supposed to
+//! succeed - runs by default, because that is the row worth guarding.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -73,6 +83,64 @@ fn session_with(args: &[&str], child_command: &str, pidfile: Option<&Path>) -> S
         ..Default::default()
     };
     Session::start(&ChildSpec::new(probe_path()).args(all), config).expect("probe session")
+}
+
+/// Takes down everything a measurement spawned, whether it passed, failed or
+/// panicked.
+///
+/// A console host outlives the process that owned it: its client exits and the
+/// host does not, so nothing is left to reap it and it stays on the operator's
+/// machine as an orphan. An assertion failure used to skip the cleanup path
+/// entirely, which is how two of them ended up owned by nobody.
+///
+/// Descendants are killed deepest first. Killing a parent first reparents its
+/// children to something unrelated, and they then drop out of the ancestry walk
+/// that finds them in the first place.
+struct TreeGuard {
+    root: u32,
+}
+
+impl TreeGuard {
+    fn sweep(&self) -> usize {
+        let Ok(table) = wbwpty_core::inspect::process_table() else {
+            return 0;
+        };
+        let mine = wbwpty_core::inspect::descendants_of(&table, self.root);
+        let alive = mine.len().saturating_sub(1);
+
+        for host in wbwpty_core::inspect::descendant_console_hosts(&table, self.root) {
+            eprintln!("cleanup: console host pid {}", host.pid);
+            let _ = wbwpty_core::inspect::terminate(host.pid);
+        }
+
+        let mut by_depth: Vec<(usize, u32)> = mine
+            .iter()
+            .filter(|&&pid| pid != self.root)
+            .map(|&pid| {
+                (
+                    wbwpty_core::inspect::ancestry_depth(&table, self.root, pid).unwrap_or(0),
+                    pid,
+                )
+            })
+            .collect();
+        by_depth.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, pid) in by_depth {
+            let _ = wbwpty_core::inspect::terminate(pid);
+        }
+        alive
+    }
+}
+
+impl Drop for TreeGuard {
+    fn drop(&mut self) {
+        for _ in 0..20 {
+            if self.sweep() == 0 && self.sweep() == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!("cleanup: pid {} still has processes", self.root);
+    }
 }
 
 /// Whether the child's own output arrived on our pipe.
@@ -131,6 +199,11 @@ fn measure_console_host(args: &[&str]) -> (bool, bool) {
         "cmd.exe /c for /L %i in (1,1,999999999) do @rem",
         Some(&pidfile),
     );
+    // Cleanup from here on runs even if an assertion below panics, which the
+    // hand-rolled teardown this replaced did not.
+    let guard = TreeGuard {
+        root: session.pid(),
+    };
 
     let mut child_pid = None;
     let mut saw_host = false;
@@ -153,25 +226,7 @@ fn measure_console_host(args: &[&str]) -> (bool, bool) {
 
     session.shutdown();
     let _ = std::fs::remove_file(&pidfile);
-
-    // Clean up after the measurement. A child that got a console leaves a
-    // visible `conhost.exe` window behind it, and leaving that behind in a test
-    // suite is the exact failure mode this project exists to prevent - the test
-    // has to be the one to take it down.
-    //
-    // Scoped to *our* child on purpose. An earlier version killed the parent of
-    // every console host that was not in the baseline, which during a parallel
-    // test run means killing whichever other test's fixture happened to own it.
-    // Two of the four tests failed that way, which looked exactly like a
-    // concurrency bug in the thing being measured.
-    if let Some(pid) = child_pid {
-        for (host, parent) in wbwpty_core::inspect::conhost_parents().unwrap_or_default() {
-            if parent == pid {
-                let _ = wbwpty_core::inspect::terminate(host);
-            }
-        }
-        let _ = wbwpty_core::inspect::terminate(pid);
-    }
+    drop(guard);
 
     (saw_host, child_pid.is_some())
 }
@@ -241,6 +296,7 @@ fn detached_process_with_std_handles_is_what_a_descendant_needs() {
 /// Kept as a test so the table is regenerated whenever the fixture changes,
 /// and so the cases the winning row is compared against cannot silently rot.
 #[test]
+#[ignore = "deliberately causes ten console hosts; regenerate the table on demand"]
 fn descendant_creation_matrix() {
     let cases: Vec<(&'static str, Vec<&str>)> = vec![
         ("plain, handle inheritance", vec!["none"]),
@@ -295,6 +351,7 @@ fn descendant_creation_matrix() {
 /// parent's standard handles, the output follows. Without it, every idea about
 /// how to route a descendant's output is a guess.
 #[test]
+#[ignore = "the measured row causes a console host for the child"]
 fn explicit_std_handles_route_output_to_the_given_handle() {
     let target = scratch("route.txt");
     let _ = std::fs::remove_file(&target);
@@ -315,6 +372,7 @@ fn explicit_std_handles_route_output_to_the_given_handle() {
 
 /// The fixture itself has to work, or every row above is noise.
 #[test]
+#[ignore = "the measured row causes a console host for the child"]
 fn the_probe_can_spawn_a_child_at_all() {
     let marker = scratch("probe-ok.txt");
     let _ = std::fs::remove_file(&marker);

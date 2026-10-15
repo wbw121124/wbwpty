@@ -281,6 +281,40 @@ impl RemoteProcess {
         Self { handle }
     }
 
+    /// Opens a process by pid, for reaching a process this host did not create.
+    ///
+    /// The session's own target is created here, so [`Self::new`] is enough for
+    /// it. A *descendant* is a different matter: the only way to learn its pid is
+    /// to look at the process table, and by then it is somebody else's handle
+    /// that has to be opened.
+    ///
+    /// The rights are the ones this module already needs - read and write
+    /// memory, plus query for the PEB walk - and no more. `PROCESS_DUP_HANDLE`
+    /// and friends would let a caller reach past the process it named.
+    pub fn open(pid: u32) -> Result<Self> {
+        use windows_sys::Win32::System::Threading::OpenProcess;
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+        };
+
+        // SAFETY: `pid` comes from a process table snapshot; a failure to open
+        // is reported through the return value rather than a null handle.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            return Err(anyhow::anyhow!(
+                "OpenProcess({pid}) failed: {}",
+                crate::error::last_error_text()
+            ));
+        }
+        Ok(Self { handle })
+    }
+
     pub fn handle(&self) -> HANDLE {
         self.handle
     }
