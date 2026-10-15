@@ -190,8 +190,14 @@ pub struct Session {
     status_rva: Option<u32>,
     /// RVA of the payload's exported WBWPTY_CRT_DETAIL word.
     crt_detail_rva: Option<u32>,
+    /// RVA of the payload's exported WBWPTY_HOOK_STATS word.
+    hook_stats_rva: Option<u32>,
     /// Console sentinel state after the post-injection re-assert.
     console_patch: Result<crate::manual_map::ConsolePatch, String>,
+    /// What the `CreateProcessW` substitution did, if it happened.
+    hook: Option<crate::manual_map::HookReport>,
+    /// Why it did not, when it was attempted and failed.
+    hook_error: Option<String>,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -229,6 +235,7 @@ impl Session {
         let child = Child::spawn(&spec).context("spawning target")?;
         // The child now owns its own inherited copies; ours would otherwise keep
         // a writer alive on `-out` and suppress EOF forever.
+        let std_handles = stdio.handles();
         stdio.release();
 
         // The target must run whether or not we manage to patch it. Resuming is
@@ -249,6 +256,38 @@ impl Session {
             .clone()
             .or_else(|| std::env::var("WBWPTY_DLL").ok().map(std::path::PathBuf::from))
             .unwrap_or_else(default_dll_path);
+
+        // Substitution goes in after the payload is mapped, because it points
+        // into it. A target that does not import `CreateProcessW` is not an
+        // error - there is nothing to intercept.
+        let hook = match report.as_ref() {
+            Some(injection) => {
+                crate::manual_map::install_create_process_hook(
+                    &child,
+                    &dll_path,
+                    injection,
+                    std_handles,
+                )
+            }
+            None => Ok(None),
+        };
+        let (hook, hook_error) = match hook {
+            Ok(hook) => (hook, None),
+            Err(err) => {
+                if config.verbose {
+                    eprintln!(
+                        "wbwpty: pid {} no CreateProcess interception: {err:#}",
+                        child.pid
+                    );
+                }
+                (None, Some(format!("{err:#}")))
+            }
+        };
+        let dll_path = config
+            .dll
+            .clone()
+            .or_else(|| std::env::var("WBWPTY_DLL").ok().map(std::path::PathBuf::from))
+            .unwrap_or_else(default_dll_path);
         let status_rva = std::fs::read(&dll_path)
             .ok()
             .and_then(|file| crate::manual_map::find_export_rva(&file, "WBWPTY_STATUS").ok().flatten());
@@ -257,6 +296,9 @@ impl Session {
             .and_then(|file| {
                 crate::manual_map::find_export_rva(&file, "WBWPTY_CRT_DETAIL").ok().flatten()
             });
+        let hook_stats_rva = std::fs::read(&dll_path).ok().and_then(|file| {
+            crate::manual_map::find_export_rva(&file, "WBWPTY_HOOK_STATS").ok().flatten()
+        });
 
         // `Child::spawn` had the last word while the target was suspended, but it
         // does not keep it. Measured on this machine: a target created
@@ -278,7 +320,10 @@ impl Session {
             report,
             status_rva,
             crt_detail_rva,
+            hook_stats_rva,
             console_patch,
+            hook,
+            hook_error,
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
         session.start_input_pump();
@@ -290,6 +335,24 @@ impl Session {
     /// The payload report, present only when the DLL mapped successfully.
     pub fn report(&self) -> Option<&InjectionReport> {
         self.report.as_ref()
+    }
+
+    /// What the `CreateProcessW` substitution did, if anything.
+    ///
+    /// `None` means one of three things, and they are worth telling apart: the
+    /// payload was never mapped, the target does not import
+    /// `CreateProcessW`, or the installation failed. [`Self::hook_error`]
+    /// answers the third.
+    pub fn hook(&self) -> Option<&crate::manual_map::HookReport> {
+        self.hook.as_ref()
+    }
+
+    /// Why the substitution did not happen, when it was attempted and failed.
+    ///
+    /// Swallowing this into a `None` is how a feature that silently does
+    /// nothing gets mistaken for one that works.
+    pub fn hook_error(&self) -> Option<&str> {
+        self.hook_error.as_deref()
     }
 
     /// Reads the payload's `WBWPTY_STATUS` word out of the target.
@@ -344,12 +407,30 @@ impl Session {
     /// Packed as `ucrt_resolved << 16 | refused << 8 | set`; see the layout in
     /// the payload's `lib.rs`.
     pub fn payload_crt_detail(&self) -> Option<CrtDetail> {
+        Some(CrtDetail::decode(self.payload_word(self.crt_detail_rva)?))
+    }
+
+    /// How many times the substituted `CreateProcessW` has been called, and how
+    /// many of those failed.
+    ///
+    /// The distinction the whole feature rests on: a slot that was rewritten
+    /// says nothing about whether anything goes *through* it. A target that
+    /// reaches process creation some other way - `CreateProcessInternalW`, a
+    /// syscall, a helper - leaves this at zero while the hook report still
+    /// claims success.
+    pub fn payload_hook_stats(&self) -> Option<(u32, u32)> {
+        let raw = self.payload_word(self.hook_stats_rva)?;
+        Some(((raw >> 8) & 0xffff, raw & 0xff))
+    }
+
+    fn payload_word(&self, rva: Option<u32>) -> Option<u32> {
         use crate::manual_map::remote::RemoteProcess;
         let report = self.report.as_ref()?;
-        let rva = self.crt_detail_rva?;
         let proc = RemoteProcess::new(self.child.process_handle());
-        let bytes = proc.read_bytes(report.image_base + rva as u64, 4).ok()?;
-        Some(CrtDetail::decode(u32::from_le_bytes(bytes.try_into().ok()?)))
+        let bytes = proc
+            .read_bytes(report.image_base + rva? as u64, 4)
+            .ok()?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
     }
 
     pub fn pid(&self) -> u32 {
@@ -402,6 +483,31 @@ impl Session {
             eprintln!(
                 "wbwpty: pid {} crt ucrt_resolved={} streams_set={} streams_refused={}",
                 self.child.pid, detail.ucrt_resolved, detail.streams_set, detail.streams_refused
+            );
+        }
+        match self.hook() {
+            Some(hook) => eprintln!(
+                "wbwpty: pid {} hooked CreateProcessW: {} slot(s) at {:#x} -> {:#x} (original {:#x}){}",
+                self.child.pid,
+                hook.slot_count(),
+                hook.slots[0].address(0),
+                hook.substitute,
+                hook.original,
+                if hook.needed_protection_change {
+                    ", image pages made writable"
+                } else {
+                    ""
+                }
+            ),
+            None if self.report.is_some() => {
+                eprintln!("wbwpty: pid {} target does not import CreateProcessW", self.child.pid)
+            }
+            None => {}
+        }
+        if let Some((calls, failures)) = self.payload_hook_stats() {
+            eprintln!(
+                "wbwpty: pid {} hook calls={calls} failures={failures}",
+                self.child.pid
             );
         }
     }
@@ -485,11 +591,39 @@ impl Session {
     /// exit code. This is the entry point the CLI uses.
     pub fn run_to_completion(self) -> Result<u32> {
         self.pump_output()?;
+        // Report what the payload ended up doing, now that the target has
+        // finished. Read at the start of the session these counters are all
+        // zero for the simplest possible reason: the target had not run a
+        // single command yet.
+        self.report_payload_outcome();
         let code = self
             .child
             .wait_timeout(std::time::Duration::from_secs(2))
             .unwrap_or(None);
         Ok(code.unwrap_or(0))
+    }
+
+    /// Prints the payload's final state when `--verbose` is on.
+    ///
+    /// Only meaningful once the session is over: the stage word is a live
+    /// progress channel and the hook counters only move when the target
+    /// creates something.
+    fn report_payload_outcome(&self) {
+        if !self.config.verbose {
+            return;
+        }
+        if let Some((calls, failures)) = self.payload_hook_stats() {
+            eprintln!(
+                "wbwpty: pid {} CreateProcessW hook: {calls} call(s), {failures} failure(s)",
+                self.child.pid
+            );
+        }
+        if let Some(status) = self.payload_stage() {
+            eprintln!(
+                "wbwpty: pid {} payload finished at {:?}",
+                self.child.pid, status.stage
+            );
+        }
     }
 
     /// Terminates the target and stops the pumps.
@@ -828,61 +962,52 @@ mod tests {
     }
 
     /// A process the target creates must write to our pipe.
-    ///
-    /// # Currently does not work - this is the test that says so
-    ///
-    /// A descendant gets **its own console**, and that is where its output goes.
-    /// Verified two independent ways on this machine:
-    ///
-    /// * the process tree during `cmd /c "cmd /c ..."` shows
-    ///   `wbwpty -> cmd -> cmd -> conhost.exe`;
-    /// * the descendant's own `mode con` reports a 9001x120 buffer, while the
-    ///   target's reports nothing at all.
-    ///
-    /// So the output is not lost by a transport bug, it is delivered to a
-    /// console we do not own and cannot read. README 1.2's mechanism - a
-    /// non-null `ConsoleHandle` sentinel - was supposed to prevent exactly this
-    /// and **does not**: enforced continuously from after startup it changes
-    /// nothing. `ConsoleFlags |= STARTF_USESTDHANDLES` likewise does nothing,
-    /// and `ConsoleHandle` cannot be rewritten before the target starts at all
-    /// (see `rewriting_the_console_handle_before_startup_kills_the_target`).
-    ///
-    /// # What does work
-    ///
-    /// `tests/descendant_creation.rs` measures the whole matrix of
-    /// `CreateProcessW` flags against `STARTF_USESTDHANDLES`. The two halves are
-    /// independent and only one row satisfies both promises:
-    ///
-    /// | flags | console host | output |
-    /// | --- | --- | --- |
-    /// | `STARTF_USESTDHANDLES` only | **spawns one** | yes |
-    /// | `DETACHED_PROCESS` only | none | **no** |
-    /// | **`DETACHED_PROCESS` + `STARTF_USESTDHANDLES`** | none | yes |
-    ///
-    /// So the fix is to intercept `CreateProcess` in the target and do both:
-    /// OR `DETACHED_PROCESS` into `dwCreationFlags`, and fill in
-    /// `STARTF_USESTDHANDLES` with the parent's handles. That is Stage 8.
-    ///
-    /// `#[ignore]`d rather than deleted so the moment it starts passing is
-    /// obvious.
-    ///
-    /// The previous version of this test was a false positive worth recording:
-    /// it looked for `wbwpty-grandchild-ok` in the output, but an interactive
-    /// `cmd.exe` *echoes the command line it was fed*, and that line contains
-    /// the marker. It passed while descendants produced nothing at all. The
-    /// marker is now assembled at runtime (`%i` in the `for` body expands to
-    /// `NEU`, and the command line only ever shows the literal `%i`), so the
-    /// command echo cannot produce it.
-    #[test]
-    #[ignore = "descendants get their own console; see the doc comment"]
-    fn grandchild_output_reaches_the_pipe() {
-        let marker = "NEU7Q2K5";
+///
+/// The whole of Stage 8 in one test. The target is an interactive `cmd.exe`
+/// that is blocked reading its (never written) stdin, which makes the ordering
+/// deterministic: the interception is in place before the command that creates
+/// a descendant is fed in.
+///
+/// Two independent promises are checked, because they are independent and only
+/// satisfying one looks like success:
+///
+/// * the descendant's output arrives on our pipe, and
+/// * no `conhost.exe` appears for it.
+///
+/// # How this works
+///
+/// The host rewrites the target's `CreateProcessW` import slot to point at the
+/// payload, which OR-s `DETACHED_PROCESS` into the flags and fills in
+/// `STARTF_USESTDHANDLES`. Both halves are required and neither is sufficient;
+/// `tests/descendant_creation.rs` is the matrix that established it.
+///
+/// `bInheritHandles` is passed through **unchanged**, and the matrix row this
+/// is written against was measured with it set. Passing `FALSE` on the grounds
+/// that the handles are explicit anyway leaves the child mute - the output
+/// never arrives, with no error anywhere.
+///
+/// # On the marker
+///
+/// Assembled at runtime (`%i` in the `for` body expands to `NEU`, and the
+/// command line only ever shows the literal `%i`). An earlier version searched
+/// the output for a marker that appeared in the text it fed in, which an
+/// interactive `cmd.exe` echoes straight back - so it passed while descendants
+/// produced nothing at all.
+#[test]
+fn grandchild_output_reaches_the_pipe() {
+        const MARKER: &str = "NEU7Q2K5";
         let spec = ChildSpec::new("cmd.exe");
         let config = SessionConfig { shim: false, ..Default::default() };
         let session = Session::start(&spec, config).unwrap();
         session
             .report()
             .expect("payload must map before the descendant behaviour is meaningful");
+        assert!(
+            session.hook().is_some(),
+            "the target imports CreateProcessW, so the slot must be rewritten; \
+             it was not: {:?}",
+            session.hook_error()
+        );
 
         let _ = session
             .pipes
@@ -899,7 +1024,7 @@ mod tests {
             match session.pipes.with(|p| p.output().read(&mut buf, 200)).unwrap() {
                 Ok(ReadEvent::Data(n)) => {
                     for line in String::from_utf8_lossy(&buf[..n]).lines() {
-                        if line.trim() == marker {
+                        if line.trim() == MARKER {
                             saw_marker = true;
                         }
                     }
@@ -909,7 +1034,24 @@ mod tests {
                 Err(e) => panic!("output read failed: {e:#}"),
             }
         }
-        assert!(saw_marker, "descendant output never arrived as its own line");
+        assert!(
+            saw_marker,
+            "descendant output never arrived as its own line"
+        );
+
+        // The hook has to have run, and the child has to have been created
+        // successfully. A zero call count means the slot was rewritten but
+        // nothing goes through it - which looks identical to success from the
+        // output side alone.
+        let (calls, failures) = session
+            .payload_hook_stats()
+            .expect("the payload publishes hook counters");
+        eprintln!("DIAG hook calls={calls} failures={failures}");
+        assert!(
+            calls >= 1,
+            "the descendant was created without going through the hook"
+        );
+        assert_eq!(failures, 0, "the intercepted CreateProcessW failed");
 
         session.shutdown();
     }

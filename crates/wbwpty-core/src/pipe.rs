@@ -414,6 +414,18 @@ impl PipePair {
 }
 
 impl InheritableStdio {
+    /// The three handles, as the target sees them.
+    ///
+    /// Captured before [`Self::release`] closes the host's copies, so the values
+    /// can be handed to a payload that has to pass the same pipes on to whatever
+    /// the target goes on to spawn. A `CreateProcess` preserves the numeric
+    /// value of an inherited handle in the child, which is what makes this more
+    /// than a convenient alias for the host's own handles.
+    pub fn handles(&self) -> [u64; 3] {
+        [self.stdin as u64, self.stdout as u64, self.stderr as u64]
+    }
+
+    /// Drops the host's copies of the target's std handles.
     /// Drops the host's copies of the target's std handles.
     ///
     /// This must happen as soon as the child exists. The host opened these

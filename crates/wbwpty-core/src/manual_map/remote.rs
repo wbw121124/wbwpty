@@ -687,6 +687,33 @@ impl RemoteProcess {
         })
     }
 
+    /// Changes the protection of a range in the target.
+    ///
+    /// Needed for anything that is not already writable: the loader leaves an
+    /// image's `.idata` read-write in practice, but "in practice" is not
+    /// something to write an import substitution on top of.
+    pub fn protect(&self, addr: u64, size: usize, protect: u32) -> Result<()> {
+        use windows_sys::Win32::System::Memory::VirtualProtectEx;
+        let mut old = 0u32;
+        // SAFETY: the range is inside the target and the out parameter is live.
+        let ok = unsafe {
+            VirtualProtectEx(
+                self.handle,
+                addr as *mut c_void,
+                size,
+                protect,
+                &mut old as *mut u32,
+            )
+        };
+        if ok == 0 {
+            bail!(
+                "VirtualProtectEx({addr:#x}, {size}, {protect:#x}) failed: {}",
+                last_error_text()
+            );
+        }
+        Ok(())
+    }
+
     /// Reserves `size` bytes as close to `near` as possible.
     ///
     /// The entry dispatcher jumps to the target's entry point with a `rel32`, so

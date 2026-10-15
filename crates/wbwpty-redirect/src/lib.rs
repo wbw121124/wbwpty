@@ -14,6 +14,7 @@
 pub mod config;
 pub mod crt;
 pub mod ffi;
+pub mod hook;
 pub mod log;
 pub mod peb;
 pub mod stdio;

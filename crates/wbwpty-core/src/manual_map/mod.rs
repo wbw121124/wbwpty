@@ -17,6 +17,8 @@
 //! side; the target-side stub lives in [`stub`].
 
 pub mod exports;
+pub mod hook;
+pub mod iat;
 pub mod pe;
 pub mod remote;
 pub mod stub;
@@ -28,6 +30,8 @@ use anyhow::{bail, Context, Result};
 
 use crate::child::Child;
 
+pub use hook::{install_create_process_hook, HookReport};
+pub use iat::ImportSlot;
 pub use pe::PeImage;
 pub use remote::{
     ConsolePatch, ConsoleState, ModuleSource, RemoteModule, RemoteModules, RemoteProcess,

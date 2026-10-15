@@ -79,6 +79,12 @@ pub const DLL_PROCESS_ATTACH: DWORD = 1;
 pub const DLL_THREAD_ATTACH: DWORD = 2;
 pub const DLL_THREAD_DETACH: DWORD = 3;
 
+// Process creation flags (winbase.h).
+pub const DETACHED_PROCESS: DWORD = 0x0000_0008;
+pub const CREATE_NEW_CONSOLE: DWORD = 0x0000_0010;
+pub const CREATE_NO_WINDOW: DWORD = 0x0800_0000;
+pub const STARTF_USESTDHANDLES: DWORD = 0x0000_0100;
+
 pub const COORD_CHAR: u16 = 0xfffe;
 
 // Console input/output modes (wincon.h).
@@ -127,6 +133,53 @@ pub struct COORD {
     pub X: i16,
     pub Y: i16,
 }
+
+/// `STARTUPINFOW` (winbase.h).
+///
+/// Only the fields the payload writes are named; the rest are present so the
+/// offsets after them are right, which is the whole point of mirroring the
+/// layout rather than taking a pointer to something opaque.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct STARTUPINFOW {
+    pub cb: DWORD,
+    pub lpReserved: LPWSTR,
+    pub lpDesktop: LPWSTR,
+    pub lpTitle: LPWSTR,
+    pub dwX: DWORD,
+    pub dwY: DWORD,
+    pub dwXSize: DWORD,
+    pub dwYSize: DWORD,
+    pub dwXCountChars: DWORD,
+    pub dwYCountChars: DWORD,
+    pub dwFillAttribute: DWORD,
+    pub dwFlags: DWORD,
+    pub wShowWindow: WORD,
+    pub cbReserved2: WORD,
+    pub lpReserved2: *mut u8,
+    pub hStdInput: HANDLE,
+    pub hStdOutput: HANDLE,
+    pub hStdError: HANDLE,
+}
+
+/// `PROCESS_INFORMATION` (winbase.h).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PROCESS_INFORMATION {
+    pub hProcess: HANDLE,
+    pub hThread: HANDLE,
+    pub dwProcessId: DWORD,
+    pub dwThreadId: DWORD,
+}
+
+// x64: four `ULONG`s precede `ConsoleHandle` in `RTL_USER_PROCESS_PARAMETERS`,
+// which pads to the first 8-byte slot at 0x10. Source: ReactOS `ntpsapi.h`.
+const _: () = assert!(core::mem::offset_of!(STARTUPINFOW, dwFlags) == 0x3c);
+const _: () = assert!(core::mem::offset_of!(STARTUPINFOW, hStdInput) == 0x50);
+const _: () = assert!(core::mem::offset_of!(STARTUPINFOW, hStdOutput) == 0x58);
+const _: () = assert!(core::mem::offset_of!(STARTUPINFOW, hStdError) == 0x60);
+const _: () = assert!(core::mem::size_of::<STARTUPINFOW>() == 0x68);
+const _: () = assert!(core::mem::size_of::<PROCESS_INFORMATION>() == 0x18);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
