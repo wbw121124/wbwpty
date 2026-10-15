@@ -22,8 +22,10 @@ use windows_sys::Win32::System::Memory::{
     PAGE_EXECUTE_READWRITE,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateRemoteThread, GetExitCodeThread, WaitForSingleObject, INFINITE, LPTHREAD_START_ROUTINE,
-};
+        CreateRemoteThread, GetExitCodeThread, WaitForSingleObject, INFINITE, LPTHREAD_START_ROUTINE,
+        PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_OPERATION,
+        PROCESS_VM_READ, PROCESS_VM_WRITE,
+    };
 
 use crate::error::last_error_text;
 
@@ -293,15 +295,16 @@ impl RemoteProcess {
     /// and friends would let a caller reach past the process it named.
     pub fn open(pid: u32) -> Result<Self> {
         use windows_sys::Win32::System::Threading::OpenProcess;
-        use windows_sys::Win32::System::Threading::{
-            PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
-        };
 
         // SAFETY: `pid` comes from a process table snapshot; a failure to open
         // is reported through the return value rather than a null handle.
         let handle = unsafe {
             OpenProcess(
-                PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+                PROCESS_QUERY_INFORMATION
+                    | PROCESS_QUERY_LIMITED_INFORMATION
+                    | PROCESS_VM_READ
+                    | PROCESS_VM_WRITE
+                    | PROCESS_VM_OPERATION,
                 0,
                 pid,
             )
