@@ -88,7 +88,15 @@ pub enum PayloadStage {
     ConsoleAlreadySet,
     /// The PEB could not be read; nothing was changed.
     ConsoleSkipped,
-    /// The attach path ran to completion.
+    /// The worker thread started.
+    WorkerStarted,
+    /// The environment contract was read and the log file, if any, was opened.
+    LogReady,
+    /// The CRT streams were put into unbuffered mode.
+    CrtRepaired,
+    /// The CRT streams could not be repaired.
+    CrtSkipped,
+    /// The worker ran to completion.
     Done,
     /// A value this build does not know about.
     Unknown(u32),
@@ -102,9 +110,18 @@ impl PayloadStage {
             2 => Self::ConsolePatched,
             3 => Self::ConsoleAlreadySet,
             4 => Self::ConsoleSkipped,
-            5 => Self::Done,
+            5 => Self::WorkerStarted,
+            6 => Self::LogReady,
+            7 => Self::CrtRepaired,
+            8 => Self::CrtSkipped,
+            9 => Self::Done,
             other => Self::Unknown(other),
         }
+    }
+
+    /// True once no further progress will be reported.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::CrtSkipped)
     }
 }
 
@@ -136,6 +153,30 @@ impl PayloadStatus {
     }
 }
 
+/// What the payload's CRT repair did.
+///
+/// Packed into one `u32` because the host reads it out of the mapped image with
+/// a single four-byte read, and because the stage word has no room for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CrtDetail {
+    /// `ucrtbase.dll` was found and both exports resolved.
+    pub ucrt_resolved: bool,
+    /// Streams `setvbuf` accepted.
+    pub streams_set: u32,
+    /// Streams `setvbuf` refused.
+    pub streams_refused: u32,
+}
+
+impl CrtDetail {
+    fn decode(raw: u32) -> Self {
+        Self {
+            ucrt_resolved: raw & (1 << 16) != 0,
+            streams_set: raw & 0xff,
+            streams_refused: (raw >> 8) & 0xff,
+        }
+    }
+}
+
 /// A live terminal session.
 ///
 /// Dropping a session terminates the target, so a panic anywhere above cannot
@@ -147,6 +188,8 @@ pub struct Session {
     report: Option<InjectionReport>,
     /// RVA of the payload's exported WBWPTY_STATUS word, resolved at start.
     status_rva: Option<u32>,
+    /// RVA of the payload's exported WBWPTY_CRT_DETAIL word.
+    crt_detail_rva: Option<u32>,
     /// Console sentinel state after the post-injection re-assert.
     console_patch: Result<crate::manual_map::ConsolePatch, String>,
     shutting_down: Arc<AtomicBool>,
@@ -209,6 +252,11 @@ impl Session {
         let status_rva = std::fs::read(&dll_path)
             .ok()
             .and_then(|file| crate::manual_map::find_export_rva(&file, "WBWPTY_STATUS").ok().flatten());
+        let crt_detail_rva = std::fs::read(&dll_path)
+            .ok()
+            .and_then(|file| {
+                crate::manual_map::find_export_rva(&file, "WBWPTY_CRT_DETAIL").ok().flatten()
+            });
 
         // `Child::spawn` had the last word while the target was suspended, but it
         // does not keep it. Measured on this machine: a target created
@@ -229,6 +277,7 @@ impl Session {
             config,
             report,
             status_rva,
+            crt_detail_rva,
             console_patch,
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
@@ -259,6 +308,48 @@ impl Session {
     /// The same word, decoded.
     pub fn payload_stage(&self) -> Option<PayloadStatus> {
         self.payload_status().map(PayloadStatus::decode)
+    }
+
+    /// Waits for the payload's worker to reach a terminal stage.
+    ///
+    /// The stage word is a live progress channel, not a one-shot result: the
+    /// worker thread publishes it as it goes, so reading it right after the
+    /// remote stub returns races the worker. `None` means the word never
+    /// settled, which is a legitimate answer - a target that exits mid-setup
+    /// takes its payload with it.
+    pub fn wait_for_payload(&self, timeout: std::time::Duration) -> Option<PayloadStatus> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut last = None;
+        loop {
+            match self.payload_stage() {
+                Some(status) => {
+                    if status.stage.is_terminal() {
+                        return Some(status);
+                    }
+                    last = Some(status);
+                }
+                // The payload is gone; nothing more will be published.
+                None if last.is_some() => return last,
+                None => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// The payload's `WBWPTY_CRT_DETAIL` word, decoded.
+    ///
+    /// Packed as `ucrt_resolved << 16 | refused << 8 | set`; see the layout in
+    /// the payload's `lib.rs`.
+    pub fn payload_crt_detail(&self) -> Option<CrtDetail> {
+        use crate::manual_map::remote::RemoteProcess;
+        let report = self.report.as_ref()?;
+        let rva = self.crt_detail_rva?;
+        let proc = RemoteProcess::new(self.child.process_handle());
+        let bytes = proc.read_bytes(report.image_base + rva as u64, 4).ok()?;
+        Some(CrtDetail::decode(u32::from_le_bytes(bytes.try_into().ok()?)))
     }
 
     pub fn pid(&self) -> u32 {
@@ -297,7 +388,7 @@ impl Session {
             Ok(patch) => eprintln!("wbwpty: pid {} sentinel {patch:?}", self.child.pid),
             Err(err) => eprintln!("wbwpty: pid {} sentinel not applied: {err}", self.child.pid),
         }
-        match self.payload_stage() {
+        match self.wait_for_payload(std::time::Duration::from_millis(1500)) {
             Some(status) => eprintln!(
                 "wbwpty: pid {} payload stage={:?} reason={} attach_path_ran={}",
                 self.child.pid,
@@ -306,6 +397,12 @@ impl Session {
                 status.ran_attach_path()
             ),
             None => eprintln!("wbwpty: pid {} payload not mapped", self.child.pid),
+        }
+        if let Some(detail) = self.payload_crt_detail() {
+            eprintln!(
+                "wbwpty: pid {} crt ucrt_resolved={} streams_set={} streams_refused={}",
+                self.child.pid, detail.ucrt_resolved, detail.streams_set, detail.streams_refused
+            );
         }
     }
 
@@ -542,7 +639,7 @@ mod tests {
     #[test]
     fn payload_maps_into_a_live_target() {
         let mut pipes = crate::pipe::PipePair::new(0x11_0005).unwrap();
-        let mut stdio = pipes.open_target_stdio().unwrap();
+        let stdio = pipes.open_target_stdio().unwrap();
         let spec = ChildSpec::new("cmd.exe").stdio(Stdio {
             stdin: stdio.stdin,
             stdout: stdio.stdout,
@@ -585,7 +682,7 @@ mod tests {
         // Real pipes, because `STARTF_USESTDHANDLES` is what puts a handle in
         // `StandardOutput`; a target created without them legitimately has none.
         let mut pipes = crate::pipe::PipePair::new(0x11_0007).unwrap();
-        let mut stdio = pipes.open_target_stdio().unwrap();
+        let stdio = pipes.open_target_stdio().unwrap();
         let spec = ChildSpec::new("cmd.exe")
             .args(["/c", "exit", "0"])
             .stdio(Stdio {
@@ -695,15 +792,39 @@ mod tests {
     #[test]
     fn status_word_layout_splits_as_documented() {
         assert_eq!(PayloadStatus::decode(0).stage, PayloadStage::Idle);
-        assert_eq!(PayloadStatus::decode(5).stage, PayloadStage::Done);
-        assert_eq!(PayloadStatus::decode(0x1_0005).reason, 1);
-        assert_eq!(PayloadStatus::decode(0x1_0005).stage, PayloadStage::Done);
+        assert_eq!(PayloadStatus::decode(9).stage, PayloadStage::Done);
+        assert_eq!(PayloadStatus::decode(0x1_0009).reason, 1);
+        assert_eq!(PayloadStatus::decode(0x1_0009).stage, PayloadStage::Done);
         assert_eq!(
-            PayloadStatus::decode(0x1_0009).stage,
-            PayloadStage::Unknown(9)
+            PayloadStatus::decode(0x1_0042).stage,
+            PayloadStage::Unknown(0x42)
         );
-        assert!(PayloadStatus::decode(0x1_0005).ran_attach_path());
+        assert!(PayloadStatus::decode(0x1_0009).ran_attach_path());
         assert!(!PayloadStatus::decode(0).ran_attach_path());
+
+        // Terminality is what `wait_for_payload` polls on, so getting it wrong
+        // either hangs the host or makes it give up early.
+        assert!(PayloadStage::Done.is_terminal());
+        assert!(PayloadStage::CrtSkipped.is_terminal());
+        assert!(!PayloadStage::CrtRepaired.is_terminal());
+        assert!(!PayloadStage::LogReady.is_terminal());
+        assert!(!PayloadStage::Entered.is_terminal());
+    }
+
+    /// The CRT detail word is packed into one `u32`; the host has to read back
+    /// what the payload packed.
+    #[test]
+    fn crt_detail_word_unpacks_as_documented() {
+        // set=2, refused=0, resolved -> 0x0001_0002
+        let raw = 2 | (0 << 8) | (1 << 16);
+        let detail = CrtDetail::decode(raw);
+        assert!(detail.ucrt_resolved);
+        assert_eq!(detail.streams_set, 2);
+        assert_eq!(detail.streams_refused, 0);
+
+        let none = CrtDetail::decode(0);
+        assert!(!none.ucrt_resolved);
+        assert_eq!(none.streams_set, 0);
     }
 
     /// A process the target creates must write to our pipe.

@@ -166,6 +166,16 @@ cargo test --release                  # 相关测试必须全绿
 20. **`stable_modules()` 里第一次遍历失败不等于失败**：`LdrpInitializeProcess` 是逐个挂链的，
     跨过挂链点的遍历会触发 doubly-linked 校验失败。机器一忙就复现。
     现在两种遍历失败都当作"还没就绪"重试到超时。
+21. **`setvbuf(_IOLBF)` 对管道完全没用**：实测 UCRT 的 `_IOLBF == 0x40` 对非 console 流
+    行为和 `_IOFBF` 一样；真正能消除延迟的是 **`_IONBF == 4`**。UCRT 只接受 `0 / 4 / 0x40`
+    三个值，其余（1,2,3,8,32,128）会触发非法参数处理器**直接把进程 abort 掉**。
+    这三个值跟 mingw 的不一样（mingw: 0/1/2），**别照头文件"修正"**。
+    完整扫描见 README §1.6 与 `tests/crt_buffering.rs`。
+22. **`_open_osfhandle` / `_dup2` 在本项目里用不上**：标准描述符本来就是会话管道，
+    宿主在目标执行任何指令之前就通过 `STARTF_USESTDHANDLES` 交出去了。
+    旧计划里的"完整 CRT 修复"包含它们，是照抄别的项目的做法，没有实测依据。
+23. **目标项目的 stderr 和 stdout 是同一条管道**（`pipe.rs` 里 stderr 是 stdout 的副本），
+    所以 shell 里 `2> file` 分不开它们，`--dump-conhost` 之类的输出要一起看。
 
 ## 10. 外部可复用模块（评估过再用）
 

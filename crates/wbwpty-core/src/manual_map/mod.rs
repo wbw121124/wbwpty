@@ -442,7 +442,7 @@ mod tests {
         };
 
         let mut pipes = PipePair::new(0x11_0001).unwrap();
-        let mut stdio = pipes.open_target_stdio().unwrap();
+        let stdio = pipes.open_target_stdio().unwrap();
         let spec = ChildSpec::new("cmd.exe").stdio(Stdio {
             stdin: stdio.stdin,
             stdout: stdio.stdout,
@@ -482,7 +482,7 @@ mod tests {
         use crate::pipe::PipePair;
 
         let mut pipes = PipePair::new(0x11_0002).unwrap();
-        let mut stdio = pipes.open_target_stdio().unwrap();
+        let stdio = pipes.open_target_stdio().unwrap();
         let child = Child::spawn(&ChildSpec::new("cmd.exe").stdio(Stdio {
             stdin: stdio.stdin,
             stdout: stdio.stdout,

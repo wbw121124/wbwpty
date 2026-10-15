@@ -148,6 +148,34 @@ ResumeThread  ──►  loader 初始化 ──► ucrtbase!__acrt_initialize_s
 
 ---
 
+### 1.6 stdio 缓冲：`_IOLBF` 在管道上没用，要用 `_IONBF`
+
+一个 CRT 对管道默认是**全缓冲**：实测（`tests/crt_buffering.rs`）写一行带换行的内容，
+**701ms 后（进程退出时）才到达管道**。在终端里这就是"程序卡住了"。
+
+原计划是 `setvbuf(_IOLBF)`。**实测不成立**。把候选值全扫一遍（UCRT）：
+
+| 值 | ucrtbase 的实际行为 |
+| --- | --- |
+| `0` | `_IOFBF`，全缓冲，退出时才到 |
+| `1`,`2`,`3`,`8`,`32`,`128` | 不是合法 mode → 跑非法参数处理器 → **进程 abort** |
+| **`4`** | **`_IONBF`，1ms 就到** ✅ |
+| `64` (`0x40`) | `_IOLBF`，但**对管道的行为和 `_IOFBF` 一模一样** |
+
+所以：合法值就是 `0 / 4 / 0x40` 这三个，而 `_IOLBF` 对非 console 流不生效。
+**`_IONBF`（4）才是能用的那个**——代价是每次写一次系统调用，对终端来说本来也是想要的行为。
+
+> ⚠️ 这三个值是 **UCRT** 的，不是 mingw 的（mingw 是 `_IOFBF 0, _IOLBF 1, _IONBF 2`）。
+> 所以是**实测出来的，不是查头文件**。别"修正"回头文件里的值。
+
+另外两件事：
+
+- `setvbuf` 必须在该流发生第一次 I/O **之前**调用才有意义（C 标准规定之后调用是未定义行为）。
+  payload 最早只能在 loader 跑完后映射，那时目标的 CRT 早就初始化完了。
+  实测这个时机**够用**——探针在 payload 到达后写的内容 0ms 就到了管道（对照组 702ms）。
+- `_open_osfhandle` / `_dup2` **不需要**：标准描述符本来就是会话管道，
+  宿主在目标跑第一条指令前就通过 `STARTF_USESTDHANDLES` 交出去了。
+
 ## 2. 架构
 
 ```
@@ -242,7 +270,7 @@ cargo test --release
 | 4 | stdio | **`STARTF_USESTDHANDLES` + 可继承管道句柄**，重定向不再依赖 DLL 注入时机 | `feat(session): run a target over pipes with no console host` | ✅ |
 | 5 | CLI | 会话循环：双泵 / EOF / 退出码 / `--dump-conhost` / `--verbose` | （同上） | ✅ |
 | 6 | PEB | 宿主侧（挂起态 + 注入后各一次）读/写目标 `ConsoleHandle`，偏移断言 + 运行时自检；**实测无法阻止孙进程分配 console**，见 §1.2 | `fix(peb): own the console state from the host side` | ✅（机制被证伪，已记录） |
-| 7 | CRT | `_open_osfhandle`/`_dup2`/`setvbuf(_IOLBF)`/`_flushall` | ⏳ |
+| 7 | CRT | `config.rs` 环境契约 + 接上 `log::init_from_env` + worker 线程 + `setvbuf(_IONBF)`（**不是 `_IOLBF`**，见 §1.6） | `feat(dll): unbuffer the target stdio streams so output is not held back` | ✅ |
 | 8 | shim | KernelBase 内联 hook：`CreateProcess*` 拦截（`DETACHED_PROCESS` + `STARTF_USESTDHANDLES`，见 §1.2）+ console API shim | ⏳ |
 | 9 | 测试 | cmd/python/大输出/stderr/无 conhost/孙进程 | ⏳ |
 | 10 | 文档 | README 定稿 | ⏳ |
@@ -256,9 +284,12 @@ cargo test --release
 - **本轮把 Stage 6 的前提证伪了，并找到了真正的开关**（见 §1.2）：`ConsoleHandle` 哨兵
   挡不住孙进程拿到 console；实测矩阵表明只有 `DETACHED_PROCESS` + `STARTF_USESTDHANDLES`
   同时满足"不冒 conhost"和"输出进管道"，两半缺一不可。方案已定，**尚未实现**。
+- **Stage 7 完成并实测有效**：同样的探针、同样的管道、同样的写，
+  无 payload 时输出 702ms 才到，有 payload 时 **0ms**（`tests/crt_buffering.rs`）。
+  `WBWPTY_LOG` 也第一次真正生效——之前 `log::init_from_env()` 从来没被调用过。
 - `cmd /c <短命令>` 这类目标**基本永远注不进去**：`stable_modules` 需要 ~100ms 稳定窗口，
   而目标几毫秒就退出。stdio 走 `STARTF_USESTDHANDLES` 所以不影响它工作，但任何注入侧的
-  语义补丁（哨兵、shim、CRT）对它都不生效。
+  语义补丁（哨兵、shim、CRT）对它都不生效。**这也包括 Stage 7 的缓冲修复。**
 
 ### 5.2 关键技术发现（全部本机实测，恢复工作时不要推翻）
 

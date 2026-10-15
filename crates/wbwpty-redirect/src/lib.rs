@@ -11,6 +11,7 @@
 
 #![no_std]
 
+pub mod config;
 pub mod crt;
 pub mod ffi;
 pub mod log;
@@ -46,10 +47,9 @@ use ffi::{HINSTANCE, DWORD};
 #[no_mangle]
 pub static mut WBWPTY_STATUS: u32 = 0;
 
-/// How far [`DllMain`]'s attach path got.
+/// How far the payload got.
 ///
-/// Mirrored by the host in `wbwpty-core::session`; the two must stay in step,
-/// which is what `status_word_matches_the_host_decoder` in the host crate checks.
+/// Mirrored by the host in `wbwpty-core::session`; the two must stay in step.
 pub mod stage {
     /// The image is mapped but no code of ours has run.
     pub const IDLE: u32 = 0;
@@ -61,8 +61,19 @@ pub mod stage {
     pub const CONSOLE_ALREADY_SET: u32 = 3;
     /// The PEB or its process parameters could not be read; nothing was changed.
     pub const CONSOLE_SKIPPED: u32 = 4;
-    /// The attach path ran to completion.
-    pub const DONE: u32 = 5;
+    /// The worker thread started.
+    pub const WORKER_STARTED: u32 = 5;
+    /// The environment contract was read and `WBWPTY_LOG` was opened if asked.
+    pub const LOG_READY: u32 = 6;
+    /// The CRT streams were put into unbuffered mode.
+    pub const CRT_REPAIRED: u32 = 7;
+    /// The CRT streams could not be repaired; see `WBWPTY_CRT_DETAIL`.
+    pub const CRT_SKIPPED: u32 = 8;
+    /// The worker ran to completion.
+    pub const DONE: u32 = 9;
+
+    /// Stages after which no further progress will be reported.
+    pub const TERMINAL: u32 = DONE;
 }
 
 /// Packs a stage and the `fdwReason` DllMain was entered with into the layout
@@ -93,24 +104,113 @@ pub const WBWPTY_STATUS_OK: u32 = 1;
 pub const WBWPTY_STATUS_NO_PIPE_IN: u32 = 2;
 pub const WBWPTY_STATUS_NO_PIPE_OUT: u32 = 3;
 
+/// Detail word for [`stage::CRT_REPAIRED`] / [`stage::CRT_SKIPPED`].
+///
+/// Packed because the host reads it as a single `u32` and the stage word only
+/// has room for "did it work":
+///
+/// ```text
+///   bits  0..7  streams `setvbuf` accepted
+///   bits  8..15 streams `setvbuf` refused
+///   bits 16..23 1 if ucrtbase and both exports resolved
+/// ```
+#[no_mangle]
+pub static mut WBWPTY_CRT_DETAIL: u32 = 0;
+
 /// Entry point invoked by the manual mapper (and by the C runtime when the DLL
 /// is loaded normally with `LoadLibrary`).
+///
+/// Deliberately short. Everything that can touch another module - reading the
+/// environment, opening the log, reaching into ucrtbase - happens on the worker
+/// thread, because `DllMain` runs under the loader lock and `dlog!`'s
+/// formatting code has already been caught faulting there (AGENTS pitfall 11).
 #[no_mangle]
 pub extern "system" fn DllMain(_hinst: HINSTANCE, reason: DWORD, _reserved: *mut c_void) -> i32 {
     // Record that we entered DllMain with the given reason, so the host can
     // verify the stub passed arguments correctly. The attach path overwrites
     // this with how far it actually got.
     unsafe { WBWPTY_STATUS = status_word(stage::ENTERED, reason); }
-    match reason {
-        ffi::DLL_PROCESS_ATTACH => {
-            let outcome = crate::stdio::install();
-            unsafe { WBWPTY_STATUS = status_word(outcome.stage(), reason); }
-        }
-        ffi::DLL_THREAD_ATTACH | ffi::DLL_THREAD_DETACH | ffi::DLL_PROCESS_DETACH => {}
-        _ => {}
+    if reason == ffi::DLL_PROCESS_ATTACH {
+        ATTACH_REASON.store(reason, core::sync::atomic::Ordering::Relaxed);
+        let outcome = crate::stdio::install();
+        unsafe { WBWPTY_STATUS = status_word(outcome.stage(), reason); }
+        start_worker(reason);
     }
     ffi::TRUE
 }
+
+/// Starts the payload's worker thread and returns immediately.
+///
+/// The thread runs the parts that must not happen under the loader lock. It is
+/// the reason `DllMain` stays trivial; see [`worker`].
+fn start_worker(reason: DWORD) {
+    // SAFETY: no attributes, default stack, a `LPTHREAD_START_ROUTINE` with
+    // the documented signature and a null parameter. `worker` is a plain
+    // `extern "system" fn(*mut c_void) -> DWORD` that ignores its argument.
+    let handle = unsafe {
+        ffi::CreateThread(
+            core::ptr::null_mut(),
+            0,
+            Some(worker),
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() {
+        // No worker means no log and no CRT repair. Record that rather than
+        // pretending the attach path finished.
+        unsafe { WBWPTY_STATUS = status_word(stage::CRT_SKIPPED, reason) };
+        return;
+    }
+    // SAFETY: a live handle from the call above.
+    unsafe { ffi::CloseHandle(handle) };
+}
+
+/// The payload's actual work, on a thread of its own.
+///
+/// Runs once. Everything here may block or take another module's init lock,
+/// which is precisely why it is not in `DllMain`.
+unsafe extern "system" fn worker(arg: *mut c_void) -> DWORD {
+    // The parameter is the null `start_worker` passed and is deliberately
+    // unused; reading it is not an unsafe operation, it just is not needed.
+    let _ = arg;
+    let reason = ATTACH_REASON.load(core::sync::atomic::Ordering::Relaxed);
+
+    crate::config::load();
+    crate::log::init_from_env();
+    unsafe { WBWPTY_STATUS = status_word(stage::LOG_READY, reason) };
+
+    let outcome = crate::crt::repair();
+    unsafe {
+        WBWPTY_CRT_DETAIL = (outcome.streams_set & 0xff)
+            | ((outcome.streams_refused & 0xff) << 8)
+            | (u32::from(outcome.ucrt_resolved) << 16);
+        WBWPTY_STATUS = status_word(
+            if outcome.is_effective() {
+                stage::CRT_REPAIRED
+            } else {
+                stage::CRT_SKIPPED
+            },
+            reason,
+        );
+        crate::dlog!(
+            "crt: ucrt_resolved={} streams_set={} streams_refused={} rows={} cols={} shim={}",
+            outcome.ucrt_resolved,
+            outcome.streams_set,
+            outcome.streams_refused,
+            crate::config::rows(),
+            crate::config::cols(),
+            crate::config::shim(),
+        );
+        WBWPTY_STATUS = status_word(stage::DONE, reason);
+    }
+    0
+}
+
+/// `fdwReason` handed to the worker, so every stage it publishes carries the
+/// same one.
+static ATTACH_REASON: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// `core` is shipped in the sysroot compiled with unwinding, so its `.xdata`
 /// still references `rust_eh_personality` even though this crate is built with
