@@ -18,13 +18,22 @@ use wbwpty_core::procwatch::{Mode, ProcessWatch};
 /// it. With this, the process is genuinely console-less.
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 
-/// Spawns a console-less process that exits at once and spawns nothing.
-fn spawn_transient() {
-    // SAFETY-free: `creation_flags` only sets a documented flag.
-    let _ = std::process::Command::new("cmd.exe")
-        .args(["/c", "exit", "0"])
+/// Spawns a console-less process that stays alive until killed.
+///
+/// Long-lived on purpose. The first version of this test used `cmd /c exit 0`,
+/// which lives for a few milliseconds - shorter than one pass of the sampler's
+/// `process_table()`, which walks every process on the machine. So the watcher
+/// missed it, and `Mode::Sampled` missing it is *correct behaviour* (AGENTS §12):
+/// that is exactly why the mode reports `is_exhaustive() == false`. A test that
+/// expects a poller to catch a process shorter than its own poll period is asking
+/// for a fluke. What is actually worth asserting is that a process which is still
+/// running *does* show up.
+fn spawn_console_less() -> std::process::Child {
+    std::process::Command::new("cmd.exe")
+        .args(["/k"])
         .creation_flags(DETACHED_PROCESS)
-        .spawn();
+        .spawn()
+        .expect("spawning the observed process")
 }
 
 fn wait_for<F: Fn() -> bool>(done: F, timeout: Duration) -> bool {
@@ -60,15 +69,25 @@ fn a_watcher_starts_and_stops() {
 #[test]
 fn a_started_process_is_recorded() {
     let watch = ProcessWatch::start();
+
+    // Settle first. `before` has to be taken *after* the first snapshot lands,
+    // otherwise "the record grew" is satisfied by the ~250 processes the watcher
+    // discovers on its own first poll and tells us nothing about the spawn below.
+    let baseline = wait_for(|| watch.recorded().len() > 100, Duration::from_secs(5));
+    assert!(baseline, "the watcher recorded no processes at all to start from");
     let before = watch.recorded().len();
 
-    spawn_transient();
-
+    let mut child = spawn_console_less();
     let grew = wait_for(
         || watch.recorded().len() > before,
         Duration::from_secs(5),
     );
     let recorded = watch.recorded();
+    // Killed whether or not the assertions below hold, so a failure here cannot
+    // leave an orphaned cmd.exe behind.
+    let _ = child.kill();
+    let _ = child.wait();
+
     assert!(
         grew,
         "a process was created but the watcher recorded none of the {} \
@@ -91,10 +110,12 @@ fn no_console_host_is_reported_under_this_process() {
     let watch = ProcessWatch::start();
     let self_pid = std::process::id();
 
-    spawn_transient();
+let mut child = spawn_console_less();
     let _ = wait_for(|| !watch.recorded().is_empty(), Duration::from_secs(5));
 
     let hosts = watch.console_hosts_under(self_pid);
+    let _ = child.kill();
+    let _ = child.wait();
     assert!(
         hosts.is_empty(),
         "a console host was created under the test process: {hosts:?}"

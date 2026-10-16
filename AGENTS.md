@@ -438,8 +438,22 @@ lpEnvironment  = NULL                lpEnvironment  = 明确传入
 | --- | --- |
 | `wbwpty --dump-conhost -- cmd.exe /c echo hello`（§6 验收） | 安全 |
 | `cargo test --workspace --release`（12 个 ignored 不跑） | 安全 |
-| `cmd.exe /c "ping -n N 127.0.0.1 > nul & <子进程>"`（有延迟，hook 来得及装上） | 安全 |
+| **延迟用 `for /L %i in (1,1,999999) do @rem`，不是 `ping`** | 安全 |
 | 第一代目标（`wbwpty -- python.exe ...`） | 安全 |
+
+### ⚠ 延迟手段：`ping` 会弹窗，2026-10-16 因此又翻车一次
+
+**别用 `ping` 来拖延时间。** 它是 `cmd` 的**第一个** spawn，发生在注入完成之前，
+于是 hook 没参与，`ping` 按基础 API 走、**自己分配一个 console**——弹出来的窗口
+标题正是 `ping`。而且它的 conhost 随 `ping` 一起退出，跑完再数必然是 0。
+
+正确的延迟手段是 **cmd 内部循环**，它不 spawn 任何东西：
+
+```
+cmd.exe /c "for /L %i in (1,1,999999) do @rem & <被测子进程>"
+```
+
+这条同样记在 §7' 规则 19 里，当时是用例；**这一轮它变成了必须遵守的禁令。**
 
 ### 哪些命令**会弹窗**，禁止随手运行
 
@@ -488,7 +502,7 @@ lpEnvironment  = NULL                lpEnvironment  = 明确传入
 
 ### 变通办法
 
-- 要验证后代逻辑，先把目标换成**有延迟**的形式（`ping -n 4 ... &`），
-  这条路径实测不会弹。
+- 要验证后代逻辑，先把目标换成**有延迟**的形式（`for /L ... do @rem &`，不是
+  `ping`），这条路径实测不会弹。
 - 需要在**完全没有 console** 的环境里跑测试时，用任务计划或服务方式启动，
   不要用 `Start-Process cmd.exe`（那本身就会分配 console，见 §7' 坑 33）。

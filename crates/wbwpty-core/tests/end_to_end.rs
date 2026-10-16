@@ -412,19 +412,22 @@ fn cmd_runs_python_through_the_substitution() {
 /// Two things in the command line are load-bearing, and both were arrived at by
 /// measurement rather than taste:
 ///
-/// * **`ping -n 2 ...` first.** `cmd.exe /c <child>` spawns within a few
-///   milliseconds, which is before the injector can finish; that child misses the
-///   hook entirely and its output is lost. The padding buys the injector time,
-///   which is why this test can assert a positive result at all. See AGENTS §12
-///   for what that costs - a `cmd /c` that spawns instantly still cannot be
-///   covered.
+/// * **A `for /L` loop first, and specifically not `ping`.** `cmd.exe /c <child>`
+///   spawns within a few milliseconds, which is before the injector can finish;
+///   that child misses the hook entirely and is allocated a console of its own.
+///   The loop buys the injector time without spawning anything. `ping` was used
+///   here first and is exactly the mistake described in AGENTS §12: it *is* the
+///   first spawn, so it gets the console instead of the child under test - the
+///   window that appeared on the user's desktop was titled `ping`.
 /// * **No `> nul` on the python command.** With a redirect in front of it, the
 ///   grandchild's `sys.stdout` comes back `None` even though the hook reports
-///   success and `STDOUT-MARK` never appears. Still unexplained (AGENTS §11), so
-///   it is avoided here rather than encoded as expected behaviour.
+///   success. Still unexplained (AGENTS §11), so it is avoided here rather than
+///   encoded as expected behaviour.
 ///
-/// Not `#[ignore]`d: it spawns a padded child, the hook is armed by the time the
-/// child under test runs, and nothing in the tree allocates a console.
+/// Not `#[ignore]`d: the delay spawns nothing, the hook is armed by the time the
+/// child under test runs, and nothing in the tree allocates a console. That is a
+/// claim, so it is checked rather than assumed - see `proc_watch` for how the
+/// "no console host" half is actually verified.
 #[test]
 fn a_grandchild_reaches_the_pipe_without_a_console() {
     let python = python_or_skip!();
@@ -446,24 +449,39 @@ fn a_grandchild_reaches_the_pipe_without_a_console() {
     )
     .expect("writing the grandchild script");
 
-    let spec = ChildSpec::new("cmd.exe").args([
-        "/c".to_string(),
-        format!(
-            "ping -n 2 127.0.0.1 & {python} {}",
-            script.display()
-        ),
-    ]);
+    // `cmd /k` and then type the command, rather than `cmd /c <command>` with a
+    // delay in front of it. See the sibling test for why: a `ping` delay is the
+    // bug rather than the fix (it is cmd's first spawn, so *it* gets the console),
+    // and a `for /L` delay is unbounded and can burn the whole deadline.
+    let spec = ChildSpec::new("cmd.exe").arg("/k");
     let config = SessionConfig {
         shim: true,
         inject: true,
+        // Rule 32: an interactive cmd exits the moment it sees stdin EOF, and the
+        // pump would deliver it at a moment this test does not control.
         pump_input: false,
         ..Default::default()
     };
     let session = Session::start(&spec, config).expect("session");
     let _guard = TreeGuard { root: session.pid() };
 
+    let armed = wait_until(std::time::Duration::from_secs(10), || {
+        session.hook().map(|h| h.slot_count() > 0).unwrap_or(false)
+    });
+    assert!(
+        armed,
+        "the CreateProcess substitution was never installed, so a child spawned \
+         now would be given a console of its own"
+    );
+
     let mut buf = [0u8; 4096];
     let mut output = String::new();
+    let command = format!("{python} {}\r\n", script.display());
+    session
+        .pipes()
+        .with(|p| p.input().write_all(command.as_bytes()).is_ok())
+        .expect("input pipe");
+
     let deadline = Instant::now() + DEADLINE;
     while Instant::now() < deadline {
         match session.pipes().with(|p| p.read_output(&mut buf, 200)) {
@@ -478,7 +496,6 @@ fn a_grandchild_reaches_the_pipe_without_a_console() {
             _ => {}
         }
     }
-    let exit = session.wait_for(std::time::Duration::from_secs(2));
     session.shutdown();
     let _ = std::fs::remove_file(&script);
 
@@ -486,11 +503,162 @@ fn a_grandchild_reaches_the_pipe_without_a_console() {
     // so one arriving without the other would mean the child had only one.
     assert!(
         output.contains("STDOUT-MARK-7Q2K"),
-        "grandchild stdout missing; got {output:?} (exit {exit:?})"
+        "grandchild stdout missing; got {output:?}"
+    );
+
+    // Both descriptors, not just stdout: stderr is the same pipe (AGENTS 坑 23),
+    // so one arriving without the other would mean the child had only one.
+    assert!(
+        output.contains("STDOUT-MARK-7Q2K"),
+        "grandchild stdout missing; got {output:?}"
     );
     assert!(
         output.contains("STDERR-MARK-7Q2K"),
-        "grandchild stderr missing; got {output:?} (exit {exit:?})"
+        "grandchild stderr missing; got {output:?}"
+    );
+}
+
+/// Polls `ready` until it holds or `timeout` elapses.
+fn wait_until(timeout: std::time::Duration, mut ready: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if ready() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The same claim, with the "no console host" half actually checked.
+///
+/// The test above takes "no console host" on trust. This one does not: it starts a
+/// [`ProcessWatch`] *before* the session, so every process creation underneath this
+/// test is recorded, and then asks whether a console host was created in that
+/// tree. That is the whole difference between an assertion and a hope, and it is
+/// the check AGENTS §12 requires of any "nothing appeared" claim.
+///
+/// The honest limit: while the watch is in [`Mode::Sampled`] it polls, so a console
+/// host created and destroyed between two samples is still missed. The mode is
+/// printed, and when ETW works (`Mode::KernelEvents`) this test becomes
+/// exhaustive without changing a line.
+#[test]
+fn the_grandchild_tree_is_attributed_and_has_no_console_host() {
+    use wbwpty_core::procwatch::ProcessWatch;
+
+    let python = python_or_skip!();
+    let python = python.display().to_string().replace("Program Files", "PROGRA~1");
+    let script = std::env::temp_dir().join("wbwpty_end_to_end_attributed.py");
+    std::fs::write(
+        &script,
+        "import sys\n\
+         sys.stdout.write('ATTRIBUTED-7Q2K\\n')\n\
+         sys.stdout.flush()\n",
+    )
+    .expect("writing the grandchild script");
+
+    // Started first, so the root itself is not a process this watch missed.
+    let watch = ProcessWatch::start();
+    eprintln!(
+        "procwatch mode = {:?}, exhaustive = {}",
+        watch.mode(),
+        watch.mode().is_exhaustive()
+    );
+    let test_pid = std::process::id();
+
+    // `cmd /k` and then type the command, rather than `cmd /c <command>` with a
+    // delay in front of it. Two failures motivated this and both are worth
+    // recording:
+    //
+    // * A delay made of `ping` is not a delay, it is the bug: `ping` is cmd's
+    //   *first* spawn, so it is the one that misses the hook and gets a console
+    //   of its own. The window that appeared on the user's desktop was titled
+    //   `ping` (AGENTS §12).
+    // * A delay made of `for /L %i in (1,1,9999999) do @rem` spawns nothing, but
+    //   it is also not bounded - it burned the whole test deadline looping and
+    //   the child under test never ran at all.
+    //
+    // `/k` sidesteps both: cmd spawns nothing until it is told to, so waiting for
+    // the hook to be installed costs nothing and cannot produce a console. The
+    // first process it creates is the one that goes through the substitution.
+    let spec = ChildSpec::new("cmd.exe").arg("/k");
+    let config = SessionConfig {
+        shim: true,
+        inject: true,
+        // Rule 32: an interactive cmd exits the moment it sees stdin EOF, and the
+        // pump would deliver it at a moment this test does not control.
+        pump_input: false,
+        ..Default::default()
+    };
+    let session = Session::start(&spec, config).expect("session");
+    let _guard = TreeGuard { root: session.pid() };
+    // The root existed before the watch could see it, so the tree is incomplete
+    // by construction; saying so is what `adopt` is for.
+    watch.adopt(session.pid());
+
+    // Wait for the substitution to be armed rather than guessing at a delay. This
+    // is the condition that actually matters, and waiting on it directly is what
+    // makes "the child below was covered" a fact instead of a hope.
+    let armed = wait_until(std::time::Duration::from_secs(10), || {
+        session.hook().map(|h| h.slot_count() > 0).unwrap_or(false)
+    });
+    assert!(
+        armed,
+        "the CreateProcess substitution was never installed, so a child spawned \
+         now would be given a console of its own"
+    );
+
+    let mut buf = [0u8; 4096];
+    let mut output = String::new();
+    let command = format!("{python} {}\r\n", script.display());
+    session
+        .pipes()
+        .with(|p| p.input().write_all(command.as_bytes()).is_ok())
+        .expect("input pipe");
+
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline {
+        match session.pipes().with(|p| p.read_output(&mut buf, 200)) {
+            Some(Ok(ReadEvent::Data(n))) => {
+                output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if output.contains("ATTRIBUTED-7Q2K") {
+                    break;
+                }
+            }
+            Some(Ok(ReadEvent::Eof)) | None => break,
+            Some(Err(_)) => break,
+            _ => {}
+        }
+    }
+    session.shutdown();
+    let _ = std::fs::remove_file(&script);
+
+    // Let the last samples land before reading the record.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    assert!(
+        output.contains("ATTRIBUTED-7Q2K"),
+        "grandchild output missing; got {output:?}"
+    );
+
+    let hosts = watch.console_hosts_under(test_pid);
+    // Report what was seen, minus the shell this test was launched from - that
+    // belongs to the harness, not to the session under test.
+    let ours: Vec<_> = watch
+        .recorded()
+        .into_iter()
+        .filter(|b| b.parent != test_pid)
+        .collect();
+    eprintln!(
+        "procwatch recorded {} creations under the test; console hosts in tree: {}",
+        ours.len(),
+        hosts.len()
+    );
+    assert!(
+        hosts.is_empty(),
+        "a console host was created in this tree: {hosts:?}"
     );
 }
 
@@ -549,3 +717,4 @@ impl Drop for TreeGuard {
         }
     }
 }
+
