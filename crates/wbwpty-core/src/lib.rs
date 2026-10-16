@@ -16,6 +16,7 @@ pub mod error;
 pub mod inspect;
 pub mod manual_map;
 pub mod pipe;
+pub mod procwatch;
 pub mod screen;
 pub mod session;
 pub mod supervisor;
@@ -24,5 +25,7 @@ pub use anyhow::{Error, Result};
 pub use child::{ChildSpec, Stdio};
 pub use error::Handle;
 pub use pipe::{PipePair, ReadEvent};
+pub use procwatch::ProcessWatch;
 pub use session::{Session, SessionConfig};
 pub use supervisor::{Coverage, SupervisorConfig};
+

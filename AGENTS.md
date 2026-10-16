@@ -396,6 +396,24 @@ lpEnvironment  = NULL                lpEnvironment  = 明确传入
 **前面带 `> nul`**。所以现在的状态是：`cmd /c "ping ... & python"` 的输出**已经**
 能回到管道（有常跑测试守着），而 `cmd /c "ping ... > nul & python"` 仍失败。
 
+### 20. `procwatch` 的 ETW 路径在本机起不来（2026-10-16）
+
+`procwatch::ProcessWatch` 的内核事件模式在本机**始终**失败：
+`StartTraceW` 返回 `ERROR_INVALID_PARAMETER (24)`，于是 `start()` 静默降级到
+`Mode::Sampled`（轮询），测试输出里会看到 `mode = Sampled, exhaustive = false`。
+
+已排除：不是 ETW 不可用（PowerShell 的 `New-EtwTraceSession -LogFileMode 256`
+能建会话并启用 `Microsoft-Windows-Kernel-Process`）；不是缺 `EVENT_TRACE_USE_NOCOPY`
+（按 PowerShell 建出来的会话回读 `LogFileMode = 0x800100` 已照抄）；不是
+`MinimumBuffers`/`MaximumBuffers`/`FlushTimer`/`BufferSize`（同样照抄）；
+`WNODE_FLAG_TRACED_GUID` 加了也一样失败。
+
+**下一位接手时先做的事**：让 `try_kernel_events()` 成功，并让
+`the_watch_says_which_mode_it_is_in` 断言 `Mode::KernelEvents`。
+在那之前，**任何"没弹 conhost"的结论都不能引用 procwatch** —— 采样模式会漏掉
+在两次采样之间创建并退出的 console host，而那正是要抓的东西。
+`Mode::is_exhaustive()` 就是为了让这一点无法被忽略。
+
 下一位接手的人建议从这里下手：
 要么用 x64dbg 在 `ucrtbase!_ioinit` / `__acrt_initialize_stdio` 上断点，
 要么比较两代 `lpEnvironment` 与 `CREATE_SUSPENDED` 的影响

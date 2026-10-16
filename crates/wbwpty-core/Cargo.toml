@@ -24,6 +24,12 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
+    # `inspect`'s process watcher. ETW rather than polling, because a console
+    # host is short-lived and polling is what makes the claim unfalsifiable.
+    # `Win32_System_Time` is not optional here: windows-sys gates
+    # `EVENT_TRACE_LOGFILEW` behind it.
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Time",
 ] }
 
 [dev-dependencies]
