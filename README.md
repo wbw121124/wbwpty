@@ -586,6 +586,56 @@ DA/DSR 的应答走 `take_replies()` 灌进 `-in` 管道。自己重写这一套
 
 ---
 
+## 7.10 本轮进展（2026-10-16）：hook 机制的实测结论
+
+三个提交把"后代拿不到 console / 输出不到管道"这件事从猜测推进到了可测量：
+
+| 提交 | 内容 |
+| --- | --- |
+| `cbfcf34` | 同时拦截 `CreateProcessW` / `CreateProcessAsUserW` / `CreateProcessA`；IAT 槽必须连续两次读回 ours 才算装好 |
+| `8a680b6` | hook 计数器改为**目标存活期内**采样并缓存（原先事后读，短命目标恒为 `None`） |
+| `5a4701f` | loader 未解析的槽（存的是 `IMAGE_IMPORT_BY_NAME`，落在映像范围内）不再被当作真实地址 |
+
+用 x64dbg 实测确认（附加到 wbwpty 启动的 `cmd.exe`，`ping` 拖出窗口）：
+
+```
+HIT: cmd branched into the payload substitute
+HOOK_STATS  raw=0x00000100  children=1 failures=0
+HOOK_FLAGS  creation_flags=0x00080008 calls=1     ← DETACHED_PROCESS|EXTENDED_STARTUPINFO_PRESENT
+STD_HANDLES in=268 out=272 err=276
+```
+
+**替换机制本身是好的。** 之前反复测到的 `hook_stats == 0` 全部是观测问题：
+
+- 计数在目标死后才读 → 恒 `None`；
+- 诊断窗口写死 3 秒，而目标要 4.5 秒才跑完；
+- `ChildSpec` 给含空格路径加引号，`cmd /c` 只剥外层那对，内层以 `\"` 字面量到达
+  解释器，**被测子进程从没真正跑过**。
+
+### 仍然未解决
+
+`cmd_runs_python_through_the_substitution` 依旧失败，但失败点已经收窄：
+
+- **`cmd /c <child>` 无延迟 spawn 早于注入完成**（§5.3 的限制）。加
+  `ping -n N 127.0.0.1` 前缀把窗口拉开，hook 立刻命中、python 也被正确注入
+  （`injected: true, sentinel: true`）。
+- **目标重定向自己的 stdout 会让管道句柄失效**：`cmd /c "ping > nul & python"`
+  里 `> nul` 关掉宿主给的句柄并用 `CreateFile("nul")` **复用同一数值**。把失效
+  句柄传给后代 → `GetStdHandle` 返回它（PEB 数值仍对）、`GetFileType` 给
+  `FILE_TYPE_UNKNOWN` → CRT 不给 fd 1 → `sys.stdout is None`。
+  这解释了 AGENTS 坑 7 的实测现象。
+
+### 下一步
+
+1. 目标重定向 stdout 时，payload 需要能重新拿到管道（管道名在环境变量
+   `WBWPTY_OUT` 里，见 §3 契约），而不是复用已失效的数值句柄。
+2. `cmd /c` 的无延迟 spawn 要真正关掉，只能走 `DEBUG_PROCESS` 那条结构性路线
+   （在子进程执行任何指令前先拿到 `DEBUG_PROCESS_CREATE`），代价见 AGENTS 规则 31。
+
+本轮的坑与调试器用法见 AGENTS.md §11。
+
+---
+
 ## 8. License
 
 MIT

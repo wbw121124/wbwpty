@@ -239,3 +239,90 @@ cargo test --release                  # 相关测试必须全绿
 - `wbw121124/wbwtty` 分支 `feature/pty-win10-early`：含渲染模块。
   恢复工作时优先评估复用它的渲染/虚拟屏层，而不是自己重写 VT 渲染。
   <https://github.com/wbw121124/wbwtty/tree/feature/pty-win10-early>
+
+## 11. 2026-10-16 新增的坑（追 `cmd /c` 输出丢失，一整轮弯路）
+
+这一轮为了查"后代输出不到管道"，先后否掉了**四个**错误假设。四个都"看起来"像证据，
+因为每一次都能测到 `hook_stats == 0`。记住：**0 调用有五种完全不同的原因。**
+
+1. **计数器在目标死后才读，永远是 `None`。**
+   `payload_hook_stats()` 原本在会话结束后才读目标内存，短命目标早就没了。
+   所以 `--verbose` 从来没打印过一次 hook 计数 —— 已装的 hook 和死掉的 hook
+   从外面看一模一样。改为**目标存活期内采样 + 缓存**（计数单调，取高水位）。
+   判据必须是采样，不是事后读。
+
+2. **诊断的观测窗口必须等目标结束，不能写死秒数。**
+   固定等 3 秒、而目标要 4.5 秒才跑完 —— 测出来 `hook=0`，对着一个完全正常的
+   替换函数。诊断脚本要 `wait_for(target)`，不是 `sleep(3)`。
+
+3. **`ChildSpec` 会给含空格的参数加引号，`cmd /c` 只剥外层那对。**
+   结果内层引号以 `\"` 字面量到达命令解释器，`python -c` 的代码被吃掉，
+   报 `NameError`/`AttributeError`，**子进程从没真正跑过**。
+   含空格的路径在 `cmd /c` 场景用 8.3 短路径（`PROGRA~1`）或脚本文件。
+
+4. **IAT 槽在 loader 解析前存的是 `IMAGE_IMPORT_BY_NAME` 指针。**
+   它落在映像自身范围内（`[base, base+SizeOfImage)`）；解析后才是别的模块里的
+   API 地址。原代码只查 `!= 0`，把 hint/name 指针当成真实地址发布出去、
+   还把槽改写了 —— 装得干净、指针一度可见，随后 loader 又填回真的
+   `CreateProcessW`。**改槽之前必须确认它不在映像范围内。**
+
+5. **`cmd /c` 无延迟 spawn 早于注入完成。** 这是 §5.3 的真实限制，不是 bug。
+   `cmd /k` + 输入命令能命中 hook（spawn 晚），`cmd /c <child>` 不能（spawn 早）。
+   加 `ping -n N 127.0.0.1` 前缀把窗口拉开就能复现命中 —— **用这个前缀区分
+   "替换不工作" 和 "替换还没装上"**。
+
+6. **`cmd.exe` 用 `STARTUPINFOEXW`（`cb = 0x70` + `lpAttributeList`）调 CreateProcess。**
+   - 别改 `cb`：改成 `0x68` 会直接 `ERROR_BAD_EXEFORMAT`。
+   - 别把 `STARTUPINFOW` 拷进 0x68 字节的本地结构：`lpAttributeList` 在
+     offset **0x68**（结构**内部**，不是后面），`cb=0x70` 让内核多读 8 字节栈垃圾，
+     同样 `ERROR_BAD_EXEFORMAT`。
+
+7. **目标重定向自己的 stdout，管道句柄就失效了（补充坑 23）。**
+   `cmd /c "ping > nul & python"` 里 `> nul` 会关掉宿主给的管道句柄并
+   `CreateFile("nul")` **复用同一个数值**。把这个失效句柄传给后代 →
+   `GetStdHandle` 返回它（PEB 里的数值仍对）、`GetFileType` 却给
+   `FILE_TYPE_UNKNOWN` → CRT 不给 fd 1 → `sys.stdout is None`。
+   **判据要同时看 `GetStdHandle` 和 `GetFileType`**：只看前者会得出"句柄没问题"
+   的错误结论。
+
+8. **别强制 `bInheritHandles = TRUE`。** 试过，与 attribute list 冲突，
+   `CreateProcess` 直接 `ERROR_BAD_EXEFORMAT`，比原样传递更糟。
+   原样传递是对的（坑 13 那行的注释"handle inheritance on"是误读，实测 cmd 本来就传对了）。
+
+9. **"第一代正常"不能推广到第二代。**
+   宿主直接创建 python：`DETACHED_PROCESS + STARTF_USESTDHANDLES` 下三个 fd
+   全是管道、`sys.stdout` 正常。同样的 flags 走 substitute 就坏 —— 所以问题
+   一定在 substitute 传给内核的东西上，不在 flags，也不在 UCRT。
+
+10. **别把子串当成导入名。** `CreateProcessA` 是 `CreateProcessAsUserW` 的**前缀子串**，
+    扫二进制找字符串会"找到"一个根本不存在的导入。（`cmd.exe` 实际只导入
+    `CreateProcessW` 和 `CreateProcessAsUserW`，且确实通过**自己的 IAT** 调用
+    `CreateProcessW` —— 用 x64dbg 在 `CreateProcessW` 下断点、`rdx` 读到
+    `ping -n 5 127.0.0.1` 实测确认。）
+
+11. **重建后 `.text` 里的 RVA 会变。** 硬编码 `create_process_w` 的 RVA 去反推
+    payload 基址，重新编译后读到的是**别的段**，得到一个 kernel32 地址这种
+    "看起来合理"的垃圾。诊断脚本要从 DLL 导出表现算，别写死。
+
+12. **小端读数要重组字节。** 把 `D024008001000000` 当一个十六进制数读等于
+    `0xD024008001000000`；真值是 `0x1800024D0`。在错误地址下断点，
+    脚本会理直气壮地报 "MISS"。
+
+13. **自己的改动会制造出你要找的 bug。** 本轮 `fd 1 = INVALID_HANDLE_VALUE`
+    一度被我当成根因，实际是前一步强制 `bInheritHandles=TRUE` 引入的；
+    `git stash` 回退后同一条命令完全正常。**推翻一个假设前，先回退自己的改动。**
+
+14. **本仓库缺 `wbwpty-spawn-probe` / `--gate`。** 旧文档引用过它们，当前树里
+    不存在；写"按规则 27 用 gate 夹具"之前先确认它还在。
+
+### 调试器怎么用（本轮实际有效的方式）
+
+- `debug_init` 会把进程跑到结束，**停不下来**；真正可用的是
+  `debug_attach_pid` + 先启动一个长命令留窗口。
+- 系统断点（`rip` 落在 ntdll）时 cmd.exe 的模块已加载、用户代码还没跑 ——
+  此时下断点最合适。
+- `attach` 会话活不过一次慢往返，**附加+下断点+运行必须写在同一个脚本里**。
+- 用 `cmd /c "ping -n 20 127.0.0.1 > nul & <被测命令>"` 拖出 ~20 秒窗口。
+- x64dbg MCP 只在重启 opencode 后成为原生工具；配置在
+  `~/.config/opencode/opencode.jsonc`（`type: "remote"`，`url: .../mcp`），
+  没重启前可用 HTTP 桥接脚本直连。
