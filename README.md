@@ -209,12 +209,30 @@ IAT 替换只改**一个进程**的导入表：会话目标。这足够让**目�
 覆盖记录是**边做边发**的，不是结束时才给：`Session::coverage()` 能区分
 "在它来得及 spawn 之前就被接管"和"接管了但已经晚了"——这两者在输出上完全一样。
 
-#### 还没关掉的竞态
+#### 为什么"挂起子进程直到被接管"这条路走不通（2026-10-16 实测）
 
-supervisor 是**轮询**的：后代是被发现之后才存在的，所以一个在起来后几毫秒内就 spawn 的后代
-可以跑赢这一轮。这个竞态没有被藏起来——它就是 `Coverage` 记录的东西。
-要关掉它，需要让子进程以 `CREATE_SUSPENDED` 创建并交给宿主，等宿主覆盖完再 resume，
-这是一个独立的改动，而且自带失败模式（宿主一旦挂掉，子进程会永远挂着）。
+最直接的修法当然是：让子进程以 `CREATE_SUSPENDED` 出生，宿主接管完再 resume。
+**这条路与本项目的注入器根本不兼容**，有两个各自独立的阻塞点：
+
+1. **挂起进程的 loader 从没跑过**。注入要先 `stable_modules()` 等
+   `PEB->Ldr` 可遍历，而 `CREATE_SUSPENDED` 出来的进程里 `PEB->Ldr` 是 NULL
+   （AGENTS 坑 7）。等多久都不会就绪。
+   （`RemoteModules::discover` 的 `HostShared` 回退本来是为这种情况准备的，
+   能拿到模块地址——但它只能解决第 1 条。）
+2. **调 `DllMain` 的那个远程线程在挂起进程里不运行**。`inject_bytes` 最后一步是
+   `CreateRemoteThread(base + DllMain)` 然后 `WaitForSingleObject(INFINITE)`；
+   进程是挂起的，这个线程永远不返回，`run_thread` 于是**永久阻塞**。
+   实测表现：监督线程挂死 → `Drop for Session` 里 join 它 → **整个测试挂住**
+   （实测一次 `cargo test` 超过 300 秒未结束，并留下孤儿 `cmd.exe`）。
+
+所以唯一可行的变体是**把注入拆成两段**：挂起期间只做"映射 + 解析导入 + 改 IAT"
+（全是数据写入，对挂起进程合法），**resume 之后再补那一次 `CreateRemoteThread`**。
+这需要把 `inject_bytes` 拆成 map / call-entry 两步，并让监督线程知道
+"映像已就位、入口待调用"。这是一个独立的、有分量的改动，不该顺手做。
+
+在那之前，§1.7 末尾那个竞态**是已知的、未关闭的**：supervisor 是轮询的，
+一个在自己起来几毫秒内就 spawn 的后代可以跑赢这一轮。
+`Coverage` 记录的就是这件事，不藏。
 
 ### 1.8 故意制造 console host 的测试一律 `#[ignore]`
 
@@ -445,6 +463,43 @@ README 旧版 5.3 的猜测（std handle 为 NULL / conhost 之类）全部排�
 
 恢复工作时**先评估能否直接复用它的渲染/虚拟屏层**，避免重复实现 VT 渲染、
 光标管理、ANSI 解析等与注入无关的部分。
+
+### 5.6 复用评估结论（2026-10-16 实测）
+
+**结论：`vt-parser` + `term-input` 值得 vendor 进来，其余不要。**
+
+| wbwtty 的 crate | 决定 | 理由 |
+| --- | --- | --- |
+| `crates/vt-parser` | **vendor 复用** | 纯 Rust、**零平台依赖**、自带 19 条单测（覆盖 UTF-8 跨 `feed` 切分、宽字符、备用屏、滚动区、SGR truecolor、DA/DSR 应答） |
+| `crates/term-input` | **vendor 复用** | 键→VT 编码，正好配 `vt-parser` 的模式查询 |
+| `crates/term-render-gtk` | **不要** | GTK/pango，与本项目的宿主形态无关 |
+| `crates/pty-win10-early` | **不要** | 含 `csrc/conhook.c`，需要 `cc` 构建——AGENTS 规则 2 明令禁止 |
+
+`vt-parser` 的公开 API 与本项目需要的几乎一一对应：
+
+```rust
+Terminal::new(cols, rows) / with_options(scrollback_limit)
+feed(&[u8])            // 增量，UTF-8 与序列状态跨调用保持
+get_screen() -> ScreenView   // 单元格网格 + damage 行 + 光标
+take_replies() -> Vec<u8>    // DA/DSR 应答 → 写回子进程 stdin
+resize(cols, rows)     // 窗口尺寸变化
+application_cursor_keys() / bracketed_paste() / mouse_mode() / is_alt_screen()
+```
+
+**这直接决定了 console API shim（Stage 8 剩下的部分）该怎么写**：
+`WriteConsoleA/W` 把 UTF-16 转 UTF-8 喂进 `Terminal`、顺带写输出管道；
+`GetConsoleScreenBufferInfo` 读它的光标与几何；`GetConsoleMode` 读模式位；
+DA/DSR 的应答走 `take_replies()` 灌进 `-in` 管道。自己重写这一套是几百行
+且必然漏边界情况，而这份是测过的。
+
+**两个必须先解决的前置条件：**
+
+1. **wbwtty 没有任何 license 声明**——仓库根目录无 `LICENSE`，workspace 与各 crate
+   都没有 `license` 字段，且全部 `publish = false`。两边仓库都是 `wbw121124` 的，
+   实际归属清楚，但**把代码抄进 MIT 的 wbwpty 之前应先补一份明确的 license 声明**，
+   否则 "MIT" 这个说法没有依据。
+2. 全部 crate 都是 `path` 依赖 + `publish = false`，所以只能**vendor 源码目录**，
+   不能按 git 依赖引入。
 
 ---
 

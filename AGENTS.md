@@ -202,6 +202,19 @@ cargo test --release                  # 相关测试必须全绿
 30. **supervisor 的覆盖记录要边做边发**（`Session::coverage()`），不是结束时才汇总。
     "在它来得及 spawn 之前被接管"和"接管了但已经晚了"在输出上完全一样，
     只有时间戳能区分。
+31. **挂起的进程注不进去**（2026-10-16 实测，两个独立的阻塞点）：
+    - `CREATE_SUSPENDED` 出来的进程 `PEB->Ldr` 是 NULL，`stable_modules()` 永远等不到；
+    - `inject_bytes` 末尾 `CreateRemoteThread(DllMain)` + `WaitForSingleObject(INFINITE)`，
+      进程挂起时那个远程线程**根本不运行**，于是 `run_thread` 永久阻塞。
+      实测后果：监督线程挂死 → `Drop for Session` join 它 → **测试整体挂住**
+      （一次 `cargo test` 超过 300 秒不结束，留下孤儿 `cmd.exe`）。
+    → "让子进程挂起直到被接管"这条路对本项目的注入器是**死路**，别再试。
+    唯一可行的变体是把注入拆成"挂起期间只映射 + 改 IAT（纯数据写入），
+    resume 之后再补 `CreateRemoteThread` 调入口"，见 README §1.7。
+32. **测试里断言"目标还活着"会被 stdin EOF 毁掉**：input pump 把宿主 stdin 的 EOF
+    变成管道 EOF，交互式 `cmd.exe` 立刻退出。要跑一个必须活着的目标，
+    用 `SessionConfig { pump_input: false, .. }`——它不会去读宿主 stdin，
+    也就不会替测试决定目标什么时候死。
 
 ## 10. 外部可复用模块（评估过再用）
 
