@@ -219,6 +219,18 @@ pub struct Session {
     hook_stats_rva: Option<u32>,
     /// RVA of the payload's exported WBWPTY_HOOK_FLAGS word.
     hook_flags_rva: Option<u32>,
+    /// Last successful read of the hook counters, sampled while the target lived.
+    ///
+    /// The counters live in the *target's* address space, so they are only
+    /// readable while it is alive. Reporting happens after the session ends, and
+    /// for a short-lived `cmd /c <child>` that is always too late: the process
+    /// handle is still valid but the pages are gone, the read fails, and the
+    /// counters come back `None`. Sampling during the session is what makes them
+    /// answerable at all.
+    hook_stats_seen: Arc<std::sync::Mutex<Option<(u32, u32)>>>,
+    /// Cached [`Self::hook_stats_seen`], for the creation flags instead of the
+    /// counters.
+    hook_flags_seen: Arc<std::sync::Mutex<Option<(u32, u32)>>>,
     /// Console sentinel state after the post-injection re-assert.
     console_patch: Result<crate::manual_map::ConsolePatch, String>,
     /// What the `CreateProcessW` substitution did, if it happened.
@@ -441,8 +453,11 @@ impl Session {
             supervisor,
             screen,
             console_state_rva,
+            hook_stats_seen: Arc::new(std::sync::Mutex::new(None)),
+            hook_flags_seen: Arc::new(std::sync::Mutex::new(None)),
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
+        session.start_hook_sampler();
         if pump_input {
             session.start_input_pump();
         }
@@ -642,9 +657,60 @@ impl Session {
     /// reaches process creation some other way - `CreateProcessInternalW`, a
     /// syscall, a helper - leaves this at zero while the hook report still
     /// claims success.
+    /// Reads the hook counters for as long as the target is alive.
+    ///
+    /// Both counters are monotonic, so the sampler keeps the largest value it
+    /// saw rather than the last: a sample that lands between a read and the
+    /// target's exit must not be able to lower the high-water mark.
+    fn start_hook_sampler(&self) {
+        if self.report.is_none() || self.hook_stats_rva.is_none() {
+            return;
+        }
+        let shutting_down = Arc::clone(&self.shutting_down);
+        let handle = SendHandle(self.child.process_handle());
+        let stats_rva = self.hook_stats_rva;
+        let flags_rva = self.hook_flags_rva;
+        let base = self.report.as_ref().map(|r| r.image_base).unwrap_or(0);
+        let stats_seen = Arc::clone(&self.hook_stats_seen);
+        let flags_seen = Arc::clone(&self.hook_flags_seen);
+
+        std::thread::spawn(move || {
+            while !shutting_down.load(Ordering::Relaxed) {
+                let proc = handle.process();
+                if let Some(raw) = stats_rva.and_then(|rva| read_u32(&proc, base + rva as u64)) {
+                    let sample = ((raw >> 8) & 0xffff, raw & 0xff);
+                    if let Ok(mut seen) = stats_seen.lock() {
+                        let current = seen.unwrap_or((0, 0));
+                        *seen = Some((current.0.max(sample.0), current.1.max(sample.1)));
+                    }
+                }
+                if let Some(raw) = flags_rva.and_then(|rva| read_u64(&proc, base + rva as u64)) {
+                    let sample = (raw as u32, (raw >> 32) as u32);
+                    if let Ok(mut seen) = flags_seen.lock() {
+                        // The second word is a call count and keeps rising; the
+                        // first is the flags of the most recent substitution, so
+                        // it is the last sample that matters, not the largest.
+                        let count = seen.map(|s| s.1).unwrap_or(0).max(sample.1);
+                        *seen = Some((sample.0, count));
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        });
+    }
+
     pub fn payload_hook_stats(&self) -> Option<(u32, u32)> {
-        let raw = self.payload_word(self.hook_stats_rva)?;
-        Some(((raw >> 8) & 0xffff, raw & 0xff))
+        if let Some(raw) = self
+            .hook_stats_rva
+            .and_then(|rva| self.read_payload_u32(rva))
+        {
+            let live = ((raw >> 8) & 0xffff, raw & 0xff);
+            if let Ok(mut seen) = self.hook_stats_seen.lock() {
+                let current = seen.unwrap_or((0, 0));
+                *seen = Some((current.0.max(live.0), current.1.max(live.1)));
+            }
+        }
+        self.hook_stats_seen.lock().ok().and_then(|s| *s)
     }
 
     /// The `dwCreationFlags` the substitution handed to `CreateProcessW`, and
@@ -655,27 +721,37 @@ impl Session {
     /// asks for a console it should not have, a hook that stops forcing anything
     /// - the only evidence is here.
     pub fn payload_hook_flags(&self) -> Option<(u32, u32)> {
-        use crate::manual_map::remote::RemoteProcess;
-        let report = self.report.as_ref()?;
-        let proc = RemoteProcess::new(self.child.process_handle());
-        let bytes = proc
-            .read_bytes(report.image_base + self.hook_flags_rva? as u64, 8)
-            .ok()?;
-        let raw: [u8; 8] = bytes.try_into().ok()?;
-        Some((
-            u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
-            u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
-        ))
+        if let Some(raw) = self
+            .hook_flags_rva
+            .and_then(|rva| self.read_payload_u64(rva))
+        {
+            let live = (raw as u32, (raw >> 32) as u32);
+            if let Ok(mut seen) = self.hook_flags_seen.lock() {
+                let count = seen.map(|s| s.1).unwrap_or(0).max(live.1);
+                *seen = Some((live.0, count));
+            }
+        }
+        self.hook_flags_seen.lock().ok().and_then(|s| *s)
+    }
+
+    fn read_payload_u32(&self, rva: u32) -> Option<u32> {
+        let base = self.report.as_ref()?.image_base;
+        read_u32(
+            &crate::manual_map::remote::RemoteProcess::new(self.child.process_handle()),
+            base + rva as u64,
+        )
+    }
+
+    fn read_payload_u64(&self, rva: u32) -> Option<u64> {
+        let base = self.report.as_ref()?.image_base;
+        read_u64(
+            &crate::manual_map::remote::RemoteProcess::new(self.child.process_handle()),
+            base + rva as u64,
+        )
     }
 
     fn payload_word(&self, rva: Option<u32>) -> Option<u32> {
-        use crate::manual_map::remote::RemoteProcess;
-        let report = self.report.as_ref()?;
-        let proc = RemoteProcess::new(self.child.process_handle());
-        let bytes = proc
-            .read_bytes(report.image_base + rva? as u64, 4)
-            .ok()?;
-        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+        rva.and_then(|rva| self.read_payload_u32(rva))
     }
 
     pub fn pid(&self) -> u32 {
@@ -740,24 +816,32 @@ impl Session {
                 self.child.pid, detail.ucrt_resolved, detail.streams_set, detail.streams_refused
             );
         }
-        match self.hook() {
-            Some(hook) => eprintln!(
-                "wbwpty: pid {} hooked CreateProcessW: {} slot(s) at {:#x} -> {:#x} (original {:#x}){}",
-                self.child.pid,
-                hook.slot_count(),
-                hook.slots[0].address(0),
-                hook.substitute,
-                hook.original,
-                if hook.needed_protection_change {
-                    ", image pages made writable"
-                } else {
-                    ""
-                }
-            ),
-            None if self.report.is_some() => {
-                eprintln!("wbwpty: pid {} target does not import CreateProcessW", self.child.pid)
+        if let Some(hook) = self.hook() {
+            // One line per API: which entry points are covered is now a set, not
+            // a single address, and knowing "CreateProcessW" alone would be a
+            // claim this project has already had falsified by cmd.exe.
+            for i in &hook.intercepts {
+                eprintln!(
+                    "wbwpty: pid {} hooked {}: {} slot(s) at {:#x} -> {:#x} (original {:#x}){}",
+                    self.child.pid,
+                    i.api,
+                    i.slots.len(),
+                    i.slots[0].address(0),
+                    i.substitute,
+                    i.original,
+                    if i.needed_protection_change {
+                        ", image pages made writable"
+                    } else {
+                        ""
+                    }
+                );
             }
-            None => {}
+        }
+        if self.hook().is_none() && self.report.is_some() {
+            eprintln!(
+                "wbwpty: pid {} target imports no process-creation entry point",
+                self.child.pid
+            );
         }
         if let Some((calls, failures)) = self.payload_hook_stats() {
             eprintln!(
@@ -1124,6 +1208,46 @@ fn nonce() -> u64 {
     nanos
         ^ (std::process::id() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
         ^ seq.wrapping_mul(0x0000_0100_0000_01b3)
+}
+
+/// A process handle that may cross a thread boundary.
+///
+/// `HANDLE` is a `*mut c_void`, which is deliberately not `Send`. But a Win32
+/// handle is a reference to a kernel object rather than to memory in this
+/// process: it stays valid from any thread and until someone closes it. The
+/// [`Session`] that owns the handle outlives the sampler, which stops on
+/// `shutting_down`, so there is no window where the sampler outlives the handle.
+struct SendHandle(*mut std::ffi::c_void);
+
+// SAFETY: see the type's own comment - the handle is a kernel object reference,
+// valid from any thread, and kept alive by the owning `Session`.
+unsafe impl Send for SendHandle {}
+
+impl SendHandle {
+    /// Reborrows the handle as a [`RemoteProcess`].
+    ///
+    /// Going through a method rather than reading `.0` at the call site is what
+    /// keeps the closure capture whole: edition 2021 captures the individual
+    /// field when it can, which would put the raw `*mut c_void` back into a
+    /// `'static` closure and lose the [`Send`] wrapper.
+    fn process(&self) -> crate::manual_map::remote::RemoteProcess {
+        crate::manual_map::remote::RemoteProcess::new(self.0)
+    }
+}
+
+/// Reads a little-endian `u32` out of a remote process, `None` on any failure.
+///
+/// The target's pages can disappear between one call and the next - it may exit
+/// mid-session - so every failure is simply "not right now" and never fatal.
+fn read_u32(proc: &crate::manual_map::remote::RemoteProcess, addr: u64) -> Option<u32> {
+    let bytes = proc.read_bytes(addr, 4).ok()?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+/// [`read_u32`] for a 64-bit word, used for the `[u32; 2]` flag pair.
+fn read_u64(proc: &crate::manual_map::remote::RemoteProcess, addr: u64) -> Option<u64> {
+    let bytes = proc.read_bytes(addr, 8).ok()?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
 #[cfg(test)]

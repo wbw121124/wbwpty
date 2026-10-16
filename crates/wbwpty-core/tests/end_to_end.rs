@@ -51,11 +51,45 @@ const EXIT_WAIT: Duration = Duration::from_secs(10);
 const BIG_WRITE: usize = 1024 * 1024;
 
 /// Finds `python.exe`, or `None` so a test can skip with a reason.
+/// Finds an interpreter this project can actually drive.
+///
+/// `PATH` is searched for real `python.exe` on purpose. The obvious fallback,
+/// `C:\Windows\py.exe`, is a 32-bit launcher: it cannot be covered by an x64
+/// payload (README §7), so it grabs a console of its own and everything it
+/// prints goes there instead of down the pipe. Selecting it made the
+/// `cmd -> python` test measure our 32-bit limitation rather than the thing it
+/// is named after, so non-x64 candidates are rejected outright.
 fn python() -> Option<PathBuf> {
-    ["python.exe", r"C:\Windows\py.exe"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|c| c.exists())
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join("python.exe"))
+            .find(|candidate| candidate.is_file() && is_x64_image(candidate))
+    })
+}
+
+/// True when the file is a PE32+ image, by its `IMAGE_FILE_MACHINE` field.
+fn is_x64_image(path: &std::path::Path) -> bool {
+    /// `IMAGE_FILE_MACHINE_AMD64`
+    const AMD64: u16 = 0x8664;
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Some(magic) = bytes.get(..2) else {
+        return false;
+    };
+    if magic != *b"MZ" {
+        return false;
+    }
+    let Some(pe_at) = bytes
+        .get(0x3c..0x40)
+        .map(|s| u32::from_le_bytes(s.try_into().unwrap()) as usize)
+    else {
+        return false;
+    };
+    matches!(
+        bytes.get(pe_at + 4..pe_at + 6),
+        Some(s) if u16::from_le_bytes(s.try_into().unwrap()) == AMD64
+    )
 }
 
 /// Skips with a reason rather than failing on a machine without python.
@@ -353,6 +387,102 @@ fn cmd_runs_python_through_the_substitution() {
         "a console host appeared for a cmd -> python chain, which is the one \
          thing this project exists to prevent"
     );
+}
+
+/// TEMPORARY diagnostic for the cmd -> python chain.
+#[test]
+#[ignore = "diagnostic"]
+fn diag_cmd_python_chain() {
+    let Some(python) = python() else {
+        eprintln!("skip: no python");
+        return;
+    };
+    let python = python.display().to_string();
+    // The plain form: `cmd /c <child>` spawns immediately, which is the case
+    // that has to work. No `ping` prefix - that only pads the clock.
+    let spec = ChildSpec::new("cmd.exe").args([
+        "/c".to_string(),
+        python,
+        "-c".to_string(),
+        "print('CHAINED-OK')".to_string(),
+    ]);
+    let config = SessionConfig { shim: true, inject: true, ..Default::default() };
+    let session = Session::start(&spec, config).unwrap();
+
+    // A timeline, because a single read after the session says nothing about
+    // *when* the counters stood still.
+    let t0 = Instant::now();
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        eprintln!(
+            "T+{:>5}ms  hook={:?} flags={:?} coverage={}",
+            t0.elapsed().as_millis(),
+            session.payload_hook_stats(),
+            session.payload_hook_flags(),
+            session.coverage().len(),
+        );
+    }
+
+    let _ = session.wait_for(std::time::Duration::from_millis(3000));
+    eprintln!("DIAG gen1 report      = {:?}", session.report().is_some());
+    eprintln!(
+        "DIAG gen1 hook        = {:?}",
+        session
+            .hook()
+            .map(|h| (h.slot_count(), h.apis(), h.primary().map(|i| i.substitute)))
+    );
+    eprintln!("DIAG gen1 hook_error  = {:?}", session.hook_error());
+    eprintln!("DIAG gen1 hook_stats  = {:?}", session.payload_hook_stats());
+    eprintln!("DIAG gen1 hook_flags  = {:?}", session.payload_hook_flags());
+    eprintln!("DIAG coverage         = {:?}", session.coverage().len());
+    for c in session.coverage() {
+        eprintln!("   {:?}", c);
+    }
+    session.shutdown();
+}
+
+/// Decides between "the hook was clobbered" and "cmd never uses that slot".
+///
+/// `cmd.exe /c <child>` is too short-lived to sample - it is gone before the
+/// counters can be read. An interactive `cmd /k` waits for input, so the
+/// counters can be read while it is very much alive, and the loader timing
+/// question gets asked of a process that finished starting long ago.
+#[test]
+#[ignore = "touches a live process; run by name"]
+fn diag_interactive_cmd_hook_fires() {
+    let config = SessionConfig {
+        shim: true,
+        inject: true,
+        // Rule 32: an interactive cmd exits the moment it sees stdin EOF, and
+        // the pump would deliver it at a moment this test does not control.
+        pump_input: false,
+        ..Default::default()
+    };
+    let session = Session::start(&ChildSpec::new("cmd.exe").arg("/k"), config).expect("session");
+
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    eprintln!(
+        "DIAG live hook        = {:?}",
+        session.hook().map(|h| h.slot_count())
+    );
+    eprintln!("DIAG live hook_error  = {:?}", session.hook_error());
+    eprintln!("DIAG live pre-spawn   = {:?}", session.payload_hook_stats());
+
+    // A nested `cmd /c ver` is a genuine CreateProcessW, unlike echo/cd/ver,
+    // which cmd answers from its own built-ins.
+    session
+        .pipes()
+        .with(|p| p.input().write_all(b"cmd /c ver\r\n").is_ok())
+        .expect("input pipe");
+
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    eprintln!("DIAG live post-spawn  = {:?}", session.payload_hook_stats());
+    eprintln!("DIAG live flags       = {:?}", session.payload_hook_flags());
+    eprintln!("DIAG live coverage    = {:?}", session.coverage().len());
+    for c in session.coverage() {
+        eprintln!("   {:?}", c);
+    }
+    session.shutdown();
 }
 
 /// Takes down whatever the session left, on every path out.
