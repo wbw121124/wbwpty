@@ -4,6 +4,8 @@ members = [
     "crates/wbwpty-core",
     "crates/wbwpty",
     "crates/wbwpty-redirect",
+    "crates/vt-parser",
+    "crates/term-input",
 ]
 
 [workspace.package]

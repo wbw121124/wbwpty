@@ -1,0 +1,9 @@
+[package]
+name = "vt-parser"
+version = "0.1.0"
+edition.workspace = true
+description = "VT sequence parser and terminal screen state (zero platform dependencies)"
+publish = false
+
+# Vendored from wbwtty. See README.md in this directory.
+[dependencies]

@@ -302,19 +302,23 @@ D:\wbwpty
 │   │   └── tests/              # 集成测试（见 §1.8 哪些不能默认跑）
 │   ├── wbwpty/                 # bin：CLI
 │   │   └── src/main.rs
-│   └── wbwpty-redirect/        # cdylib：注入 DLL（no_std）
-│       └── src/
-│           ├── lib.rs          # DllMain 入口 + worker 调度 + 发布的状态字
-│           ├── ffi.rs          # 手写 extern "system" 声明
-│           ├── config.rs       # 环境变量契约解析
-│           ├── log.rs          # OutputDebugStringA + 可选文件日志
-│           ├── stdio.rs        # SetStdHandle + 继承标记
-│           ├── peb.rs          # NtCurrentTeb→PEB 补丁 + 偏移自检
-│           ├── crt.rs          # setvbuf(_IONBF)（见 §1.6）
-│           └── hook.rs         # create_process_w 替身（§1.2/§1.7）
+│   ├── wbwpty-redirect/        # cdylib：注入 DLL（no_std）
+│   │   └── src/
+│   │       ├── lib.rs          # DllMain 入口 + worker 调度 + 发布的状态字
+│   │       ├── ffi.rs          # 手写 extern "system" 声明
+│   │       ├── config.rs       # 环境变量契约解析
+│   │       ├── log.rs          # OutputDebugStringA + 可选文件日志
+│   │       ├── stdio.rs        # SetStdHandle + 继承标记
+│   │       ├── peb.rs          # NtCurrentTeb→PEB 补丁 + 偏移自检
+│   │       ├── crt.rs          # setvbuf(_IONBF)（见 §1.6）
+│   │       └── hook.rs         # create_process_w 替身（§1.2/§1.7）
+│   ├── vt-parser/              # vendor 自 wbwtty：VT 解析 + 虚拟屏（零平台依赖）
+│   └── term-input/             # vendor 自 wbwtty：按键/鼠标 → VT 字节
 ```
 
-> 尚未实现：`console_api.rs`（控制台 API 替身，见 §1.5）与 `keys.rs`（按键事件 / VT 翻译）。
+> 尚未实现：`console_api.rs`（控制台 API 替身，见 §1.5）——设计已经由 §5.6 的
+> 复用结论给出（建在 `vt-parser` 的 `feed` / `get_screen` / `take_replies` 上）。
+> `keys.rs` 的职责已由 vendor 进来的 `term-input` 覆盖。
 > `--shim` 目前是空承诺，见 §5.1。
 
 ---
@@ -357,8 +361,9 @@ cargo test --release
 
 ### 5.1 已完成部分的实际状态（截至本次提交）
 
-- `cargo build --release` 绿；`cargo test --release` = **46 passed / 0 failed / 9 ignored**
-  （ignored 的全是**故意制造 console host** 的对照组，默认不跑，见 §1.8）。
+- `cargo build --release` 绿；`cargo test --release` = **134 passed / 0 failed / 9 ignored**
+  （其中 **88 条来自 vendor 进来的 `vt-parser` / `term-input`**，它们自带的测试在本机全绿；
+  9 条 ignored 的全是**故意制造 console host** 的对照组，默认不跑，见 §1.8）。
 - `wbwpty.exe --dump-conhost -- cmd.exe /c echo hello` 实测：**hello 原样输出，exit=0，conhost.exe 数量不变**。
 - **三代进程树实测无 console host**（`probe → probe → ping`）：第三代的 `DETACHED_PROCESS`
   是从**后代自己 payload 里发布的 `WBWPTY_HOOK_FLAGS`** 读出来的，不是"碰巧没弹窗"。
