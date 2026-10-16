@@ -309,8 +309,8 @@ fn observe(inject: bool, patch_descendants: bool) -> Observation {
             .iter()
             .map(|v| format!("{v:#018x}"))
             .collect::<Vec<_>>(),
-        session.hook().map(|h| h.substitute),
-        session.hook().map(|h| h.original),
+        session.hook().and_then(|h| h.primary()).map(|i| i.substitute),
+        session.hook().and_then(|h| h.primary()).map(|i| i.original),
         stats_at_marker,
         session.payload_hook_stats(),
         session.payload_status(),

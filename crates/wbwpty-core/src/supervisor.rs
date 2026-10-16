@@ -115,12 +115,19 @@ pub struct SupervisorConfig {
     /// are identical on both sides of a `CreateProcess`.
     pub std_handles: [u64; 3],
     /// How often to look for new processes.
+    ///
+    /// This is the other half of the race in README §1.7: even with injection
+    /// down to single-digit milliseconds, a descendant that is discovered late
+    /// has already had a chance to spawn an uncovered child of its own. Polling
+    /// at 15 ms put that window at tens of milliseconds.
     pub poll: Duration,
     /// How long to wait for one descendant's loader before giving up on this
     /// attempt. Short on purpose - see [`Self::max_attempts`].
     pub loader_wait: Duration,
-    /// How far apart two module snapshots must agree to count as settled.
-    pub stability: Duration,
+    /// How often the injector re-checks a descendant while waiting for it to
+    /// finish loading. Not a settle interval: readiness is decided by the real
+    /// precondition (every imported module mapped), so this only paces retries.
+    pub inject_poll: Duration,
     /// How many polls a descendant gets before it is written off.
     pub max_attempts: u32,
     /// Report per-descendant outcomes on stderr.
@@ -140,9 +147,9 @@ impl SupervisorConfig {
             payload_path,
             payload_image: Arc::new(Vec::new()),
             std_handles,
-            poll: Duration::from_millis(15),
+            poll: Duration::from_millis(3),
             loader_wait: Duration::from_millis(150),
-            stability: Duration::from_millis(30),
+            inject_poll: Duration::from_millis(1),
             max_attempts: 25,
             verbose: false,
         }
@@ -372,13 +379,13 @@ fn attempt(config: &SupervisorConfig, pid: u32, depth: usize, attempt_no: u32) -
         &config.payload_image,
         "DllMain",
         config.loader_wait,
-        config.stability,
+        config.inject_poll,
     ) {
         Ok(report) => report,
         // Either the process is gone - in which case the next poll will not find
-        // it and the record is moot - or its loader has not settled yet. Both are
-        // the caller's problem to count, and neither is worth distinguishing
-        // here: the loop gives up either way.
+        // it and the record is moot - or its loader has not mapped what the
+        // payload imports yet. Both are the caller's problem to count, and
+        // neither is worth distinguishing here: the loop gives up either way.
         Err(err) => return Outcome::Retry(format!("attempt {attempt_no}: {err:#}")),
     };
 

@@ -32,12 +32,12 @@ use anyhow::{bail, Context, Result};
 use crate::child::Child;
 
 pub use console::{install_console_hook, ConsoleApi, ConsoleHookReport, CONSOLE_APIS};
-pub use hook::{install_create_process_hook, HookReport};
+pub use hook::{install_create_process_hook, HookReport, Intercept};
 pub use iat::ImportSlot;
 pub use pe::PeImage;
 pub use remote::{
-    ConsolePatch, ConsoleState, ModuleSource, RemoteModule, RemoteModules, RemoteProcess,
-    CONSOLE_HANDLE_SENTINEL,
+    ConsolePatch, ConsoleState, ModuleNotMapped, ModuleSource, RemoteModule, RemoteModules,
+    RemoteProcess, CONSOLE_HANDLE_SENTINEL,
 };
 
 /// What the injector did, for logging and for tests.
@@ -80,8 +80,15 @@ pub fn inject_dll(child: &Child, dll: &Path, entry_symbol: &str) -> Result<Injec
 /// retries on the next poll instead.
 const DEFAULT_LOADER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How far apart two module snapshots must agree to count as settled.
-const STABILITY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+/// How often the injector re-checks the target while waiting for its loader.
+///
+/// Deliberately small. Readiness is now driven by the real precondition - every
+/// module the payload imports is mapped - rather than by waiting for the module
+/// list to stop changing, so the loop usually exits on its first or second pass.
+/// A long interval here would reintroduce exactly the window this design
+/// removes: a target that spawns a child in its first few milliseconds gets that
+/// child a console before anyone patched `ConsoleHandle`.
+const INJECT_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// [`inject_bytes`] with the session's own loader wait.
 pub fn inject_bytes(
@@ -96,7 +103,7 @@ pub fn inject_bytes(
         image,
         entry_symbol,
         DEFAULT_LOADER_WAIT,
-        STABILITY_INTERVAL,
+        INJECT_POLL,
     )
 }
 
@@ -116,7 +123,7 @@ pub fn inject_bytes_with(
     image: &[u8],
     entry_symbol: &str,
     loader_wait: std::time::Duration,
-    stability: std::time::Duration,
+    poll: std::time::Duration,
 ) -> Result<InjectionReport> {
     let pe = PeImage::parse(image)?;
     if !pe.info.is_dll {
@@ -127,25 +134,77 @@ pub fn inject_bytes_with(
     }
     let entry_rva = resolve_entry_rva(&pe, image, entry_symbol)?;
 
-    // Wait for `LdrpInitializeProcess` to finish linking modules. That single
-    // event is the whole synchronisation problem solved: before it the target
-    // has nothing mapped to resolve imports against, and we are not allowed to
-    // hook the entry point to catch the moment (README 5.3).
+    // Synchronising with the target's loader used to be a guess: wait for the
+    // module list to stop changing, which needs a settle interval long enough
+    // to be right and therefore long enough (~100 ms) to lose against a target
+    // that spawns immediately.
+    //
+    // The actual precondition is much narrower and directly observable: every
+    // module *this* image imports has to be mapped, so that `resolve_imports`
+    // can find an address for each of them. So we wait for a cheap "there is
+    // something to resolve against" signal, then keep retrying the real work
+    // until it succeeds, re-reading the module list each time. The common case
+    // exits on the first or second pass, in single-digit milliseconds.
     let started = std::time::Instant::now();
-    let modules = proc
-        .stable_modules(loader_wait, stability)
-        .with_context(|| format!("waiting for the loader in pid {pid}"))?;
-    let loader_wait_ms = started.elapsed().as_millis() as u64;
+    let deadline = started + loader_wait;
 
-    // The settled snapshot is the one we resolve against: walking again would
-    // race the target loading more DLLs.
-    let discovered = RemoteModules::from_snapshot(modules);
+    let mut modules = proc
+        .poll_modules_ready(poll, loader_wait)
+        .with_context(|| format!("waiting for the loader in pid {pid}"))?;
+
+    // Allocated once: retrying the resolution must not leak a reservation per
+    // attempt, and the payload's preferred base is nowhere the loader maps
+    // system DLLs, so re-allocating would only risk disagreeing with what is
+    // already reserved.
     let (base, reloc_delta) = allocate_image(proc, &pe)?;
     let mut mapped = pe.map(reloc_delta)?;
+
+    let (patch_count, discovered) = loop {
+        let snapshot = RemoteModules::from_snapshot(modules);
+        match resolve_imports(proc, &snapshot, &pe, &mut mapped) {
+            Ok(count) => break (count, snapshot),
+            Err(err) => {
+                // Every failure is retryable, not just a missing module. Mid
+                // loader, a module can be *listed* but not yet readable, and the
+                // thunk walk then dereferences a half-built address instead of
+                // reporting anything honest - `ReadProcessMemory` at an address
+                // like `0x7ffee39c0000`, `ERROR_PARTIAL_COPY`. Treating only
+                // `ModuleNotMapped` as transient turned that into a hard failure
+                // where the old settle loop had simply waited it out.
+                //
+                // Retrying is safe: nothing is written to the target until
+                // resolution succeeds, and `mapped` is re-resolved from scratch
+                // on every attempt because its import slots are patched in place.
+                if std::time::Instant::now() >= deadline {
+                    return if err.downcast_ref::<ModuleNotMapped>().is_some() {
+                        Err(err).with_context(|| {
+                            format!(
+                                "pid {pid} never mapped every module the payload imports \
+                                 within {}ms",
+                                loader_wait.as_millis()
+                            )
+                        })
+                    } else {
+                        Err(err).with_context(|| {
+                            format!(
+                                "pid {pid} never became resolvable within {}ms",
+                                loader_wait.as_millis()
+                            )
+                        })
+                    };
+                }
+                std::thread::sleep(poll);
+                // Re-read: whatever was missing or unreadable is exactly what may
+                // have appeared since.
+                modules = proc.poll_modules_ready(poll, deadline - std::time::Instant::now())?;
+            }
+        }
+    };
+    let loader_wait_ms = started.elapsed().as_millis() as u64;
+
     // Imports are written straight into the mapped image, so the payload is
     // fully self-contained by the time `DllMain` is called and the in-target
     // trampoline only has to make the call.
-    let patch_count = resolve_imports(proc, &discovered, &pe, &mut mapped)?;
     proc.write_bytes(base, &mapped)?;
 
     // `DllMain(hinst, DLL_PROCESS_ATTACH, NULL)` cannot be expressed as a

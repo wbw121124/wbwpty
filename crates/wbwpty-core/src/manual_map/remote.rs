@@ -211,6 +211,12 @@ impl RemoteModules {
     }
 
     /// Resolves a module name to its base address inside the target.
+    ///
+    /// A name that is absent yields [`ModuleNotMapped`] rather than a plain
+    /// error, because "absent right now" and "will never be here" are different
+    /// situations: during `LdrpInitializeProcess` entries are linked one at a
+    /// time, so a module the payload needs can legitimately appear a
+    /// millisecond later. The injector retries on that variant.
     pub fn base_for_name(&self, proc: &RemoteProcess, name: &str) -> Result<u64> {
         if let Some(base) = self.from_peb(name) {
             return Ok(base);
@@ -218,7 +224,7 @@ impl RemoteModules {
 
         let host_base = host_module_base(name);
         if host_base == 0 {
-            bail!("module {name} is not mapped in the target and not loadable here");
+            return Err(anyhow::Error::new(ModuleNotMapped { name: name.to_owned() }));
         }
 
         // Trust but verify: the target must actually have this image at that
@@ -230,6 +236,26 @@ impl RemoteModules {
         Ok(host_base)
     }
 }
+
+/// A module the payload imports is not mapped in the target *yet*.
+///
+/// Kept as its own type so the injector can retry on exactly this condition
+/// instead of on "any failure". Guessing with a fixed settle interval was both
+/// slower and less reliable: it had to assume a duration that was long enough
+/// to be correct and was therefore long enough to lose the race against a
+/// target that spawns immediately.
+#[derive(Debug)]
+pub struct ModuleNotMapped {
+    pub name: String,
+}
+
+impl std::fmt::Display for ModuleNotMapped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "module {} is not mapped in the target yet", self.name)
+    }
+}
+
+impl std::error::Error for ModuleNotMapped {}
 
 /// `GetModuleHandleW` in the host, 0 when the DLL is not loaded here.
 fn host_module_base(name: &str) -> u64 {
@@ -877,6 +903,50 @@ impl RemoteProcess {
     /// interval, take another, and accept only when the two agree. The returned
     /// value is the snapshot the caller must keep using, so no second, racy walk is
     /// needed afterwards.
+    /// Cheap readiness probe: the first walkable list that already contains the
+    /// modules every image needs.
+    ///
+    /// This deliberately does *not* wait for the list to stop changing. It only
+    /// answers "is there anything to resolve imports against yet", which becomes
+    /// true within a millisecond or two of the loader starting, and the
+    /// remaining question - "has the target mapped every module *this* payload
+    /// imports" - is answered by the caller retrying [`ModuleNotMapped`].
+    ///
+    /// The pair of them is what lets injection finish in single-digit
+    /// milliseconds instead of the ~100 ms a settle interval needs, which is the
+    /// difference between patching a target before it spawns and after.
+    pub fn poll_modules_ready(
+        &self,
+        poll: std::time::Duration,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<RemoteModule>> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut best_effort = 0usize;
+        loop {
+            if let Ok(modules) = self.walk_modules_allow_empty() {
+                best_effort = best_effort.max(modules.len());
+                if !modules.is_empty() && Self::looks_like_a_real_module_list(&modules) {
+                    return Ok(modules);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "target loader published no usable module list within {}ms \
+                     (best was {} entries)",
+                    timeout.as_millis(),
+                    best_effort
+                );
+            }
+            std::thread::sleep(poll);
+        }
+    }
+
+    /// Blocks until the target's module list has stopped changing, and returns
+    /// the settled snapshot.
+    ///
+    /// Kept for callers that want the strong "nothing more will be mapped"
+    /// guarantee. The injector does not use it: see [`Self::poll_modules_ready`]
+    /// for why the weaker, faster signal is the right one there.
     pub fn stable_modules(
         &self,
         timeout: std::time::Duration,

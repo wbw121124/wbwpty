@@ -162,6 +162,36 @@ pub struct STARTUPINFOW {
     pub hStdError: HANDLE,
 }
 
+/// `STARTUPINFOA` (winbase.h).
+///
+/// Field-for-field the same as [`STARTUPINFOW`] except that the four string
+/// fields are `char` rather than `wchar_t`. On x64 a pointer is a pointer, so
+/// every offset the hook touches is identical - which is why the assertions
+/// below expect the same numbers, and is the reason mirroring the struct at
+/// all is safe rather than a guess.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct STARTUPINFOA {
+    pub cb: DWORD,
+    pub lpReserved: LPSTR,
+    pub lpDesktop: LPSTR,
+    pub lpTitle: LPSTR,
+    pub dwX: DWORD,
+    pub dwY: DWORD,
+    pub dwXSize: DWORD,
+    pub dwYSize: DWORD,
+    pub dwXCountChars: DWORD,
+    pub dwYCountChars: DWORD,
+    pub dwFillAttribute: DWORD,
+    pub dwFlags: DWORD,
+    pub wShowWindow: WORD,
+    pub cbReserved2: WORD,
+    pub lpReserved2: *mut u8,
+    pub hStdInput: HANDLE,
+    pub hStdOutput: HANDLE,
+    pub hStdError: HANDLE,
+}
+
 /// `PROCESS_INFORMATION` (winbase.h).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -179,6 +209,11 @@ const _: () = assert!(core::mem::offset_of!(STARTUPINFOW, hStdInput) == 0x50);
 const _: () = assert!(core::mem::offset_of!(STARTUPINFOW, hStdOutput) == 0x58);
 const _: () = assert!(core::mem::offset_of!(STARTUPINFOW, hStdError) == 0x60);
 const _: () = assert!(core::mem::size_of::<STARTUPINFOW>() == 0x68);
+const _: () = assert!(core::mem::offset_of!(STARTUPINFOA, dwFlags) == 0x3c);
+const _: () = assert!(core::mem::offset_of!(STARTUPINFOA, hStdInput) == 0x50);
+const _: () = assert!(core::mem::offset_of!(STARTUPINFOA, hStdOutput) == 0x58);
+const _: () = assert!(core::mem::offset_of!(STARTUPINFOA, hStdError) == 0x60);
+const _: () = assert!(core::mem::size_of::<STARTUPINFOA>() == 0x68);
 const _: () = assert!(core::mem::size_of::<PROCESS_INFORMATION>() == 0x18);
 
 #[repr(C)]
