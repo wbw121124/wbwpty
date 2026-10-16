@@ -16,13 +16,27 @@
 //!
 //! ```text
 //! wbwpty-spawn-probe [--std-handles|--no-std-handles] [--inherit|--no-inherit]
-//!                    [--pidfile <path>]
+//!                    [--pidfile <path>] [--gate <path>]
 //!                    <flag>...  --  <command line>
 //! ```
 //!
 //! `<flag>` is one of `detached`, `no_window`, `new_console`, `unicode_env`,
 //! or `none`. Exits with the child's exit code, or `0xff` if the child could not
 //! be created at all.
+//!
+//! # `--gate`
+//!
+//! Waits for the named file to appear before spawning anything, and says so on
+//! stderr first (`probe: gated`, then `probe: released`).
+//!
+//! This exists because a fixture that spawns immediately is not measuring what
+//! it looks like it measures. Injection cannot happen until the target's loader
+//! has settled, which takes on the order of a hundred milliseconds; a probe that
+//! spawns in its first few milliseconds does so before any substitution is in
+//! place, and the measurement then describes a target we never patched. The
+//! gate makes "spawn now" something the test decides, which is the only way to
+//! ask whether a substitution *works* rather than whether it was installed in
+//! time.
 
 use std::ffi::c_void;
 use std::ffi::OsString;
@@ -55,6 +69,7 @@ fn main() {
     let mut inherit = true;
     let mut flags: u32 = 0;
     let mut pidfile: Option<OsString> = None;
+    let mut gate: Option<std::path::PathBuf> = None;
     let mut command: Option<OsString> = None;
 
     let mut args = std::env::args_os().skip(1);
@@ -66,6 +81,7 @@ fn main() {
             "--inherit" => inherit = true,
             "--no-inherit" => inherit = false,
             "--pidfile" => pidfile = args.next(),
+            "--gate" => gate = args.next().map(std::path::PathBuf::from),
             "--" => {
                 command = args.next();
                 break;
@@ -84,6 +100,10 @@ fn main() {
         eprintln!("wbwpty-spawn-probe: nothing to spawn; see --help output above");
         std::process::exit(2);
     };
+
+    if let Some(gate) = gate {
+        wait_for_gate(&gate);
+    }
 
     let mut wide: Vec<u16> = command.encode_wide().collect();
     if wide.last() != Some(&0) {
@@ -183,6 +203,24 @@ fn main() {
         std::process::exit(STILL_ACTIVE as i32);
     }
     std::process::exit(code as i32);
+}
+
+/// Blocks until `gate` exists, saying so on stderr on the way in and out.
+///
+/// stderr, because that is the stream a session routes onto its own pipe: the
+/// test that opened the gate sees the `released` line arrive before the child
+/// does, which is what turns "I touched a file" into "the fixture really did
+/// proceed".
+///
+/// No timeout. A fixture that is never released is a test that failed to set
+/// itself up, and the harness's own timeout is the thing that reports that -
+/// which is a better report than an invented exit code would be.
+fn wait_for_gate(gate: &std::path::Path) {
+    eprintln!("probe: gated on {}", gate.display());
+    while !gate.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    eprintln!("probe: released");
 }
 
 /// Maps a flag name onto the `CreateProcessW` bit it stands for.

@@ -28,7 +28,6 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::child::Child;
 use crate::manual_map::iat::{self, ImportSlot};
 use crate::manual_map::remote::RemoteProcess;
 use crate::manual_map::InjectionReport;
@@ -59,15 +58,20 @@ impl HookReport {
 /// legitimate answer and not a failure: an API the target never calls needs no
 /// interception, and a target that reaches `CreateProcess` by some other route
 /// is a separate problem to diagnose rather than to paper over.
+///
+/// `proc` rather than a `&Child`, because this has to work on a process the host
+/// did not create. The descendant supervisor has only a pid and a handle; the
+/// target image to parse and the pid to report both come from that handle.
 pub fn install_create_process_hook(
-    child: &Child,
+    proc: &RemoteProcess,
     payload_dll: &Path,
     report: &InjectionReport,
     std_handles: [u64; 3],
 ) -> Result<Option<HookReport>> {
-    let proc = RemoteProcess::new(child.process_handle());
-    let target_image = std::fs::read(&child.image)
-        .with_context(|| format!("reading the target image {}", child.image.display()))?;
+    let pid = proc.pid().unwrap_or(0);
+    let image_path = proc.image_path()?;
+    let target_image = std::fs::read(&image_path)
+        .with_context(|| format!("reading the target image {}", image_path.display()))?;
     let slots = iat::find_imports(&target_image, &["CreateProcessW"])
         .context("walking the target's import table")?;
     if slots.is_empty() {
@@ -92,7 +96,7 @@ pub fn install_create_process_hook(
     let first = slots[0].address(target_base);
     let original = proc
         .read_bytes(first, 8)
-        .context("reading the bound import slot")?;
+        .with_context(|| format!("reading the bound import slot in pid {pid}"))?;
     let original = u64::from_le_bytes(original.try_into().expect("read 8"));
     if original == 0 {
         bail!("the loader left {:#x} unbound, so there is nothing to intercept", first);

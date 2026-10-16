@@ -49,6 +49,16 @@ pub struct SessionConfig {
     /// Map the payload DLL at all. Injection only adds console semantics; the
     /// stdio redirection itself does not depend on it.
     pub inject: bool,
+    /// Watch the session's descendants and give them the same treatment the
+    /// target got.
+    ///
+    /// Without it, only the *target* can substitute its own `CreateProcessW`,
+    /// so anything the target spawns creates its children the way the base API
+    /// does - with a console each. See [`crate::supervisor`] for the whole
+    /// argument. Off means "inject the target and nothing else", which is the
+    /// behaviour this project had before, and which only holds for two
+    /// generations.
+    pub cover_descendants: bool,
     /// Report injection and shim decisions on stderr.
     pub verbose: bool,
     /// Virtual terminal geometry reported to the payload.
@@ -64,6 +74,7 @@ impl Default for SessionConfig {
             log_path: None,
             shim: true,
             inject: true,
+            cover_descendants: true,
             verbose: false,
             rows: 25,
             cols: 80,
@@ -200,6 +211,9 @@ pub struct Session {
     hook: Option<crate::manual_map::HookReport>,
     /// Why it did not, when it was attempted and failed.
     hook_error: Option<String>,
+    /// Watches the tree and gives every descendant the same treatment the target
+    /// got. `None` when there was nothing to extend - see [`Self::start`].
+    supervisor: Option<crate::supervisor::DescendantSupervisor>,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -275,14 +289,12 @@ impl Session {
         // into it. A target that does not import `CreateProcessW` is not an
         // error - there is nothing to intercept.
         let hook = match report.as_ref() {
-            Some(injection) => {
-                crate::manual_map::install_create_process_hook(
-                    &child,
-                    &dll_path,
-                    injection,
-                    std_handles,
-                )
-            }
+            Some(injection) => crate::manual_map::install_create_process_hook(
+                &crate::manual_map::remote::RemoteProcess::new(child.process_handle()),
+                &dll_path,
+                injection,
+                std_handles,
+            ),
             None => Ok(None),
         };
         let (hook, hook_error) = match hook {
@@ -311,6 +323,29 @@ impl Session {
             .patch_console_state()
             .map_err(|err| format!("{err:#}"));
 
+        // The substitution above only rewrites *one* process' import table. A
+        // descendant gets its own image and its own import table, so anything
+        // the target spawns would create its children exactly the way the base
+        // API does - with a console, and with a `conhost.exe` per grandchild.
+        // Watching the tree extends the same treatment to every generation.
+        //
+        // Started only when there is something to extend: no payload means
+        // nothing to point the descendants' slots at, and a watcher that
+        // injected nothing would just spend a process table snapshot per poll.
+        let supervisor = match (report.as_ref(), hook.as_ref(), config.inject, config.cover_descendants) {
+            (Some(_), Some(_), true, true) => {
+                let mut supervisor = crate::supervisor::SupervisorConfig::new(
+                    child.pid,
+                    dll_path.clone(),
+                    std_handles,
+                );
+                supervisor.payload_image = Arc::new(dll_image.unwrap_or_default());
+                supervisor.verbose = config.verbose;
+                Some(crate::supervisor::DescendantSupervisor::spawn(supervisor))
+            }
+            _ => None,
+        };
+
         let session = Self {
             child,
             pipes: Arc::new(SharedPipes::new(pipes)),
@@ -323,6 +358,7 @@ impl Session {
             console_patch,
             hook,
             hook_error,
+            supervisor,
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
         session.start_input_pump();
@@ -352,6 +388,72 @@ impl Session {
     /// nothing gets mistaken for one that works.
     pub fn hook_error(&self) -> Option<&str> {
         self.hook_error.as_deref()
+    }
+
+    /// Which descendants of the target have been given the same treatment, as of
+    /// right now.
+    ///
+    /// The record is published as it happens rather than at the end, so a caller
+    /// can tell a descendant that was covered before it could spawn anything
+    /// from one that was covered afterwards - which, for the promise this project
+    /// makes, is the difference between working and not.
+    ///
+    /// Empty when no supervisor is running; see [`Self::start`] for when there
+    /// is one.
+    pub fn coverage(&self) -> Vec<crate::supervisor::Coverage> {
+        self.supervisor
+            .as_ref()
+            .map(|s| s.coverage())
+            .unwrap_or_default()
+    }
+
+    /// Blocks until `pid` appears in [`Self::coverage`], or the timeout expires.
+    ///
+    /// For a test that has to hold a descendant still until it is covered: a
+    /// fixture that spawns its child immediately would race the watcher, and
+    /// losing that race looks exactly like the feature not working.
+    pub fn wait_for_coverage(
+        &self,
+        pid: u32,
+        timeout: std::time::Duration,
+    ) -> Option<crate::supervisor::Coverage> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(found) = self.coverage().into_iter().find(|c| c.pid == pid) {
+                return Some(found);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The descendants' coverage as one line, for `--verbose`.
+    fn describe_coverage(&self) {
+        if !self.config.verbose {
+            return;
+        }
+        let records = self.coverage();
+        let covered = records.iter().filter(|c| c.covered()).count();
+        let notes: Vec<String> = records
+            .iter()
+            .filter(|c| !c.covered())
+            .map(|c| match &c.note {
+                Some(note) => format!("{} ({note})", c.pid),
+                None => c.pid.to_string(),
+            })
+            .collect();
+        eprintln!(
+            "wbwpty: pid {} descendants: {covered} of {} covered{}",
+            self.child.pid,
+            records.len(),
+            if notes.is_empty() {
+                String::new()
+            } else {
+                format!(", not covered: {}", notes.join(", "))
+            }
+        );
     }
 
     /// Reads the payload's `WBWPTY_STATUS` word out of the target.
@@ -654,11 +756,15 @@ impl Session {
                 self.child.pid, status.stage
             );
         }
+        self.describe_coverage();
     }
 
     /// Terminates the target and stops the pumps.
     pub fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Relaxed);
+        if let Some(supervisor) = &self.supervisor {
+            supervisor.stop();
+        }
         let _ = self.child.terminate();
     }
 }
@@ -668,6 +774,10 @@ impl Drop for Session {
         self.shutting_down.store(true, Ordering::Relaxed);
         // Best effort: a detached target would otherwise outlive the host.
         let _ = self.child.terminate();
+        // Dropping the supervisor joins its thread, which is why it has to come
+        // after the terminate: a thread still covering the tree would otherwise
+        // be writing into descendants of a process we just killed.
+        drop(self.supervisor.take());
     }
 }
 

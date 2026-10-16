@@ -6,9 +6,9 @@
 //! * [`pipe`]        — named-pipe byte transport, overlapped, pump threads
 //! * [`child`]       — suspended + detached process creation, environment block
 //! * [`manual_map`]  — PE parsing, PEB module walk, manual mapping, remote stub
-//! * [`inject`]      — glue: map the redirect DLL and call its entry point
 //! * [`session`]     — the terminal session lifecycle built on top of the above
-//! * [`console`]     — host side virtual terminal state (rows/cols/code page)
+//! * [`supervisor`]  — covers every *descendant* of the target, so the whole
+//!   tree creates its children with `DETACHED_PROCESS` and our pipes
 //! * [`inspect`]     — process snapshots used to prove "no conhost.exe"
 
 pub mod child;
@@ -17,9 +17,11 @@ pub mod inspect;
 pub mod manual_map;
 pub mod pipe;
 pub mod session;
+pub mod supervisor;
 
 pub use anyhow::{Error, Result};
 pub use child::{ChildSpec, Stdio};
 pub use error::Handle;
 pub use pipe::{PipePair, ReadEvent};
 pub use session::{Session, SessionConfig};
+pub use supervisor::{Coverage, SupervisorConfig};

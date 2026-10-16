@@ -66,15 +66,56 @@ pub struct InjectionReport {
 pub fn inject_dll(child: &Child, dll: &Path, entry_symbol: &str) -> Result<InjectionReport> {
     let file =
         std::fs::read(dll).with_context(|| format!("reading redirect DLL {}", dll.display()))?;
-    inject_bytes(child, &file, entry_symbol)
+    let proc = RemoteProcess::new(child.process_handle());
+    inject_bytes(&proc, child.pid, &file, entry_symbol)
 }
 
-/// [`inject_dll`] for an in-memory image.
+/// How long [`inject_bytes`] waits for `LdrpInitializeProcess`.
 ///
-/// The child must already be running (see [`inject_into_child`]): the loader has
-/// to have mapped its imports before we can resolve ours against them.
-pub fn inject_bytes(child: &Child, image: &[u8], entry_symbol: &str) -> Result<InjectionReport> {
-    let proc = RemoteProcess::new(child.process_handle());
+/// Generous for the session's own target, which is expected to be an interactive
+/// process that stays alive. A descendant is a different proposition - it may
+/// be gone in milliseconds - so the supervisor uses a much shorter wait and
+/// retries on the next poll instead.
+const DEFAULT_LOADER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How far apart two module snapshots must agree to count as settled.
+const STABILITY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// [`inject_bytes`] with the session's own loader wait.
+pub fn inject_bytes(
+    proc: &RemoteProcess,
+    pid: u32,
+    image: &[u8],
+    entry_symbol: &str,
+) -> Result<InjectionReport> {
+    inject_bytes_with(
+        proc,
+        pid,
+        image,
+        entry_symbol,
+        DEFAULT_LOADER_WAIT,
+        STABILITY_INTERVAL,
+    )
+}
+
+/// [`inject_bytes`] for a caller that cannot afford to block for
+/// [`DEFAULT_LOADER_WAIT`].
+///
+/// The supervisor drives this from a thread that has to stay responsive to the
+/// session shutting down, so the wait is short and failure means "try again
+/// later" rather than "this will never work".
+///
+/// `proc` rather than a `&Child` because a descendant is not a `Child`: it was
+/// created by the target, and the host only ever learns its pid from a process
+/// table snapshot. `pid` is therefore passed in separately, for the messages.
+pub fn inject_bytes_with(
+    proc: &RemoteProcess,
+    pid: u32,
+    image: &[u8],
+    entry_symbol: &str,
+    loader_wait: std::time::Duration,
+    stability: std::time::Duration,
+) -> Result<InjectionReport> {
     let pe = PeImage::parse(image)?;
     if !pe.info.is_dll {
         bail!(
@@ -88,22 +129,21 @@ pub fn inject_bytes(child: &Child, image: &[u8], entry_symbol: &str) -> Result<I
     // event is the whole synchronisation problem solved: before it the target
     // has nothing mapped to resolve imports against, and we are not allowed to
     // hook the entry point to catch the moment (README 5.3).
-    let loader_wait = std::time::Duration::from_secs(10);
     let started = std::time::Instant::now();
     let modules = proc
-        .stable_modules(loader_wait, std::time::Duration::from_millis(50))
-        .with_context(|| format!("waiting for the loader in pid {}", child.pid))?;
+        .stable_modules(loader_wait, stability)
+        .with_context(|| format!("waiting for the loader in pid {pid}"))?;
     let loader_wait_ms = started.elapsed().as_millis() as u64;
 
     // The settled snapshot is the one we resolve against: walking again would
     // race the target loading more DLLs.
     let discovered = RemoteModules::from_snapshot(modules);
-    let (base, reloc_delta) = allocate_image(&proc, &pe)?;
+    let (base, reloc_delta) = allocate_image(proc, &pe)?;
     let mut mapped = pe.map(reloc_delta)?;
     // Imports are written straight into the mapped image, so the payload is
     // fully self-contained by the time `DllMain` is called and the in-target
     // trampoline only has to make the call.
-    let patch_count = resolve_imports(&proc, &discovered, &pe, &mut mapped)?;
+    let patch_count = resolve_imports(proc, &discovered, &pe, &mut mapped)?;
     proc.write_bytes(base, &mapped)?;
 
     // `DllMain(hinst, DLL_PROCESS_ATTACH, NULL)` cannot be expressed as a

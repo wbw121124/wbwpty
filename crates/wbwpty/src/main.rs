@@ -39,6 +39,16 @@ struct Cli {
     #[arg(long)]
     no_inject: bool,
 
+    /// Do not map the payload into the target's descendants.
+    ///
+    /// They then create their own children with whatever flags they choose, and
+    /// the base API gives each of them a console - a `conhost.exe` per
+    /// grandchild. Off means "cover the whole tree", which is the default and
+    /// the only setting under which the no-console-host claim holds past the
+    /// target's own children.
+    #[arg(long)]
+    no_cover_descendants: bool,
+
     /// Program and arguments to run, after `--`.
     #[arg(trailing_var_arg = true, value_name = "COMMAND")]
     command: Vec<std::ffi::OsString>,
@@ -63,6 +73,7 @@ fn main() -> Result<()> {
         log_path: cli.log.clone(),
         shim: cli.shim,
         inject: !cli.no_inject,
+        cover_descendants: !cli.no_cover_descendants,
         verbose: cli.verbose,
         ..Default::default()
     };

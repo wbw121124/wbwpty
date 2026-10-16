@@ -13,6 +13,8 @@
 //! (`ntdll!LdrpInitializeLoader` usage), `LDR_DATA_TABLE_ENTRY` (same).
 
 use std::ffi::c_void;
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
 
 use anyhow::{bail, Context, Result};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, TRUE};
@@ -320,6 +322,79 @@ impl RemoteProcess {
 
     pub fn handle(&self) -> HANDLE {
         self.handle
+    }
+
+    /// The pid this handle names.
+    ///
+    /// Needed because the descendant supervisor learns a process' identity from
+    /// the process table, and every message it prints has to name a pid it did
+    /// not create - `Child` is only for the one process this host owns.
+    pub fn pid(&self) -> Result<u32> {
+        use windows_sys::Win32::System::Threading::GetProcessId;
+        // SAFETY: `self.handle` is a live process handle with the query rights
+        // that `open` asked for; a zero return is reported, not swallowed.
+        let pid = unsafe { GetProcessId(self.handle) };
+        if pid == 0 {
+            bail!("GetProcessId failed: {}", last_error_text());
+        }
+        Ok(pid)
+    }
+
+    /// True when the target is a 64-bit PE.
+    ///
+    /// Read from the target's own headers rather than from its file, because the
+    /// question that matters is what the *loader* mapped. It is also the question
+    /// that decides whether any of the offsets in this module mean anything: a
+    /// WOW64 process is a 32-bit address space, and reading an `x64` PEB out of
+    /// one - or writing an `x64` payload into it - is not a degraded result, it is
+    /// corruption. The project is x64 only (README 7), so this is how that limit
+    /// is enforced rather than assumed.
+    pub fn is_x64_image(&self) -> Result<bool> {
+        const AMD64: u16 = 0x8664;
+        let base = self.image_base()?;
+        let dos = self.read_bytes(base, 0x40)?;
+        if &dos[0..2] != b"MZ" {
+            bail!("no MZ header at the target's image base {base:#x}");
+        }
+        let e_lfanew =
+            u32::from_le_bytes(dos[0x3c..0x40].try_into().expect("4 bytes")) as usize;
+        // FILE_HEADER is 24 bytes; `Machine` is its second field.
+        let file_header = self.read_bytes(base + e_lfanew as u64, 24)?;
+        if &file_header[0..4] != b"PE\0\0" {
+            bail!("no PE signature at {:#x}", base + e_lfanew as u64);
+        }
+        let machine = u16::from_le_bytes(file_header[4..6].try_into().expect("2 bytes"));
+        Ok(machine == AMD64)
+    }
+
+    /// Full path of the target's executable, as the kernel has it.
+    ///
+    /// The injection and substitution steps both have to read the target's image
+    /// *file* - to find its import table, and to find where its `CreateProcessW`
+    /// slot is. For the session's own target that path is known at spawn time,
+    /// but a descendant is only ever discovered as a pid in a process table
+    /// snapshot, and a snapshot carries a base name (`ping.exe`), not a path that
+    /// can be opened.
+    pub fn image_path(&self) -> Result<std::path::PathBuf> {
+        use windows_sys::Win32::System::Threading::{
+            QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        };
+
+        // `MAX_PATH` is the documented minimum the API accepts; longer paths are
+        // legal on this machine, so the buffer is sized for the long form and a
+        // path that still does not fit is reported rather than truncated.
+        const CAP: usize = 32768 / 2;
+        let mut buf = vec![0u16; CAP];
+        let mut len = CAP as u32;
+        // SAFETY: both the buffer and the length out parameter are live; the
+        // handle carries `PROCESS_QUERY_LIMITED_INFORMATION`.
+        let ok = unsafe {
+            QueryFullProcessImageNameW(self.handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
+        };
+        if ok == 0 {
+            bail!("QueryFullProcessImageNameW failed: {}", last_error_text());
+        }
+        Ok(std::path::PathBuf::from(OsString::from_wide(&buf[..len as usize])))
     }
 
     /// Reads `len` bytes from the target at `addr`.
