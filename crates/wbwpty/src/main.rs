@@ -22,15 +22,18 @@ struct Cli {
     #[arg(long)]
     dump_conhost: bool,
 
-    /// Ask the payload to install the console API shim (default: on).
+    /// Do not install the console API shim in the target (default: on).
     ///
-    /// Published as `WBWPTY_SHIM=1`. The shim itself - `GetConsoleMode`,
-    /// `WriteConsoleW` and friends replaced inside the target - is **not
-    /// implemented yet**; the payload currently reads the flag and logs it. The
-    /// flag stays because the environment contract is frozen and something has
-    /// to set it, not because it does anything yet.
+    /// With it, `WriteConsoleW` / `GetConsoleMode` / `AllocConsole` and the
+    /// rest are answered by the payload instead of failing on a pipe handle, so
+    /// programs that ask for a console can write. It needs the payload, so
+    /// `--no-inject` wins.
+    ///
+    /// Deliberately an off-switch rather than `--shim`: the default is on, and a
+    /// flag whose name reads "do the thing" while meaning "don't" is how this flag
+    /// spent its life meaning the opposite of [`SessionConfig::shim`].
     #[arg(long)]
-    shim: bool,
+    no_shim: bool,
 
     /// Path the payload appends its diagnostics to (`WBWPTY_LOG`).
     #[arg(long, value_name = "PATH")]
@@ -77,7 +80,7 @@ fn main() -> Result<()> {
     let config = SessionConfig {
         dll: cli.dll.clone(),
         log_path: cli.log.clone(),
-        shim: cli.shim,
+        shim: !cli.no_shim && !cli.no_inject,
         inject: !cli.no_inject,
         cover_descendants: !cli.no_cover_descendants,
         verbose: cli.verbose,

@@ -12,6 +12,7 @@
 #![no_std]
 
 pub mod config;
+pub mod console;
 pub mod crt;
 pub mod ffi;
 pub mod hook;

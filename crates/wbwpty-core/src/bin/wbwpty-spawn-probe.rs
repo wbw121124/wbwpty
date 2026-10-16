@@ -17,12 +17,17 @@
 //! ```text
 //! wbwpty-spawn-probe [--std-handles|--no-std-handles] [--inherit|--no-inherit]
 //!                    [--pidfile <path>] [--gate <path>]
+//!                    [--console-write <text>]
 //!                    <flag>...  --  <command line>
 //! ```
 //!
 //! `<flag>` is one of `detached`, `no_window`, `new_console`, `unicode_env`,
 //! or `none`. Exits with the child's exit code, or `0xff` if the child could not
 //! be created at all.
+//!
+//! `--console-write <text>` is a mode rather than a flag: it writes `text` to
+//! stdout through `WriteConsoleW` and exits, with nothing to spawn. It exists to
+//! be a subject for the console API substitution - see `tests/console_shim.rs`.
 //!
 //! # `--gate`
 //!
@@ -43,7 +48,6 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use windows_sys::Win32::System::Console::GetStdHandle;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, WaitForSingleObject, CREATE_NEW_CONSOLE, CREATE_NO_WINDOW,
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, INFINITE, PROCESS_INFORMATION,
@@ -70,6 +74,7 @@ fn main() {
     let mut flags: u32 = 0;
     let mut pidfile: Option<OsString> = None;
     let mut gate: Option<std::path::PathBuf> = None;
+    let mut console_text: Option<OsString> = None;
     let mut command: Option<OsString> = None;
 
     let mut args = std::env::args_os().skip(1);
@@ -82,6 +87,7 @@ fn main() {
             "--no-inherit" => inherit = false,
             "--pidfile" => pidfile = args.next(),
             "--gate" => gate = args.next().map(std::path::PathBuf::from),
+            "--console-write" => console_text = args.next(),
             "--" => {
                 command = args.next();
                 break;
@@ -96,14 +102,20 @@ fn main() {
         }
     }
 
+    if let Some(gate) = gate {
+        wait_for_gate(&gate);
+    }
+
+    if let Some(text) = console_text {
+        // A mode rather than a flag: there is nothing to spawn afterwards, and a
+        // fixture that also did that would be measuring two things at once.
+        console_write(&text.to_string_lossy());
+    }
+
     let Some(command) = command else {
         eprintln!("wbwpty-spawn-probe: nothing to spawn; see --help output above");
         std::process::exit(2);
     };
-
-    if let Some(gate) = gate {
-        wait_for_gate(&gate);
-    }
 
     let mut wide: Vec<u16> = command.encode_wide().collect();
     if wide.last() != Some(&0) {
@@ -131,7 +143,7 @@ fn main() {
                 si.hStdInput,
                 si.hStdOutput,
                 si.hStdError,
-                unsafe { GetStdHandle(1) }
+                unsafe { GetStdHandle(1) as isize }
             );
         }
     } else if std::env::var_os("WBWPTY_PROBE_VERBOSE").is_some() {
@@ -221,6 +233,67 @@ fn wait_for_gate(gate: &std::path::Path) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     eprintln!("probe: released");
+}
+
+// `GetStdHandle` and `WriteConsoleW`, called through the import table.
+//
+// Declared rather than reached through dynamic lookup on purpose: the console
+// API substitution rewrites **import slots**, so a program that resolves the
+// function at run time has no slot to rewrite and would not be covered. This
+// fixture has to import it statically to be a valid subject, and that is a real
+// limitation of the mechanism rather than a detail of the test.
+extern "system" {
+    fn GetStdHandle(n_std_handle: u32) -> *mut std::ffi::c_void;
+    #[allow(non_snake_case)]
+    fn WriteConsoleW(
+        console_output: *mut std::ffi::c_void,
+        buffer: *const u16,
+        chars_to_write: u32,
+        chars_written: *mut u32,
+        reserved: *mut std::ffi::c_void,
+    ) -> i32;
+}
+
+/// `STD_OUTPUT_HANDLE`.
+const STD_OUTPUT_HANDLE: u32 = 0xffff_ffff;
+
+/// Reported when `--console-write` was asked for and the console API refused.
+///
+/// Distinct from every other exit code here, and from zero, because "the console
+/// write failed" and "the write succeeded" are the two ends of what this fixture
+/// is measuring and they must not be confused with a spawn that never happened.
+const CONSOLE_WRITE_FAILED: u32 = 0x41;
+
+/// Writes `text` to stdout through `WriteConsoleW` and reports what happened.
+///
+/// This is the only way a program gets text onto a handle that is not a console,
+/// so a program that uses it against our pipe gets `ERROR_INVALID_HANDLE` and no
+/// output at all - which is the whole reason the payload substitutes the call.
+/// The report line goes to stderr, which for a session is the same pipe, so the
+/// test sees the verdict alongside whatever the write produced.
+fn console_write(text: &str) -> ! {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide: Vec<u16> = std::ffi::OsStr::new(text)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // The NUL is a terminator for the convenience of the reader, not part of the
+    // text: `WriteConsoleW` counts characters, so it is excluded.
+    let chars = (wide.len() - 1) as u32;
+    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    let mut written = 0u32;
+    let ok = unsafe {
+        WriteConsoleW(handle, wide.as_ptr(), chars, &mut written, std::ptr::null_mut())
+    };
+
+    eprintln!(
+        "probe: console-write ok={} written={written} of {chars} bytes={}",
+        ok != 0,
+        wide[..chars as usize].len() * 2
+    );
+    let good = ok != 0 && written == chars;
+    std::process::exit(if good { 0 } else { CONSOLE_WRITE_FAILED as i32 });
 }
 
 /// Maps a flag name onto the `CreateProcessW` bit it stands for.

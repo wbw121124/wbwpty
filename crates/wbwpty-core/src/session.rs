@@ -223,6 +223,9 @@ pub struct Session {
     console_patch: Result<crate::manual_map::ConsolePatch, String>,
     /// What the `CreateProcessW` substitution did, if it happened.
     hook: Option<crate::manual_map::HookReport>,
+    /// What the console API substitution did, if it was asked for and the target
+    /// uses one.
+    console_hook: Option<crate::manual_map::ConsoleHookReport>,
     /// Why it did not, when it was attempted and failed.
     hook_error: Option<String>,
     /// Watches the tree and gives every descendant the same treatment the target
@@ -361,6 +364,50 @@ impl Session {
         };
 
         let pump_input = config.pump_input;
+        // The console API substitution, when asked for. Same mechanism as the
+        // `CreateProcessW` one and independent of it: a target may well use one,
+        // the other, or both. Deliberately gated on `shim` rather than on
+        // `inject`, because this is an opt-in behaviour change - a program whose
+        // console calls start succeeding is a program behaving differently - while
+        // the `CreateProcessW` substitution is required for the tree to work at
+        // all.
+        let console_hook = if config.shim {
+            match report.as_ref() {
+                Some(injection) => {
+                    let proc_handle = crate::manual_map::remote::RemoteProcess::new(
+                        child.process_handle(),
+                    );
+                    match proc_handle
+                        .image_path()
+                        .and_then(|image| {
+                            let file = std::fs::read(&image).with_context(|| {
+                                format!("reading the target image {}", image.display())
+                            })?;
+                            crate::manual_map::install_console_hook(
+                                &proc_handle,
+                                &file,
+                                &dll_path,
+                                injection,
+                            )
+                        }) {
+                        Ok(hook) => hook,
+                        Err(err) => {
+                            if config.verbose {
+                                eprintln!(
+                                    "wbwpty: pid {} no console API substitution: {err:#}",
+                                    child.pid
+                                );
+                            }
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         let session = Self {
             child,
             pipes: Arc::new(SharedPipes::new(pipes)),
@@ -372,6 +419,7 @@ impl Session {
             hook_flags_rva,
             console_patch,
             hook,
+            console_hook,
             hook_error,
             supervisor,
             shutting_down: Arc::new(AtomicBool::new(false)),
@@ -405,6 +453,16 @@ impl Session {
     /// nothing gets mistaken for one that works.
     pub fn hook_error(&self) -> Option<&str> {
         self.hook_error.as_deref()
+    }
+
+    /// What the console API substitution did.
+    ///
+    /// `None` means one of four things, and [`SessionConfig::shim`] separates the
+    /// first from the rest: the shim was not asked for, the payload was not
+    /// mapped, the target imports no console API, or every slot it had was
+    /// unwritable.
+    pub fn console_hook(&self) -> Option<&crate::manual_map::ConsoleHookReport> {
+        self.console_hook.as_ref()
     }
 
     /// Which descendants of the target have been given the same treatment, as of

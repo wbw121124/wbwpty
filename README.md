@@ -134,17 +134,27 @@ ResumeThread  ──►  loader 初始化 ──► ucrtbase!__acrt_initialize_s
 
 `cmd.exe` / `python.exe` 在 std handle 是管道时本来就能工作（它们会退化成文件 I/O 路径）。
 但很多程序**硬依赖控制台 API**（`GetConsoleMode` / `WriteConsoleW` / `GetConsoleScreenBufferInfo`）。
-在目标进程内对 `KernelBase` 的同名导出做 x64 内联跳板（inline hook），
-把这些 API 换成我们的实现，让目标"自认为是控制台"，而 I/O 实际走管道：
+在目标进程内把这些 API 的**导入槽**改写成指向 payload，让目标"自认为是控制台"，而 I/O 实际走管道。
 
-- `Get/SetConsoleMode` → 虚拟 mode（`ENABLE_VIRTUAL_TERMINAL_PROCESSING` 等）
-- `WriteConsoleA/W` → UTF-16 → UTF-8 写输出管道
-- `ReadConsoleA/W` / `ReadConsoleInputW` → 读输入管道 + 行编辑回显 + 合成按键事件
-- `GetConsoleScreenBufferInfo(Ex)` → 返回宿主上报的窗口尺寸
-- `AllocConsole`/`FreeConsole` → no-op，`AttachConsole` → 失败
+**已实现（第一批，全部不依赖宿主）**：
 
-> 实测依据：本机 `kernel32!GetConsoleMode` 等只是 6 字节 `jmp [rip+disp32]` 桩，
-> 真实实现在 `KernelBase.dll`，因此只需 hook `KernelBase` 即可覆盖所有 kernel32 调用者。
+| API | 实现 |
+| --- | --- |
+| `WriteConsoleW` | UTF-16 → UTF-8，写到会话的 stdout（分块过栈缓冲，DLL 无分配器） |
+| `WriteConsoleA` | 原样字节写出（目标自己的编码就是终端要看到的东西） |
+| `GetConsoleMode` / `SetConsoleMode` | 虚拟 mode word，默认带 `ENABLE_VIRTUAL_TERMINAL_PROCESSING` |
+| `AllocConsole` / `FreeConsole` | no-op 且**返回成功**（真分配就会冒出 conhost） |
+| `AttachConsole` | 恒定失败（没有 console 可附着） |
+
+**尚未实现（需要屏幕）**：`GetConsoleScreenBufferInfo(Ex)` 这一族要光标位置和单元格网格，
+而网格需要堆——注入 DLL 是 `no_std` 无分配器（AGENTS 规则 3），**虚拟屏不能放在 DLL 里**，
+它在宿主那边（§5.6 的 `vt-parser`）。要回答这些调用就得往返宿主。
+在做完之前这些函数**故意不被拦截**：放着不管会诚实地失败，
+而用编出来的光标位置去应答会失败得莫名其妙。
+
+> 实测依据：`kernel32` 的控制台导出只是 6 字节跳转桩，真实实现在 `KernelBase.dll`；
+> 但**不需要**内联跳板——改写目标的**导入槽**就够了，而导入槽是数据，CFG 看不见它。
+> 覆盖面限制同 `CreateProcessW`：**运行时用 `GetProcAddress` 取的 API 没有槽，不会被拦截**。
 
 ---
 
@@ -311,15 +321,15 @@ D:\wbwpty
 │   │       ├── stdio.rs        # SetStdHandle + 继承标记
 │   │       ├── peb.rs          # NtCurrentTeb→PEB 补丁 + 偏移自检
 │   │       ├── crt.rs          # setvbuf(_IONBF)（见 §1.6）
-│   │       └── hook.rs         # create_process_w 替身（§1.2/§1.7）
+│   │       ├── hook.rs         # create_process_w 替身（§1.2/§1.7）
+│   │       └── console.rs      # 控制台 API 替身：不需要屏幕的那一批（§1.5）
 │   ├── vt-parser/              # vendor 自 wbwtty：VT 解析 + 虚拟屏（零平台依赖）
 │   └── term-input/             # vendor 自 wbwtty：按键/鼠标 → VT 字节
 ```
 
-> 尚未实现：`console_api.rs`（控制台 API 替身，见 §1.5）——设计已经由 §5.6 的
-> 复用结论给出（建在 `vt-parser` 的 `feed` / `get_screen` / `take_replies` 上）。
+> 尚未实现：**需要屏幕的那一族**控制台 API（`GetConsoleScreenBufferInfo` 等，见 §1.5）
+> ——设计由 §5.6 的复用结论给出（屏幕在宿主侧，payload 只能往返问）。
 > `keys.rs` 的职责已由 vendor 进来的 `term-input` 覆盖。
-> `--shim` 目前是空承诺，见 §5.1。
 
 ---
 
@@ -355,21 +365,24 @@ cargo test --release
 | 5 | CLI | 会话循环：双泵 / EOF / 退出码 / `--dump-conhost` / `--verbose` | （同上） | ✅ |
 | 6 | PEB | 宿主侧（挂起态 + 注入后各一次）读/写目标 `ConsoleHandle`，偏移断言 + 运行时自检；**实测无法阻止孙进程分配 console**，见 §1.2 | `fix(peb): own the console state from the host side` | ✅（机制被证伪，已记录） |
 | 7 | CRT | `config.rs` 环境契约 + 接上 `log::init_from_env` + worker 线程 + `setvbuf(_IONBF)`（**不是 `_IOLBF`**，见 §1.6） | `feat(dll): unbuffer the target stdio streams so output is not held back` | ✅ |
-| 8 | shim | `CreateProcess*` 的 IAT 拦截（`DETACHED_PROCESS` + `STARTF_USESTDHANDLES`，见 §1.2）+ **supervisor 把同样的替换铺到每一个后代**（见 §1.7）；console API shim 仍未实现 | `feat: cover every generation of the process tree with a descendant supervisor` | ✅（shim 未实现，见 §5.1） |
+| 8 | shim | `CreateProcess*` 的 IAT 拦截 + **supervisor 把替换铺到每一个后代**（见 §1.7）；console API 替身**第一批**（`WriteConsoleW`/`GetConsoleMode` 等，见 §1.5），需要屏幕的那一族未做 | `feat: cover every generation of the process tree with a descendant supervisor`<br>`feat: substitute the console APIs that need no screen` | ✅（部分） |
 | 9 | 测试 | cmd/python/大输出/stderr/无 conhost/孙进程 | ⏳ |
 | 10 | 文档 | README 定稿 | ⏳ |
 
 ### 5.1 已完成部分的实际状态（截至本次提交）
 
-- `cargo build --release` 绿；`cargo test --release` = **134 passed / 0 failed / 9 ignored**
+- `cargo build --release` 绿；`cargo test --release` = **138 passed / 0 failed / 9 ignored**
   （其中 **88 条来自 vendor 进来的 `vt-parser` / `term-input`**，它们自带的测试在本机全绿；
-  9 条 ignored 的全是**故意制造 console host** 的对照组，默认不跑，见 §1.8）。
+  9 条 ignored 的是**故意制造 console host** 的对照组，默认不跑，见 §1.8）。
 - `wbwpty.exe --dump-conhost -- cmd.exe /c echo hello` 实测：**hello 原样输出，exit=0，conhost.exe 数量不变**。
 - **三代进程树实测无 console host**（`probe → probe → ping`）：第三代的 `DETACHED_PROCESS`
   是从**后代自己 payload 里发布的 `WBWPTY_HOOK_FLAGS`** 读出来的，不是"碰巧没弹窗"。
   见 §1.7 与 `tests/descendant_injection.rs`。
-- `--shim` **目前是空承诺**：payload 只读 `WBWPTY_SHIM` 拿去打日志，
-  §1.5 描述的那套 `GetConsoleMode` / `WriteConsoleW` 替身一行都没写。
+- `--shim` **现在是真的了**（第一批）：`WriteConsoleW` / `WriteConsoleA` / `GetConsoleMode` /
+  `SetConsoleMode` / `AllocConsole` / `FreeConsole` / `AttachConsole` 的导入槽被改写，
+  实测 `WriteConsoleW` 的输出真的进了管道，而关掉 shim 同一个调用什么也不产生
+  （`tests/console_shim.rs`，正反两条都断言）。
+  **仍未实现**：需要屏幕的那一族（`GetConsoleScreenBufferInfo` 等），见 §1.5。
 - 手工映射每一段机器码都有**真正执行**的单测（不是只比对字节），`stub.rs` 已简化为只负责"调 DllMain"，不再携带死代码。
 - 核心注入失败根因已定位：**stub 用 `r9d` 而不是 `edx` 传 `DLL_PROCESS_ATTACH`**（Win64 第 2 参数在 `rdx`），导致 `DllMain` 拿到假 reason 直接 return TRUE 而不做任何事；修完后 stub 调用真实成功。
 - **Stage 7 完成并实测有效**：同样的探针、同样的管道、同样的写，

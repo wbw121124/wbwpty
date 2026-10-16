@@ -16,6 +16,7 @@
 //! Everything except the last 10 instructions is done and tested on the host
 //! side; the target-side stub lives in [`stub`].
 
+pub mod console;
 pub mod exports;
 pub mod hook;
 pub mod iat;
@@ -30,6 +31,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::child::Child;
 
+pub use console::{install_console_hook, ConsoleApi, ConsoleHookReport, CONSOLE_APIS};
 pub use hook::{install_create_process_hook, HookReport};
 pub use iat::ImportSlot;
 pub use pe::PeImage;
