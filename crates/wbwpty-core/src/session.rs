@@ -942,6 +942,17 @@ impl Session {
         self.child.wait().ok()
     }
 
+    /// Waits for the target, but gives up after `timeout`.
+    ///
+    /// [`Self::wait`] has no timeout, which is right for a session that is going
+    /// to finish and wrong for a caller that has to stay responsive: a target
+    /// waiting on a gate that is never opened would hang the caller rather than
+    /// fail. `None` means it did not finish in time, which is not the same as "it
+    /// exited with no code".
+    pub fn wait_for(&self, timeout: std::time::Duration) -> Option<u32> {
+        self.child.wait_timeout(timeout).ok().flatten()
+    }
+
     /// Runs the whole session on the calling thread: output until EOF, then the
     /// exit code. This is the entry point the CLI uses.
     pub fn run_to_completion(self) -> Result<u32> {
