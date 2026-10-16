@@ -132,6 +132,7 @@ pub fn install_create_process_hook(
     payload_dll: &Path,
     report: &InjectionReport,
     std_handles: [u64; 3],
+    explicit_environment: bool,
 ) -> Result<Option<HookReport>> {
 
     let pid = proc.pid().unwrap_or(0);
@@ -175,8 +176,19 @@ pub fn install_create_process_hook(
     for (slot, value) in packed.chunks_mut(8).zip(std_handles) {
         slot.copy_from_slice(&value.to_le_bytes());
     }
-    proc.write_bytes(report.image_base + handles_rva as u64, &packed)
+proc.write_bytes(report.image_base + handles_rva as u64, &packed)
         .context("publishing the session standard handles")?;
+
+    // Whether the substitute should hand the child an explicit environment
+    // block. Generation 1 always does; generation 2 currently forwards the
+    // target's `NULL`. The grandchild's stdout does not bind and the two
+    // generations differ here, so it is a switch rather than an assumption.
+    let env_rva = rva("WBWPTY_EXPLICIT_ENVIRONMENT")?;
+    proc.write_bytes(
+        report.image_base + env_rva as u64,
+        &u32::from(explicit_environment).to_le_bytes(),
+    )
+    .context("publishing the explicit-environment choice")?;
 
     let mut intercepts = Vec::new();
     for t in TARGETS {

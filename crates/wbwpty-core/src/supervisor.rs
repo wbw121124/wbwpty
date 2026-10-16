@@ -114,6 +114,8 @@ pub struct SupervisorConfig {
     /// numbers the target's own substitution was given: inherited handle values
     /// are identical on both sides of a `CreateProcess`.
     pub std_handles: [u64; 3],
+    /// Mirrors [`crate::session::SessionConfig::explicit_environment`].
+    pub explicit_environment: bool,
     /// How often to look for new processes.
     ///
     /// This is the other half of the race in README §1.7: even with injection
@@ -142,11 +144,26 @@ impl SupervisorConfig {
     /// would stall every other descendant behind it. A process that has not
     /// settled simply comes back on the next poll.
     pub fn new(root_pid: u32, payload_path: PathBuf, std_handles: [u64; 3]) -> Self {
+        Self::with_environment(root_pid, payload_path, std_handles, false)
+    }
+
+    /// [`Self::new`], with the explicit-environment choice made up front.
+    ///
+    /// Taken here rather than per-descendant so a session either hands every
+    /// child the same treatment or none does - a tree where generation 2 differs
+    /// from generation 3 would not be comparable between runs.
+    pub fn with_environment(
+        root_pid: u32,
+        payload_path: PathBuf,
+        std_handles: [u64; 3],
+        explicit_environment: bool,
+    ) -> Self {
         Self {
             root_pid,
             payload_path,
             payload_image: Arc::new(Vec::new()),
             std_handles,
+            explicit_environment,
             poll: Duration::from_millis(3),
             loader_wait: Duration::from_millis(150),
             inject_poll: Duration::from_millis(1),
@@ -397,6 +414,7 @@ fn attempt(config: &SupervisorConfig, pid: u32, depth: usize, attempt_no: u32) -
         &config.payload_path,
         &report,
         config.std_handles,
+        config.explicit_environment,
     ) {
         Ok(Some(_)) => (true, None),
         Ok(None) => (

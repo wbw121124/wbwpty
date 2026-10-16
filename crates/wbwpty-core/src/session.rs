@@ -74,6 +74,16 @@ pub struct SessionConfig {
     pub pump_input: bool,
     /// Report injection and shim decisions on stderr.
     pub verbose: bool,
+    /// Hand every child an explicit environment block instead of letting it
+    /// inherit, and flag it `CREATE_UNICODE_ENVIRONMENT`.
+    ///
+    /// Generation 1 does this unconditionally. Generation 2 forwards whatever
+    /// the target passed - `NULL` for `cmd.exe`, meaning "inherit mine" - and the
+    /// grandchild's stdout does not bind while generation 1's does. The two
+    /// generations differ here and nowhere else that has survived scrutiny, so
+    /// this is a switch to make the difference observable rather than a
+    /// preference: `NULL` is well defined and is not known to be wrong.
+    pub explicit_environment: bool,
     /// Virtual terminal geometry reported to the payload.
     pub rows: u16,
     pub cols: u16,
@@ -90,6 +100,7 @@ impl Default for SessionConfig {
             cover_descendants: true,
             pump_input: true,
             verbose: false,
+            explicit_environment: false,
             rows: 25,
             cols: 80,
         }
@@ -332,6 +343,7 @@ impl Session {
                 &dll_path,
                 injection,
                 std_handles,
+                config.explicit_environment,
             ),
             None => Ok(None),
         };
@@ -379,6 +391,7 @@ impl Session {
                 );
                 supervisor.payload_image = Arc::new(dll_image.unwrap_or_default());
                 supervisor.verbose = config.verbose;
+                supervisor.explicit_environment = config.explicit_environment;
                 Some(crate::supervisor::DescendantSupervisor::spawn(supervisor))
             }
             _ => None,

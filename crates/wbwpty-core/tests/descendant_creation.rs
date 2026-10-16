@@ -271,6 +271,8 @@ struct Row {
 /// `DETACHED_PROCESS` into `dwCreationFlags` *and* fill in `STARTF_USESTDHANDLES`
 /// with the parent's handles. Doing either on its own leaves one promise broken.
 #[test]
+#[ignore = "probes console allocation and spawns a descendant without our interception; \
+            a console host window appears on the user's desktop"]
 fn detached_process_with_std_handles_is_what_a_descendant_needs() {
     const WINNING: &[&str] = &["--std-handles", "detached"];
 

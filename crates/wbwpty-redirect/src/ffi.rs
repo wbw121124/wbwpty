@@ -59,6 +59,15 @@ pub const FILE_TYPE_UNKNOWN: DWORD = 0x0000_0000;
 pub const FILE_TYPE_DISK: DWORD = 0x0000_0001;
 pub const FILE_TYPE_CHAR: DWORD = 0x0000_0002;
 pub const FILE_TYPE_PIPE: DWORD = 0x0000_0003;
+/// `CREATE_UNICODE_ENVIRONMENT`, `winbase.h`.
+///
+/// Generation 1 passes an explicit Unicode environment block and sets this;
+/// generation 2 forwards whatever the target passed, which for `cmd.exe` is
+/// `lpEnvironment = NULL` and no such flag. `lpEnvironment = NULL` means
+/// "inherit mine" and needs no flag, so this is bookkeeping the kernel does not
+/// require - it is here because the two generations differ in it and the
+/// difference has to be testable from inside the payload.
+pub const CREATE_UNICODE_ENVIRONMENT: DWORD = 0x0000_0400;
 pub const FILE_ATTRIBUTE_NORMAL: DWORD = 0x0000_0080;
 pub const FILE_FLAG_OVERLAPPED: DWORD = 0x4000_0000;
 pub const HANDLE_FLAG_INHERIT: DWORD = 0x0000_0001;
@@ -349,6 +358,13 @@ extern "system" {
     /// `kernel32` (fileapi). Returns one of the `FILE_TYPE_*` constants.
     pub fn GetFileType(hFile: HANDLE) -> DWORD;
     pub fn GetEnvironmentVariableW(lpName: LPCWSTR, lpBuffer: LPWSTR, nSize: DWORD) -> DWORD;
+    /// `kernel32` (environment). Returns a block owned by the caller, or NULL.
+    ///
+    /// The block must be released with [`FreeEnvironmentStringsW`] and is only
+    /// borrowed by `CreateProcessW`, which copies it - so the release happens
+    /// after the call returns, not before.
+    pub fn GetEnvironmentStringsW() -> LPWSTR;
+    pub fn FreeEnvironmentStringsW(lpenv: LPWSTR) -> BOOL;
     pub fn GetModuleFileNameW(hModule: HMODULE, lpFilename: LPWSTR, nSize: DWORD) -> DWORD;
 
     // kernel32 (fileapi)

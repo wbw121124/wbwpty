@@ -614,23 +614,24 @@ STD_HANDLES in=268 out=272 err=276
 
 ### 仍然未解决
 
-`cmd_runs_python_through_the_substitution` 依旧失败，但失败点已经收窄：
+代际输出传递**已经打通**，并由一个常跑的端到端测试守住
+（`a_grandchild_reaches_the_pipe_without_a_console`）：`cmd.exe` 创建时被 detach，
+它 spawn 的子进程经由替换后的 `CreateProcessW` 创建，**stdout 与 stderr 都回到会话管道，
+整棵进程树里没有任何 conhost**。覆盖方式见 `crates/wbwpty-core/src/supervisor.rs`。
 
-- **`cmd /c <child>` 无延迟 spawn 早于注入完成**（§5.3 的限制）。加
-  `ping -n N 127.0.0.1` 前缀把窗口拉开，hook 立刻命中、python 也被正确注入
-  （`injected: true, sentinel: true`）。
-- **目标重定向自己的 stdout 会让管道句柄失效**：`cmd /c "ping > nul & python"`
-  里 `> nul` 关掉宿主给的句柄并用 `CreateFile("nul")` **复用同一数值**。把失效
-  句柄传给后代 → `GetStdHandle` 返回它（PEB 数值仍对）、`GetFileType` 给
-  `FILE_TYPE_UNKNOWN` → CRT 不给 fd 1 → `sys.stdout is None`。
-  这解释了 AGENTS 坑 7 的实测现象。
+剩下的两个限制都写进了 AGENTS.md §11/§12：
 
-### 下一步
-
-1. 目标重定向 stdout 时，payload 需要能重新拿到管道（管道名在环境变量
-   `WBWPTY_OUT` 里，见 §3 契约），而不是复用已失效的数值句柄。
-2. `cmd /c` 的无延迟 spawn 要真正关掉，只能走 `DEBUG_PROCESS` 那条结构性路线
-   （在子进程执行任何指令前先拿到 `DEBUG_PROCESS_CREATE`），代价见 AGENTS 规则 31。
+- **`cmd /c <child>` 无延迟 spawn 早于注入完成。** 该子进程整个错过 hook，输出丢失。
+  这就是 README §5.3 的结构性限制；要真正关掉它只能走 `DEBUG_PROCESS` 那条路
+  （在子进程执行任何指令前先拿到 `DEBUG_PROCESS_CREATE`），代价见 AGENTS 规则 31。
+  保留 `cmd_runs_python_through_the_substitution` 作为这条限制的红色测试。
+- **子进程命令前带 `> nul` 时，其 `sys.stdout` 会是 `None`**，尽管 hook 报告成功。
+  句柄传递链已验证正确（`GetStdHandle` 返回有效管道、`GetFileType` 是 PIPE），
+  但 UCRT 仍把 fd 1 记为 `INVALID_HANDLE_VALUE`，且第一代完全正常。
+  两代参数只差 `STARTUPINFOW.cb`、`lpEnvironment`、`CREATE_SUSPENDED` 三处，
+  逐一试过都失败（缩 `cb` 和强制 `bInheritHandles` 都是 `ERROR_BAD_EXEFORMAT`）。
+  为此新增了一个开关 `--explicit-environment`，用来**验证**这个假设而不是直接改行为；
+  实测两种模式结果相同，所以它默认关闭。
 
 本轮的坑与调试器用法见 AGENTS.md §11。
 

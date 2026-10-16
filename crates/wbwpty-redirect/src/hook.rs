@@ -92,6 +92,18 @@ pub static mut WBWPTY_HOOK_STATS: u32 = 0;
 #[no_mangle]
 pub static mut WBWPTY_HOOK_FLAGS: [DWORD; 2] = [0, 0];
 
+/// Whether to hand the child an explicit environment block.
+///
+/// Set by the host, and a question rather than an answer: generation 1 always
+/// passes one (with `CREATE_UNICODE_ENVIRONMENT`), while generation 2 forwards
+/// whatever the target passed, which for `cmd.exe` is `lpEnvironment = NULL`.
+/// `NULL` means "inherit mine" and is well defined, so there is no reason to
+/// prefer either - but the two generations differ here and the grandchild's
+/// stdout does not bind, so this makes the difference testable one run at a time
+/// instead of a guess baked into the code.
+#[no_mangle]
+pub static mut WBWPTY_EXPLICIT_ENVIRONMENT: u32 = 0;
+
 type CreateProcessW = unsafe extern "system" fn(
     lp_application_name: *const u16,
     lp_command_line: *mut u16,
@@ -141,6 +153,38 @@ unsafe fn note_result(ok: BOOL) {
 /// that produces a console host is exactly what this project exists to prevent.
 unsafe fn force_flags(dw_creation_flags: DWORD) -> DWORD {
     (dw_creation_flags & !ffi::CREATE_NEW_CONSOLE) | ffi::DETACHED_PROCESS
+}
+
+/// Decides what environment block to pass, and whether to flag it as Unicode.
+///
+/// Returns `(block, flags)`. When the target passed `NULL` - "inherit mine" -
+/// and [`WBWPTY_EXPLICIT_ENVIRONMENT`] is set, the inherited environment is
+/// materialised with `GetEnvironmentStringsW` and flagged, because that is what
+/// generation 1 does. Otherwise the caller's `NULL` is left alone.
+///
+/// The block belongs to the caller of `CreateProcessW` only for the duration of
+/// the call; the kernel copies it, so [`release_environment`] runs straight
+/// after.
+unsafe fn resolve_environment(lp_environment: *const c_void, flags: DWORD) -> (*const c_void, DWORD) {
+    if !lp_environment.is_null() || WBWPTY_EXPLICIT_ENVIRONMENT == 0 {
+        return (lp_environment, flags);
+    }
+    let block = ffi::GetEnvironmentStringsW();
+    if block.is_null() {
+        return (lp_environment, flags);
+    }
+    (block as *const c_void, flags | ffi::CREATE_UNICODE_ENVIRONMENT)
+}
+
+/// Releases a block obtained from [`resolve_environment`], if one was made.
+///
+/// # Safety
+/// Must only be called with the pair `resolve_environment` returned, and only
+/// once, after the `CreateProcessW` call it was handed to has returned.
+unsafe fn release_environment(resolved: *const c_void, original: *const c_void) {
+    if !resolved.is_null() && resolved != original {
+        ffi::FreeEnvironmentStringsW(resolved as *mut u16);
+    }
 }
 
 /// Points `si` at the session's three handles.
@@ -353,6 +397,7 @@ pub unsafe extern "system" fn create_process_w(
 
     publish_handles_w(si);
     let flags = force_flags(dw_creation_flags);
+    let (environment, flags) = resolve_environment(lp_environment, flags);
     note_call(flags);
 
     let ok = original(
@@ -365,11 +410,12 @@ pub unsafe extern "system" fn create_process_w(
         // handle inheritance on, and nothing in it requires turning it off.
         b_inherit_handles,
         flags,
-        lp_environment,
+        environment,
         lp_current_directory,
         si,
         lp_process_information,
     );
+    release_environment(environment, lp_environment);
 
     note_result(ok);
     ok

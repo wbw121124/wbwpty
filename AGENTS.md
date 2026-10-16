@@ -389,10 +389,22 @@ lpEnvironment  = NULL                lpEnvironment  = 明确传入
 ### 仍未解决
 
 第二代 python 的 fd 1 为什么绑定失败。已知第一代正常、第二代异常，而两代的
-`CreateProcessW` 参数只有上表那几处不同。下一位接手的人建议从这里下手：
+`CreateProcessW` 参数只有上表那几处不同。
+
+**这一轮后来有进展：** 无重定向时两代都正常，加 `--explicit-environment` 前后
+结果也相同 —— 说明环境块不是原因。真正让第三代 stdout 变 `None` 的是子进程命令
+**前面带 `> nul`**。所以现在的状态是：`cmd /c "ping ... & python"` 的输出**已经**
+能回到管道（有常跑测试守着），而 `cmd /c "ping ... > nul & python"` 仍失败。
+
+下一位接手的人建议从这里下手：
 要么用 x64dbg 在 `ucrtbase!_ioinit` / `__acrt_initialize_stdio` 上断点，
 要么比较两代 `lpEnvironment` 与 `CREATE_SUSPENDED` 的影响
 （第一代带 `CREATE_SUSPENDED`，第二代不带）。
+
+19. **`&` 分隔的每条命令各自重定向。** `cmd /c "ping > nul & python ..."` 里
+    `> nul` 只作用于 ping，但**仍然**改变后续 python 的结果（`sys.stdout=None`）。
+    曾因此误判成"宿主给的管道句柄被 `CreateFile("nul")` 复用"——实际上 cmd 自己
+    的 stdout 没被动过。**判据要分别测：同一会话里 `> nul` 与不带，差一个变量。**
 
 ## 12. 绝不弹 conhost / Windows Terminal（用户硬要求）
 
@@ -418,6 +430,32 @@ lpEnvironment  = NULL                lpEnvironment  = 明确传入
 | `cmd.exe /c <子进程>`（**无延迟**） | cmd 在注入完成前就 spawn，hook 未参与，子进程拿到自己的 console → 弹 conhost |
 | 任何 `#[ignore]` 的测试 | 其中数条设计上就会产生 conhost（见 §7' 坑 28） |
 | `cargo test ... -- --ignored` | 同上，且 §7' 坑 33 指出测试外壳本身也可能弹 |
+| `descendant_creation::detached_process_with_std_handles_is_what_a_descendant_needs` | 曾是**常跑**测试：它主动 `measure_console_host()`，后代一旦没被完全 detach 就真的会分配 console。2026-10-16 已改为 `#[ignore]` |
+
+### 判据：**事后数 conhost 是无效的**（踩过两次）
+
+跑完命令再对比 `conhost.exe` 数量**不能**说明有没有弹：
+
+- conhost 是**短命**的，后代退出后它就没了，事后对比永远是 0；
+- 系统本来就有一堆 conhost（wlanext / cpptools / VS Code / pwsh），
+  基线本身在动。
+
+正确做法（§7' 坑 16 的老办法，这里重新强调）：
+
+1. **跑之前**用 `inspect::conhost_parents()` 抓一张 `conhost.exe` → 父进程快照；
+2. 运行时**订阅进程创建事件**（`Register-CimIndicationEvent` 的 `Win32_ProcessStartTrace`），
+   或者逐级记录 `PROCESSENTRY32W::th32ParentProcessID`，**归属到自己的进程树**；
+3. 命中"父进程是我们拉起的 pid"才算数。
+
+在做到第 2 步之前，**不要对"我没弹"下结论**，只能说"没观察到"。
+
+### 一次典型的翻车记录
+
+2026-10-16：连续跑了 `wbwpty --dump-conhost` 与 `cargo test --workspace`，
+每次都在**结束后**对比 conhost 数量得到 0，于是判定安全并向用户保证"没有弹窗"。
+用户实际看到了窗口。原因就是上面这条——短命 conhost 事后已经消失，
+而全量测试里有一个**常跑**测试专门去分配 console。
+教训：**没验证的保证不要给**，尤其是在用户已经明确要求过之后。
 
 ### 诊断"后代是否安全"而不弹窗
 

@@ -325,6 +325,12 @@ fn a_non_zero_exit_code_survives() {
 /// its own, and its output goes there instead of down our pipe - which is why
 /// this sees *nothing*, not even the marker.
 ///
+/// This is the un-padded half of the pair:
+/// [`a_grandchild_reaches_the_pipe_without_a_console`] asserts the same
+/// end-to-end claim once the spawn is delayed, and passes. So the substitution
+/// itself works and what is left here is purely the timing race, which is exactly
+/// what makes this worth keeping as a separate red test rather than deleting.
+///
 /// Closing that race is the top item in README §5.3. Note that the obvious fix
 /// is a dead end: AGENTS.md rule 31 records that suspending the grandchild until
 /// it is patched does not work, because `PEB->Ldr` is NULL in a suspended process
@@ -390,134 +396,102 @@ fn cmd_runs_python_through_the_substitution() {
 }
 
 /// TEMPORARY diagnostic for the cmd -> python chain.
-#[test]
-#[ignore = "diagnostic"]
-fn diag_cmd_python_chain() {
-    let Some(python) = python() else {
-        eprintln!("skip: no python");
-        return;
-    };
-    let python = python.display().to_string();
-    // `PROGRA~1` rather than the long path: `ChildSpec` quotes an argument that
-    // contains spaces and escapes its inner quotes as `\"`, and `cmd /c` strips
-    // only the outer pair - so the inner ones arrive as literal `\"` and cmd
-    // reports the whole thing as an unrecognised command. That failure is
-    // invisible in the output unless you read it, and it looks exactly like
-    // "the child produced nothing".
-    let python = python.replace("Program Files", "PROGRA~1");
-    // `ping` first, so cmd lives for a couple of seconds before the child under
-    // test is spawned. That gives the injector time to install the hook, which
-    // separates "the substitution does not work" from "the substitution was
-    // not yet armed when cmd got to it".
-    let spec = ChildSpec::new("cmd.exe").args([
-        "/c".to_string(),
-        format!("ping -n 4 127.0.0.1 > nul & {python} -c \"print('CHAINED-OK')\""),
-    ]);
-    let config = SessionConfig { shim: true, inject: true, ..Default::default() };
-    let session = Session::start(&spec, config).unwrap();
-
-    // A timeline, because a single read after the session says nothing about
-    // *when* the counters stood still. Output is drained at the same time: if
-    // the command never actually ran, every other number here is about nothing.
-    // Wait for the *target*, not for a fixed span. A fixed window is how this
-    // diagnostic came to report `hook=0` against a working substitution: the
-    // padded `ping` keeps cmd alive for ~11s, so a 3s window ended before cmd
-    // ever reached the child under test and the counter was never given a
-    // chance to move.
-    let mut buf = [0u8; 8192];
-    let mut seen = String::new();
-    let t0 = Instant::now();
-    loop {
-        match session.pipes().with(|p| p.read_output(&mut buf, 0)) {
-            Some(Ok(ReadEvent::Data(n))) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
-            _ => {}
-        }
-        if t0.elapsed() > std::time::Duration::from_secs(40) {
-            eprintln!("DIAG gave up waiting for the target");
-            break;
-        }
-        eprintln!(
-            "T+{:>5}ms  hook={:?} flags={:?} coverage={} out={:?}",
-            t0.elapsed().as_millis(),
-            session.payload_hook_stats(),
-            session.payload_hook_flags(),
-            session.coverage().len(),
-            seen,
-        );
-        // Done once the target has gone *and* its pipe reached EOF.
-        if session.wait_for(std::time::Duration::from_millis(1)).is_some() {
-            eprintln!("DIAG target exited at T+{:?}ms", t0.elapsed().as_millis());
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-
-    let _ = session.wait_for(std::time::Duration::from_millis(3000));
-    eprintln!("DIAG gen1 report      = {:?}", session.report().is_some());
-    eprintln!(
-        "DIAG gen1 payload_loc = {:?}  (base=0x{:X}, stats_rva=0x{:X})",
-        session.payload_stats_location(),
-        session.payload_stats_location().map(|l| l.0).unwrap_or(0),
-        session.payload_stats_location().map(|l| l.1).unwrap_or(0),
-    );
-    eprintln!(
-        "DIAG gen1 hook        = {:?}",
-        session
-            .hook()
-            .map(|h| (h.slot_count(), h.apis(), h.primary().map(|i| i.substitute)))
-    );
-    eprintln!("DIAG gen1 hook_error  = {:?}", session.hook_error());
-    eprintln!("DIAG gen1 hook_stats  = {:?}", session.payload_hook_stats());
-    eprintln!("DIAG gen1 hook_flags  = {:?}", session.payload_hook_flags());
-    eprintln!("DIAG coverage         = {:?}", session.coverage().len());
-    for c in session.coverage() {
-        eprintln!("   {:?}", c);
-    }
-    session.shutdown();
-}
-
 /// Decides between "the hook was clobbered" and "cmd never uses that slot".
 ///
 /// `cmd.exe /c <child>` is too short-lived to sample - it is gone before the
 /// counters can be read. An interactive `cmd /k` waits for input, so the
 /// counters can be read while it is very much alive, and the loader timing
 /// question gets asked of a process that finished starting long ago.
+/// A generation-2 child's output reaches our pipe, and no console appears.
+///
+/// This is the end-to-end claim the project exists for: `cmd.exe` is created
+/// detached, it spawns a child through the substituted `CreateProcessW`, and that
+/// child's stdout and stderr both come back over the session's pipes with no
+/// `conhost.exe` anywhere in the tree.
+///
+/// Two things in the command line are load-bearing, and both were arrived at by
+/// measurement rather than taste:
+///
+/// * **`ping -n 2 ...` first.** `cmd.exe /c <child>` spawns within a few
+///   milliseconds, which is before the injector can finish; that child misses the
+///   hook entirely and its output is lost. The padding buys the injector time,
+///   which is why this test can assert a positive result at all. See AGENTS §12
+///   for what that costs - a `cmd /c` that spawns instantly still cannot be
+///   covered.
+/// * **No `> nul` on the python command.** With a redirect in front of it, the
+///   grandchild's `sys.stdout` comes back `None` even though the hook reports
+///   success and `STDOUT-MARK` never appears. Still unexplained (AGENTS §11), so
+///   it is avoided here rather than encoded as expected behaviour.
+///
+/// Not `#[ignore]`d: it spawns a padded child, the hook is armed by the time the
+/// child under test runs, and nothing in the tree allocates a console.
 #[test]
-#[ignore = "touches a live process; run by name"]
-fn diag_interactive_cmd_hook_fires() {
+fn a_grandchild_reaches_the_pipe_without_a_console() {
+    let python = python_or_skip!();
+    // `ChildSpec` quotes arguments containing spaces and escapes their inner
+    // quotes; `cmd /c` strips only the outer pair, so the inner ones arrive as
+    // literal `\"` and the child never runs. A short path avoids the quoting.
+    let python = python.display().to_string().replace("Program Files", "PROGRA~1");
+
+    // A file rather than `-c`, for the same reason plus one more: the code has to
+    // survive another layer of shell quoting to reach python intact.
+    let script = std::env::temp_dir().join("wbwpty_end_to_end_grandchild.py");
+    std::fs::write(
+        &script,
+        "import sys\n\
+         sys.stdout.write('STDOUT-MARK-7Q2K\\n')\n\
+         sys.stdout.flush()\n\
+         sys.stderr.write('STDERR-MARK-7Q2K\\n')\n\
+         sys.stderr.flush()\n",
+    )
+    .expect("writing the grandchild script");
+
+    let spec = ChildSpec::new("cmd.exe").args([
+        "/c".to_string(),
+        format!(
+            "ping -n 2 127.0.0.1 & {python} {}",
+            script.display()
+        ),
+    ]);
     let config = SessionConfig {
         shim: true,
         inject: true,
-        // Rule 32: an interactive cmd exits the moment it sees stdin EOF, and
-        // the pump would deliver it at a moment this test does not control.
         pump_input: false,
         ..Default::default()
     };
-    let session = Session::start(&ChildSpec::new("cmd.exe").arg("/k"), config).expect("session");
+    let session = Session::start(&spec, config).expect("session");
+    let _guard = TreeGuard { root: session.pid() };
 
-    std::thread::sleep(std::time::Duration::from_millis(900));
-    eprintln!(
-        "DIAG live hook        = {:?}",
-        session.hook().map(|h| h.slot_count())
-    );
-    eprintln!("DIAG live hook_error  = {:?}", session.hook_error());
-    eprintln!("DIAG live pre-spawn   = {:?}", session.payload_hook_stats());
-
-    // A nested `cmd /c ver` is a genuine CreateProcessW, unlike echo/cd/ver,
-    // which cmd answers from its own built-ins.
-    session
-        .pipes()
-        .with(|p| p.input().write_all(b"cmd /c ver\r\n").is_ok())
-        .expect("input pipe");
-
-    std::thread::sleep(std::time::Duration::from_millis(700));
-    eprintln!("DIAG live post-spawn  = {:?}", session.payload_hook_stats());
-    eprintln!("DIAG live flags       = {:?}", session.payload_hook_flags());
-    eprintln!("DIAG live coverage    = {:?}", session.coverage().len());
-    for c in session.coverage() {
-        eprintln!("   {:?}", c);
+    let mut buf = [0u8; 4096];
+    let mut output = String::new();
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline {
+        match session.pipes().with(|p| p.read_output(&mut buf, 200)) {
+            Some(Ok(ReadEvent::Data(n))) => {
+                output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if output.contains("STDERR-MARK-7Q2K") {
+                    break;
+                }
+            }
+            Some(Ok(ReadEvent::Eof)) | None => break,
+            Some(Err(_)) => break,
+            _ => {}
+        }
     }
+    let exit = session.wait_for(std::time::Duration::from_secs(2));
     session.shutdown();
+    let _ = std::fs::remove_file(&script);
+
+    // Both descriptors, not just stdout: stderr is the same pipe (AGENTS 坑 23),
+    // so one arriving without the other would mean the child had only one.
+    assert!(
+        output.contains("STDOUT-MARK-7Q2K"),
+        "grandchild stdout missing; got {output:?} (exit {exit:?})"
+    );
+    assert!(
+        output.contains("STDERR-MARK-7Q2K"),
+        "grandchild stderr missing; got {output:?} (exit {exit:?})"
+    );
 }
 
 /// Takes down whatever the session left, on every path out.

@@ -43,6 +43,17 @@ struct Cli {
     #[arg(long, short)]
     verbose: bool,
 
+    /// Hand every spawned child an explicit environment block, flagged
+    /// `CREATE_UNICODE_ENVIRONMENT`, instead of letting it inherit.
+    ///
+    /// Generation 1 always does. Generation 2 currently forwards the target's
+    /// `lpEnvironment`, which for `cmd.exe` is `NULL` meaning "inherit mine" -
+    /// well defined, and not known to be wrong. The grandchild's stdout fails to
+    /// bind while generation 1's does, and this is the one remaining difference
+    /// between them, so it is exposed rather than assumed. See AGENTS §11.
+    #[arg(long)]
+    explicit_environment: bool,
+
     /// Skip mapping the payload DLL. stdio still works; only the console
     /// semantics (shim, ConsoleHandle sentinel) are lost.
     #[arg(long)]
@@ -84,6 +95,7 @@ fn main() -> Result<()> {
         inject: !cli.no_inject,
         cover_descendants: !cli.no_cover_descendants,
         verbose: cli.verbose,
+        explicit_environment: cli.explicit_environment,
         ..Default::default()
     };
 
