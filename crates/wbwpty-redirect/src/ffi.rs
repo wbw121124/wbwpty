@@ -50,6 +50,15 @@ pub const GENERIC_WRITE: DWORD = 0x4000_0000;
 pub const FILE_SHARE_READ: DWORD = 0x0000_0001;
 pub const FILE_SHARE_WRITE: DWORD = 0x0000_0002;
 pub const OPEN_EXISTING: DWORD = 3;
+/// `GetFileType` result for a handle that names nothing.
+///
+/// Source: `winbase.h` `FILE_TYPE_UNKNOWN`. This is the value that tells us a
+/// handle value in a process parameters block no longer names anything - the
+/// number is still in the block, but the handle table has no entry for it.
+pub const FILE_TYPE_UNKNOWN: DWORD = 0x0000_0000;
+pub const FILE_TYPE_DISK: DWORD = 0x0000_0001;
+pub const FILE_TYPE_CHAR: DWORD = 0x0000_0002;
+pub const FILE_TYPE_PIPE: DWORD = 0x0000_0003;
 pub const FILE_ATTRIBUTE_NORMAL: DWORD = 0x0000_0080;
 pub const FILE_FLAG_OVERLAPPED: DWORD = 0x4000_0000;
 pub const HANDLE_FLAG_INHERIT: DWORD = 0x0000_0001;
@@ -337,6 +346,8 @@ extern "system" {
     pub fn SetHandleInformation(hObject: HANDLE, dwMask: DWORD, dwFlags: DWORD) -> BOOL;
     pub fn SetStdHandle(nStdHandle: DWORD, hHandle: HANDLE) -> BOOL;
     pub fn GetStdHandle(nStdHandle: DWORD) -> HANDLE;
+    /// `kernel32` (fileapi). Returns one of the `FILE_TYPE_*` constants.
+    pub fn GetFileType(hFile: HANDLE) -> DWORD;
     pub fn GetEnvironmentVariableW(lpName: LPCWSTR, lpBuffer: LPWSTR, nSize: DWORD) -> DWORD;
     pub fn GetModuleFileNameW(hModule: HMODULE, lpFilename: LPWSTR, nSize: DWORD) -> DWORD;
 

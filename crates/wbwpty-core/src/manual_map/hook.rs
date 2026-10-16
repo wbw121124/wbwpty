@@ -260,12 +260,11 @@ let target_base = proc.image_base()?;
         // loader that is already done passes on the first check - which keeps
         // the common case down to one extra read instead of a fixed settle.
 let mut consecutive = 0u32;
-        let mut last = 0u64;
         loop {
             let read = proc
                 .read_bytes(first, 8)
                 .with_context(|| format!("reading back the {} slot in pid {pid}", t.api))?;
-            last = u64::from_le_bytes(read.try_into().expect("read 8"));
+            let last = u64::from_le_bytes(read.try_into().expect("read 8"));
             if last == substitute {
                 consecutive += 1;
                 if consecutive >= 2 {

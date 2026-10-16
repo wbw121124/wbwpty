@@ -149,11 +149,29 @@ unsafe fn force_flags(dw_creation_flags: DWORD) -> DWORD {
 /// is what stops a console being allocated for it. Neither half works alone -
 /// see the table at the top of this module.
 unsafe fn publish_handles_w(si: *mut STARTUPINFOW) {
-    let handles = WBWPTY_STD_HANDLES;
+    let h = wbwpty_resolved_handles();
     (*si).dwFlags |= ffi::STARTF_USESTDHANDLES;
-    (*si).hStdInput = handles[0] as HANDLE;
-    (*si).hStdOutput = handles[1] as HANDLE;
-    (*si).hStdError = handles[2] as HANDLE;
+    (*si).hStdInput = h[0] as HANDLE;
+    (*si).hStdOutput = h[1] as HANDLE;
+    (*si).hStdError = h[2] as HANDLE;
+}
+
+/// Resolves the three handles the child will actually receive.
+///
+/// Falls back to reopening the named pipe for any slot whose published handle no
+/// longer names anything. See [`usable_handle`] for why that happens.
+unsafe fn wbwpty_resolved_handles() -> [usize; 3] {
+    let mut out = WBWPTY_STD_HANDLES;
+    if let Some(h) = usable_handle(0, ffi::GENERIC_READ, "WBWPTY_IN") {
+        out[0] = h as usize;
+    }
+    if let Some(h) = usable_handle(1, ffi::GENERIC_WRITE, "WBWPTY_OUT") {
+        out[1] = h as usize;
+    }
+    if let Some(h) = usable_handle(2, ffi::GENERIC_WRITE, "WBWPTY_OUT") {
+        out[2] = h as usize;
+    }
+    out
 }
 
 /// [`publish_handles_w`] for the `A` variant, which has an identical layout.
@@ -176,6 +194,102 @@ unsafe fn publish_handles_a(si: *mut crate::ffi::STARTUPINFOA) {
 unsafe fn have_session_handles() -> bool {
     WBWPTY_STD_HANDLES[1] != 0
 }
+
+/// Longest pipe name this will bother to look for.
+///
+/// `\\.\pipe\` plus a session nonce is comfortably inside this. Fixed capacity
+/// on the stack: rule 3, no allocator.
+const PIPE_NAME_MAX: usize = 128;
+
+/// Longest variable name this will bother to look for, plus its terminator.
+///
+/// 16 is comfortably above `WBWPTY_IN` / `WBWPTY_OUT`, and the length is
+/// asserted below rather than trusted: writing the name into a fixed buffer is
+/// exactly the kind of thing that corrupts the stack silently when the constant
+/// grows and nobody recompiles the check.
+const ENV_NAME_MAX: usize = 16;
+
+/// The session pipe name the host published in the environment.
+///
+/// Both this process and every child inherit it, so a substitute running here
+/// can name the same pipe the child needs.
+unsafe fn env_pipe_name(which: &str, buf: &mut [u16]) -> bool {
+    debug_assert!(which.len() + 1 <= ENV_NAME_MAX, "env name buffer too small");
+    let bytes = which.as_bytes();
+    if bytes.len() + 1 > ENV_NAME_MAX {
+        return false;
+    }
+    let mut name = [0u16; ENV_NAME_MAX];
+    for (i, b) in bytes.iter().enumerate() {
+        name[i] = *b as u16;
+    }
+    name[bytes.len()] = 0;
+
+    let got = ffi::GetEnvironmentVariableW(
+        name.as_ptr(),
+        buf.as_mut_ptr(),
+        buf.len() as u32,
+    );
+    got != 0 && (got as usize) < buf.len()
+}
+
+/// True when `h` still names a pipe this module can hand to a child.
+///
+/// The test is `FILE_TYPE_PIPE`, not merely "not unknown", and the difference
+/// is the whole bug: a target that redirects its own stdout closes the inherited
+/// pipe and then `CreateFile("nul")` reuses the same value. `nul` is a character
+/// device, so `GetFileType` answers `FILE_TYPE_CHAR` and a check for
+/// `FILE_TYPE_UNKNOWN` happily calls that handle "fine" - the child then gets a
+/// device that swallows everything, which is how `sys.stdout` ends up `None`
+/// while `GetStdHandle` still reports a plausible number.
+unsafe fn handle_is_pipe(h: HANDLE) -> bool {
+    !h.is_null() && h != INVALID_HANDLE && ffi::GetFileType(h) == ffi::FILE_TYPE_PIPE
+}
+
+/// Returns a handle the child can actually write to for the given slot.
+///
+/// When the published handle still names a pipe it is used as-is. When it does
+/// not - because the target closed and recycled it - the same named pipe is
+/// reopened by name, which is why the host puts `WBWPTY_IN` / `WBWPTY_OUT` in
+/// the environment rather than only handing over three numbers.
+///
+/// Returns `None` when neither works, and the caller then leaves the child with
+/// whatever it had: a wrong handle is worse than none, and failing to redirect
+/// is a smaller problem than corrupting a program that was working.
+///
+/// # Safety
+/// `slot` is an index into [`WBWPTY_STD_HANDLES`].
+unsafe fn usable_handle(slot: usize, access: DWORD, which: &str) -> Option<HANDLE> {
+    let published = WBWPTY_STD_HANDLES[slot] as HANDLE;
+    if handle_is_pipe(published) {
+        return Some(published);
+    }
+
+    let mut name = [0u16; PIPE_NAME_MAX];
+    if !env_pipe_name(which, &mut name) {
+        return None;
+    }
+    let h = ffi::CreateFileW(
+        name.as_ptr(),
+        access,
+        ffi::FILE_SHARE_READ | ffi::FILE_SHARE_WRITE,
+        core::ptr::null_mut(),
+        ffi::OPEN_EXISTING,
+        // Overlapped, because this runs in the target's `CreateProcess`: a
+        // client that waits for a free server instance would block the caller
+        // and the child would never be created.
+        ffi::FILE_FLAG_OVERLAPPED,
+        INVALID_HANDLE,
+    );
+    if handle_is_pipe(h) {
+        Some(h)
+    } else {
+        None
+    }
+}
+
+/// `INVALID_HANDLE_VALUE`, which is `HANDLE`'s way of saying "no handle".
+const INVALID_HANDLE: HANDLE = -1isize as HANDLE;
 
 /// Substituted for the target's `CreateProcessW`.
 ///
@@ -425,6 +539,7 @@ pub unsafe extern "system" fn create_process_a(
     ok
 }
 
+
 fn zeroed_startup_info() -> STARTUPINFOW {
     // SAFETY: `STARTUPINFOW` is `#[repr(C)]` and every field is a plain integer
     // or pointer, so all-zero bits is a valid value for each of them.
@@ -436,3 +551,5 @@ fn zeroed_startup_info_a() -> crate::ffi::STARTUPINFOA {
     // SAFETY: as above, for `STARTUPINFOA`.
     unsafe { core::mem::zeroed() }
 }
+
+

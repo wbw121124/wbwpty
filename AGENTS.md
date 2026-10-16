@@ -3,6 +3,9 @@
 本文件是给**人类开发者与 AI 编码代理**共同遵守的工程约束。
 动手前请完整读一遍，改完请对照"提交纪律"和"验收要求"自查。
 
+> **用户明确要求：绝对不要在开发过程中弹出 conhost.exe / Windows Terminal 窗口。**
+> 这条高于本文件其它所有测试约定。判断见 §12。宁可少验证，也不要弹窗。
+
 ---
 
 ## 0. 项目一句话
@@ -326,3 +329,110 @@ cargo test --release                  # 相关测试必须全绿
 - x64dbg MCP 只在重启 opencode 后成为原生工具；配置在
   `~/.config/opencode/opencode.jsonc`（`type: "remote"`，`url: .../mcp`），
   没重启前可用 HTTP 桥接脚本直连。
+
+## 11. 2026-10-16 第二轮：第二代 python 的 `sys.stdout` 仍然是 `None`
+
+接着 §7' 那轮继续查。**这一轮没有解决问题，但把问题缩小到了可以逐条排除的范围。**
+
+### 已经用 x64dbg 确认的事实
+
+对着 wbwpty 启动的 `cmd.exe` 在 substitute 上断点，读它实际传给内核的参数：
+
+```
+第二代（cmd 调 substitute）          第一代（宿主直接创建）
+bInheritHandles = 1                  bInheritHandles = 1
+dwCreationFlags = 0x80000            dwCreationFlags = 0x40C
+lpStartupInfo.cb = 0x70 (EX)         lpStartupInfo.cb = 0x68 (普通)
+lpEnvironment  = NULL                lpEnvironment  = 明确传入
+```
+
+- `lpAttributeList` **不是**原因：cmd 那份已经被清空（`dwLength=2, dwFlags=1`），
+  没有 handle list 可言。
+- 句柄**传递链正确**：`GetStdHandle(STDOUT)` 返回的就是我们的管道句柄，
+  `GetFileType` 说是 PIPE。
+- 但 `msvcrt.get_osfhandle(1)` 是 `INVALID_HANDLE_VALUE`，而 fd 0 / fd 2 正常。
+
+### 已排除的假设（都别再试）
+
+| 假设 | 排除依据 |
+| --- | --- |
+| `bInheritHandles` 没生效 | 断点读到 `1`，句柄确实可继承 |
+| attribute list 限制了继承 | list 已清空，`dwLength=2` |
+| 句柄失效（nul 复用） | `GetFileType` 返回 PIPE，是活句柄 |
+| shim 干扰 | `--no-shim` 同样复现 |
+| UCRT 对无 console 的固有行为 | 用 Python `subprocess` 在同样 flags 下创建第二代，**fd 全部正常** |
+
+### 试过并失败的改法
+
+- **把 `STARTUPINFOW.cb` 从 `0x70` 缩到 `0x68`**：复制结构 + 缩 `cb` 两步都做，
+  `CreateProcessW` 直接返回 `ERROR_BAD_EXEFORMAT`（"系统无法执行指定的程序"）。
+  只做复制不缩 `cb` 同样报错（内核多读 8 字节栈垃圾）。
+  **第一代用的就是 `cb=0x68` 却正常，所以 `cb` 不是根因**，这个方向是死路。
+- **强制 `bInheritHandles = TRUE`**：与 attribute list 冲突，`ERROR_BAD_EXEFORMAT`。
+
+### 新增的坑
+
+15. **`FILE_TYPE_UNKNOWN` 不是"句柄失效"的判据。** 目标重定向 stdout 时
+    `CreateFile("nul")` 复用句柄值，而 `nul` 是**字符设备**，
+    `GetFileType` 给 `FILE_TYPE_CHAR` 而不是 `UNKNOWN`。判据必须写成
+    `== FILE_TYPE_PIPE`，否则会把 nul 当成好句柄直接用掉。
+16. **固定栈缓冲写环境变量名，越界是静默的 UB。** 曾写成
+    `let mut name = [0u16; 8]` 去放 `"WBWPTY_IN"`（9 字符 + null），
+    栈被写坏、命令挂死 300 秒。加 `debug_assert!` + 长度拒绝，不要只靠常量对齐。
+17. **在目标进程里 `CreateFileW` 打开命名管道必须带 `FILE_FLAG_OVERLAPPED`。**
+    否则 client 端会同步等待空闲的 server 实例；这段代码跑在目标的
+    `CreateProcess` 里，一等就是"子进程永远不被创建"。
+18. **`sys.stdout is None` 只说明 CRT 没给 fd 1 分配句柄，不说明句柄无效。**
+    必须同时看 `GetStdHandle`（读 PEB）和 `get_osfhandle`（读 CRT fd 表），
+    两者不一致时结论完全相反。
+
+### 仍未解决
+
+第二代 python 的 fd 1 为什么绑定失败。已知第一代正常、第二代异常，而两代的
+`CreateProcessW` 参数只有上表那几处不同。下一位接手的人建议从这里下手：
+要么用 x64dbg 在 `ucrtbase!_ioinit` / `__acrt_initialize_stdio` 上断点，
+要么比较两代 `lpEnvironment` 与 `CREATE_SUSPENDED` 的影响
+（第一代带 `CREATE_SUSPENDED`，第二代不带）。
+
+## 12. 绝不弹 conhost / Windows Terminal（用户硬要求）
+
+> 这是用户 2026-10-16 明确提出的要求，优先级高于本文件其它测试约定。
+
+**弹窗的来源不是"测试"，是"目标真的分配了 console"。** 一旦某个后代没拿到
+`DETACHED_PROCESS`，内核就会给它拉起一个 `conhost.exe`；从有桌面的进程
+（pwsh / 终端）启动时，那个窗口就会出现在用户屏幕上。
+
+### 哪些命令**安全**（实测 conhost delta = 0）
+
+| 场景 | 是否弹窗 |
+| --- | --- |
+| `wbwpty --dump-conhost -- cmd.exe /c echo hello`（§6 验收） | 安全 |
+| `cargo test --workspace --release`（12 个 ignored 不跑） | 安全 |
+| `cmd.exe /c "ping -n N 127.0.0.1 > nul & <子进程>"`（有延迟，hook 来得及装上） | 安全 |
+| 第一代目标（`wbwpty -- python.exe ...`） | 安全 |
+
+### 哪些命令**会弹窗**，禁止随手运行
+
+| 场景 | 原因 |
+| --- | --- |
+| `cmd.exe /c <子进程>`（**无延迟**） | cmd 在注入完成前就 spawn，hook 未参与，子进程拿到自己的 console → 弹 conhost |
+| 任何 `#[ignore]` 的测试 | 其中数条设计上就会产生 conhost（见 §7' 坑 28） |
+| `cargo test ... -- --ignored` | 同上，且 §7' 坑 33 指出测试外壳本身也可能弹 |
+
+### 诊断"后代是否安全"而不弹窗
+
+**不要靠跑一次看有没有弹窗来发现。** 顺序应该是：
+
+1. 先用 `-v`（`--verbose`）读 **文字输出**：`descendant ... injected=true
+   sentinel=true` 且 `hook calls>0` 才说明后代被接管了。
+2. `-v` 里出现 `descendant conhost.exe depth 2` → **已经弹了**，立刻停止，
+   不要继续加 `-v` 重跑。
+3. 确认需要跑时，**先在命令里带 `--dump-conhost` 并把命令贴给用户征得同意**，
+   一次跑完，不要为了"再看一次细节"重跑。
+
+### 变通办法
+
+- 要验证后代逻辑，先把目标换成**有延迟**的形式（`ping -n 4 ... &`），
+  这条路径实测不会弹。
+- 需要在**完全没有 console** 的环境里跑测试时，用任务计划或服务方式启动，
+  不要用 `Start-Process cmd.exe`（那本身就会分配 console，见 §7' 坑 33）。
