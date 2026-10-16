@@ -96,6 +96,9 @@ cargo test --release                  # 相关测试必须全绿
   但仍要确认 `git add -A` 之后 `git status --short` 是干净且只有预期文件）。
 - 最终必须 `git push -u origin main`（remote: `https://github.com/wbw121124/wbwpty.git`）。
   若凭证不可用，输出完整 `git log --oneline` + 可直接粘贴的 push 命令，**不许谎称已 push**。
+- **已知例外**：`a137298`（message 是 `???`）与 `4ede9bb`（message 是 `awa`）两条不符合本节格式。
+  它们在 2026-10-16 之前就已推到 origin，2026-10-16 决定**不重写历史**
+  （改已发布历史需要 force-push，风险大于收益）。记在这里，别再"顺手修一下"。
 
 ## 8. 代码风格
 
