@@ -754,6 +754,16 @@ impl Session {
         rva.and_then(|rva| self.read_payload_u32(rva))
     }
 
+    /// Where the hook counters live: `(payload image base, RVA)`.
+///
+/// The two halves have to be paired against each other and against the payload
+/// on disk; a mismatch reads a zero-filled address and looks exactly like a
+/// hook that never fired. Exposed for the diagnostics that have to check that
+/// without re-deriving the layout.
+    pub fn payload_stats_location(&self) -> Option<(u64, u32)> {
+        Some((self.report.as_ref()?.image_base, self.hook_stats_rva?))
+    }
+
     pub fn pid(&self) -> u32 {
         self.child.pid
     }

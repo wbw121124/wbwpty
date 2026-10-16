@@ -30,7 +30,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::manual_map::iat::{self, ImportSlot};
 use crate::manual_map::remote::RemoteProcess;
-use crate::manual_map::InjectionReport;
+use crate::manual_map::{InjectionReport, PeImage};
 
 /// One intercepted API.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,15 +186,47 @@ pub fn install_create_process_hook(
         let slots = iat::find_imports(&target_image, &[t.api])
             .with_context(|| format!("walking the target's import table for {}", t.api))?;
 
-        let target_base = proc.image_base()?;
+let target_base = proc.image_base()?;
         let first = slots[0].address(target_base);
-        let bound = proc
-            .read_bytes(first, 8)
-            .with_context(|| format!("reading the bound {} slot in pid {pid}", t.api))?;
-        let original = u64::from_le_bytes(bound.try_into().expect("read 8"));
-        if original == 0 {
-            bail!("the loader left {:#x} unbound, so there is nothing to intercept", first);
-        }
+
+        // Wait for the loader to have actually resolved this slot *before*
+        // trusting what is in it, and before writing over it.
+        //
+        // Until it does, an IAT slot holds a pointer to an
+        // `IMAGE_IMPORT_BY_NAME`, which lives inside the image itself; once it
+        // does, the slot holds the real API address, which lives in another
+        // module entirely. That difference is directly observable - the value
+        // is inside `[base, base + SizeOfImage)` or it is not - and it is the
+        // whole synchronisation problem.
+        //
+        // Skipping this is not a small mistake. Reading a hint/name pointer,
+        // treating it as the resolved address and patching over it produces a
+        // hook that installs cleanly, reports no error, holds the substituted
+        // pointer for as long as anyone looks, and is then silently resolved
+        // back to the real `CreateProcessW` by the loader moments later. The
+        // only symptom is a payload counter that never moves - which is exactly
+        // what a `cmd.exe /c` target shows.
+        let size_of_image = PeImage::parse(&target_image)?.info.size_of_image as u64;
+        let image_end = target_base.saturating_add(size_of_image);
+        let gap = std::time::Duration::from_millis(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let original = loop {
+            let bound = proc
+                .read_bytes(first, 8)
+                .with_context(|| format!("reading the bound {} slot in pid {pid}", t.api))?;
+            let value = u64::from_le_bytes(bound.try_into().expect("read 8"));
+            if value != 0 && !(target_base..image_end).contains(&value) {
+                break value;
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "the loader never resolved the {} slot at {first:#x} in pid {pid} \
+                     (last read {value:#x})",
+                    t.api
+                );
+            }
+            std::thread::sleep(gap);
+        };
 
         // 1. Tell the payload what it is standing in for.
         let original_rva = rva(t.original_export)?;
@@ -227,9 +259,7 @@ pub fn install_create_process_hook(
         // still working clobbers the write, the mismatch repairs it, and a
         // loader that is already done passes on the first check - which keeps
         // the common case down to one extra read instead of a fixed settle.
-        let gap = std::time::Duration::from_millis(2);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-        let mut consecutive = 0u32;
+let mut consecutive = 0u32;
         let mut last = 0u64;
         loop {
             let read = proc

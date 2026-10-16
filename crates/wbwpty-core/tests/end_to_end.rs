@@ -398,33 +398,68 @@ fn diag_cmd_python_chain() {
         return;
     };
     let python = python.display().to_string();
-    // The plain form: `cmd /c <child>` spawns immediately, which is the case
-    // that has to work. No `ping` prefix - that only pads the clock.
+    // `PROGRA~1` rather than the long path: `ChildSpec` quotes an argument that
+    // contains spaces and escapes its inner quotes as `\"`, and `cmd /c` strips
+    // only the outer pair - so the inner ones arrive as literal `\"` and cmd
+    // reports the whole thing as an unrecognised command. That failure is
+    // invisible in the output unless you read it, and it looks exactly like
+    // "the child produced nothing".
+    let python = python.replace("Program Files", "PROGRA~1");
+    // `ping` first, so cmd lives for a couple of seconds before the child under
+    // test is spawned. That gives the injector time to install the hook, which
+    // separates "the substitution does not work" from "the substitution was
+    // not yet armed when cmd got to it".
     let spec = ChildSpec::new("cmd.exe").args([
         "/c".to_string(),
-        python,
-        "-c".to_string(),
-        "print('CHAINED-OK')".to_string(),
+        format!("ping -n 4 127.0.0.1 > nul & {python} -c \"print('CHAINED-OK')\""),
     ]);
     let config = SessionConfig { shim: true, inject: true, ..Default::default() };
     let session = Session::start(&spec, config).unwrap();
 
     // A timeline, because a single read after the session says nothing about
-    // *when* the counters stood still.
+    // *when* the counters stood still. Output is drained at the same time: if
+    // the command never actually ran, every other number here is about nothing.
+    // Wait for the *target*, not for a fixed span. A fixed window is how this
+    // diagnostic came to report `hook=0` against a working substitution: the
+    // padded `ping` keeps cmd alive for ~11s, so a 3s window ended before cmd
+    // ever reached the child under test and the counter was never given a
+    // chance to move.
+    let mut buf = [0u8; 8192];
+    let mut seen = String::new();
     let t0 = Instant::now();
-    for _ in 0..30 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    loop {
+        match session.pipes().with(|p| p.read_output(&mut buf, 0)) {
+            Some(Ok(ReadEvent::Data(n))) => seen.push_str(&String::from_utf8_lossy(&buf[..n])),
+            _ => {}
+        }
+        if t0.elapsed() > std::time::Duration::from_secs(40) {
+            eprintln!("DIAG gave up waiting for the target");
+            break;
+        }
         eprintln!(
-            "T+{:>5}ms  hook={:?} flags={:?} coverage={}",
+            "T+{:>5}ms  hook={:?} flags={:?} coverage={} out={:?}",
             t0.elapsed().as_millis(),
             session.payload_hook_stats(),
             session.payload_hook_flags(),
             session.coverage().len(),
+            seen,
         );
+        // Done once the target has gone *and* its pipe reached EOF.
+        if session.wait_for(std::time::Duration::from_millis(1)).is_some() {
+            eprintln!("DIAG target exited at T+{:?}ms", t0.elapsed().as_millis());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
     let _ = session.wait_for(std::time::Duration::from_millis(3000));
     eprintln!("DIAG gen1 report      = {:?}", session.report().is_some());
+    eprintln!(
+        "DIAG gen1 payload_loc = {:?}  (base=0x{:X}, stats_rva=0x{:X})",
+        session.payload_stats_location(),
+        session.payload_stats_location().map(|l| l.0).unwrap_or(0),
+        session.payload_stats_location().map(|l| l.1).unwrap_or(0),
+    );
     eprintln!(
         "DIAG gen1 hook        = {:?}",
         session
