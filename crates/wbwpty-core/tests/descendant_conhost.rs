@@ -32,13 +32,22 @@
 //! which left orphaned console hosts on the machine with no owner: their client
 //! had exited, so nothing was left to reap them.
 //!
-//! # Current result: the substitution is not being reached
+//! # Current result
 //!
-//! `the_intercepted_target_leaves_no_console_host_behind` fails with
-//! `hook_calls = 0` - the slot is rewritten, the descendant's output does arrive
-//! on our pipe, and a `conhost.exe` still shows up whose parent is the target.
-//! A rewritten slot that nothing calls looks identical to no feature at all,
-//! which is exactly what this file exists to catch.
+//! An earlier version of this file said the substitution was not being reached at
+//! all - `hook_calls = 0`, a rewritten slot nothing called. That was wrong, and
+//! wrong for a reason worth keeping: x64dbg shows `cmd.exe` calling the very
+//! slot that gets rewritten, and the payload counts the calls. The promise holds
+//! for the generation that inherits the substitution, and only that one - a
+//! process created by a *descendant* is created with whatever flags that
+//! descendant chose.
+//!
+//! That gap is now closed by [`crate::supervisor`], which gives every
+//! descendant the substitution as well; `tests/descendant_injection.rs` is where
+//! that is pinned. What is left here is the measuring apparatus this project
+//! needed to get there: ancestry-attributed console host detection, per-pid
+//! cleanup, and a control that must show a console host or the other tests prove
+//! nothing.
 
 use std::time::{Duration, Instant};
 
@@ -193,10 +202,15 @@ fn observe(inject: bool, patch_descendants: bool) -> Observation {
     let command = format!(
         "cmd.exe /c \"{DESCENDANT_COMMAND}\"\r\n{KEEP_AWAKE}\r\n"
     );
+    // Two expects, because there are two failure modes and they are not the same
+    // one: `with` yields an `Option` (the pipe lock is poisoned) and the write
+    // itself yields an `io::Result`. Only the first was being handled, so a
+    // failed write was silently discarded.
     session
         .pipes()
         .with(|p| p.input().write_all(command.as_bytes()))
-        .expect("pipe write");
+        .expect("input pipe is gone")
+        .expect("writing the command to the target");
 
     let proc = wbwpty_core::manual_map::remote::RemoteProcess::new(session.process_handle());
     let base = proc.image_base().unwrap_or(0);
@@ -263,7 +277,7 @@ fn observe(inject: bool, patch_descendants: bool) -> Observation {
             // `ProcessParameters->ConsoleHandle` to decide whether the child
             // inherits a console or is allocated a fresh one - and a fresh
             // console is a `conhost.exe`.
-if patch_descendants && !patched.contains(&entry.pid) {
+            if patch_descendants && !patched.contains(&entry.pid) {
                 patched.push(entry.pid);
                 let tag = line.clone();
                 match wbwpty_core::manual_map::remote::RemoteProcess::open(entry.pid) {

@@ -21,6 +21,21 @@
 //! * sentinel written into probe#2: if this is enough, one `CreateProcess` write
 //!   per descendant replaces recursive injection entirely.
 //! * nothing written: the baseline the substitution alone produces.
+//!
+//! # Superseded for the question it was built to answer
+//!
+//! Kept, because the two variants are still the only place the sentinel's
+//! effect on an *uncovered* generation is measured side by side. But the
+//! fixture has a fault that makes both runs measure something else: probe#1
+//! spawns probe#2 in the first few milliseconds of its life, while injection is
+//! still waiting for a loader to settle, so probe#2 is created *unsubstituted*
+//! and already owns a console when the sentinel is written into it - which is why
+//! `patch_console_state` reports `Unchanged` and the question stays unanswered.
+//!
+//! `tests/descendant_injection.rs` is the version that holds each generation
+//! still until the previous one is covered, and it answers a different question
+//! better: rather than whether the sentinel is enough on its own, whether
+//! covering every generation is.
 
 use std::time::{Duration, Instant};
 
@@ -135,7 +150,6 @@ fn observe(sentinel: bool) -> Observation {
     let guard = TreeGuard {
         root: session.pid(),
     };
-    let (calls, _) = session.payload_hook_stats().unwrap_or((0, 0));
 
     let mut buf = [0u8; 4096];
     let mut console_host = None;
@@ -214,6 +228,12 @@ fn observe(sentinel: bool) -> Observation {
         .ok()
         .and_then(|t| t.trim().parse().ok());
     let _ = std::fs::remove_file(&ping_pid);
+    // Read *after* the observation, not right after `Session::start`: these
+    // counters only move when the target creates something. An earlier version
+    // read them up front and reported zero for a run in which the substitution
+    // had in fact been reached, which is what made both tests in this file fail
+    // for a reason that had nothing to do with the sentinel.
+    let (calls, _) = session.payload_hook_stats().unwrap_or((0, 0));
     session.shutdown();
     drop(guard);
 
@@ -243,6 +263,13 @@ fn observe(sentinel: bool) -> Observation {
 #[ignore = "deliberately causes a console host; run only when told"]
 fn baseline_substitution_alone() {
     let seen = observe(false);
+    eprintln!(
+        "baseline: console_host={:?} hook_flags={:?} probe2_console={:?} output={:?}",
+        seen.console_host.as_ref().map(|h| (h.pid, h.parent)),
+        seen.hook_flags,
+        seen.probe2_console,
+        seen.output
+    );
     assert!(seen.hook_calls >= 1, "probe#2 must go through the substitution");
     assert_eq!(seen.tree.len(), 2, "expected probe#2 and ping, got {:?}", seen.tree);
 }
@@ -251,6 +278,13 @@ fn baseline_substitution_alone() {
 #[ignore = "deliberately causes a console host; run only when told"]
 fn sentinel_in_the_uncovered_generation() {
     let seen = observe(true);
+    eprintln!(
+        "sentinel: console_host={:?} hook_flags={:?} probe2_console={:?} output={:?}",
+        seen.console_host.as_ref().map(|h| (h.pid, h.parent)),
+        seen.hook_flags,
+        seen.probe2_console,
+        seen.output
+    );
     assert!(seen.hook_calls >= 1, "probe#2 must go through the substitution");
     assert_eq!(seen.tree.len(), 2, "expected probe#2 and ping, got {:?}", seen.tree);
 }

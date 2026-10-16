@@ -1103,37 +1103,44 @@ mod tests {
 
     /// A process the target creates must write to our pipe.
 ///
-/// The whole of Stage 8 in one test. The target is an interactive `cmd.exe`
-/// that is blocked reading its (never written) stdin, which makes the ordering
-/// deterministic: the interception is in place before the command that creates
-/// a descendant is fed in.
-///
-/// Two independent promises are checked, because they are independent and only
-/// satisfying one looks like success:
-///
-/// * the descendant's output arrives on our pipe, and
-/// * no `conhost.exe` appears for it.
-///
-/// # How this works
-///
-/// The host rewrites the target's `CreateProcessW` import slot to point at the
-/// payload, which OR-s `DETACHED_PROCESS` into the flags and fills in
-/// `STARTF_USESTDHANDLES`. Both halves are required and neither is sufficient;
-/// `tests/descendant_creation.rs` is the matrix that established it.
-///
-/// `bInheritHandles` is passed through **unchanged**, and the matrix row this
-/// is written against was measured with it set. Passing `FALSE` on the grounds
-/// that the handles are explicit anyway leaves the child mute - the output
-/// never arrives, with no error anywhere.
-///
-/// # On the marker
-///
-/// Assembled at runtime (`%i` in the `for` body expands to `NEU`, and the
-/// command line only ever shows the literal `%i`). An earlier version searched
-/// the output for a marker that appeared in the text it fed in, which an
-/// interactive `cmd.exe` echoes straight back - so it passed while descendants
-/// produced nothing at all.
-#[test]
+/// The first generation of Stage 8 in one test. The target is an interactive
+    /// `cmd.exe` that is blocked reading its (never written) stdin, which makes
+    /// the ordering deterministic: the interception is in place before the
+    /// command that creates a descendant is fed in.
+    ///
+    /// Two independent promises are checked, because they are independent and
+    /// only satisfying one looks like success:
+    ///
+    /// * the descendant's output arrives on our pipe, and
+    /// * no `conhost.exe` appears for it.
+    ///
+    /// # How this works
+    ///
+    /// The host rewrites the target's `CreateProcessW` import slot to point at
+    /// the payload, which OR-s `DETACHED_PROCESS` into the flags and fills in
+    /// `STARTF_USESTDHANDLES`. Both halves are required and neither is
+    /// sufficient; `tests/descendant_creation.rs` is the matrix that established
+    /// it.
+    ///
+    /// `bInheritHandles` is passed through **unchanged**, and the matrix row this
+    /// is written against was measured with it set. Passing `FALSE` on the
+    /// grounds that the handles are explicit anyway leaves the child mute - the
+    /// output never arrives, with no error anywhere.
+    ///
+    /// # The generation after this one
+    ///
+    /// Everything here is about the target's *own* children. What those children
+    /// go on to create needs the substitution to be in them too, which
+    /// [`crate::supervisor`] arranges; `tests/descendant_injection.rs` pins it.
+    ///
+    /// # On the marker
+    ///
+    /// Assembled at runtime (`%i` in the `for` body expands to `NEU`, and the
+    /// command line only ever shows the literal `%i`). An earlier version
+    /// searched the output for a marker that appeared in the text it fed in,
+    /// which an interactive `cmd.exe` echoes straight back - so it passed while
+    /// descendants produced nothing at all.
+    #[test]
 fn grandchild_output_reaches_the_pipe() {
         const MARKER: &str = "NEU7Q2K5";
         let spec = ChildSpec::new("cmd.exe");

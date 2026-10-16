@@ -22,7 +22,13 @@ struct Cli {
     #[arg(long)]
     dump_conhost: bool,
 
-    /// Install the console API shim inside the target (default: on).
+    /// Ask the payload to install the console API shim (default: on).
+    ///
+    /// Published as `WBWPTY_SHIM=1`. The shim itself - `GetConsoleMode`,
+    /// `WriteConsoleW` and friends replaced inside the target - is **not
+    /// implemented yet**; the payload currently reads the flag and logs it. The
+    /// flag stays because the environment contract is frozen and something has
+    /// to set it, not because it does anything yet.
     #[arg(long)]
     shim: bool,
 

@@ -110,8 +110,8 @@ cargo test --release                  # 相关测试必须全绿
 | --- | --- |
 | 注入后目标立刻退出 | DLL 的 `DllMain` 是否 panic/返回 FALSE；看 `WBWPTY_LOG` 与 DebugView |
 | 目标没有输出 | 管道是否都创建成功；`SetStdHandle` 是否在 CRT 初始化之前完成 |
-| 输出要等 4KB 才出现 | CRT 全缓冲；检查 `setvbuf(_IOLBF)` 与"读输入前 `_flushall`"是否生效 |
-| 子进程又冒出 conhost | `ConsoleHandle` 补丁是否生效（阶段 6）；std handle 是否标记可继承 |
+| 输出要等 4KB 才出现 | CRT 全缓冲；检查 `setvbuf(_IONBF)`（不是 `_IOLBF`，坑 21） |
+| 子进程又冒出 conhost | ①目标自己的 `CreateProcessW` IAT 槽改了吗（`manual_map::hook`）；②supervisor 覆盖到那一代了吗（`Session::coverage()`）；③它是不是在自己起来几毫秒内就 spawn 了（坑 27） |
 | `iced-x86` 在 no_std 下编译失败 | 退回手写 x64 长度解码器（在 `hook.rs` 里已留降级分支） |
 | `ReadProcessMemory` 报 `ERROR_PARTIAL_COPY` | **目标里还没映射这个模块**。挂起进程只有 exe + ntdll，必须等 loader 跑完（见规则 7） |
 | 目标一直不进入口点 | 见 README 5.3；先确认是不是"我们没动它也进不去" |
@@ -176,6 +176,29 @@ cargo test --release                  # 相关测试必须全绿
     旧计划里的"完整 CRT 修复"包含它们，是照抄别的项目的做法，没有实测依据。
 23. **目标项目的 stderr 和 stdout 是同一条管道**（`pipe.rs` 里 stderr 是 stdout 的副本），
     所以 shell 里 `2> file` 分不开它们，`--dump-conhost` 之类的输出要一起看。
+24. **`SharedPipes::with` 返回 `Option<R>`，不是 `R`**：`with(|p| p.input().write_all(..))`
+    的类型是 `Option<io::Result<()>>`，只写一个 `.expect()` 会把**内层 `Result` 静默丢掉**
+    （告警 `unused Result that must be used`）。写管道要 `.expect(..).expect(..)` 两个。
+25. **pid 单独存在时会被复用**：进程一退出 pid 就能被新进程拿走。
+    往 pid 写内存（注入、打补丁）时**必须持有 `RemoteProcess` 句柄直到写完**——
+    句柄让进程对象活着，pid 就不会被回收。`supervisor.rs` 整个处理过程都持有。
+26. **后代可能是 32 位**：`remote.rs` 里每个 PEB 偏移都是 x64 的。
+    把 x64 映像写进 WOW64 地址空间不是降级，是破坏。`RemoteProcess::is_x64_image()`
+    读的是**目标自己的头**（不是磁盘文件），supervisor 拿它当拒绝条件。
+27. **注入有 ~100ms 的时序窗口**：`stable_modules` 要两次快照一致才算就绪。
+    目标在自己起来的前几毫秒内 spawn 的子进程，**赶在注入之前**——子进程就拿到自己的 console。
+    这不是理论：`tests/grandchild_sentinel.rs` 的夹具就是这么失真的。
+    → **夹具必须用 `--gate <file>` 把 spawn 时机交给测试**（见 `wbwpty-spawn-probe`），
+    否则测的是竞态，不是功能。
+28. **`--ignored` 的测试会弹真实的 conhost 窗口**。这是设计如此（它们测的就是那个 bug）。
+    **跑之前必须把命令贴给用户、得到同意再跑**。`tests/descendant_injection.rs` 的
+    两条是例外：设计上就不产生 conhost（其中一条还有运行时安全闸）。
+29. **不要断言英文输出**：本机 `ping.exe` 是中文版，输出走 OEM 代码页，
+    管道读出来是乱码。断言 "Pinging" 会对着一个**正常工作的功能**失败。
+    断言 ASCII 的地址（`127.0.0.1`）这种与语言无关的东西。
+30. **supervisor 的覆盖记录要边做边发**（`Session::coverage()`），不是结束时才汇总。
+    "在它来得及 spawn 之前被接管"和"接管了但已经晚了"在输出上完全一样，
+    只有时间戳能区分。
 
 ## 10. 外部可复用模块（评估过再用）
 

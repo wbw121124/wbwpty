@@ -176,6 +176,62 @@ ResumeThread  ──►  loader 初始化 ──► ucrtbase!__acrt_initialize_s
 - `_open_osfhandle` / `_dup2` **不需要**：标准描述符本来就是会话管道，
   宿主在目标跑第一条指令前就通过 `STARTF_USESTDHANDLES` 交出去了。
 
+### 1.7 每一代都要被接管（supervisor）
+
+IAT 替换只改**一个进程**的导入表：会话目标。这足够让**目标自己创建的**子进程正确
+（`DETACHED_PROCESS` + 我们的句柄，无 conhost，输出进管道，由
+`session::tests::grandchild_output_reaches_the_pipe` 钉住），但**不够**再往下。
+
+导入表属于它被加载的那个映像。后代有自己的导入表，而**里面什么都没有**。
+于是后代创建的进程用的是**后代自己选的**标志位——而一个没有 console 的 CUI 父进程
+创建的 CUI 子进程会被 base API **分配一个 console**，那就是每个孙进程一个 `conhost.exe`。
+
+办法是结构性的，不是技巧性的：**给每个后代同样的替换**。一个能替换自己
+`CreateProcessW` 的进程，创建出来的子进程就是对的，于是这个性质沿整棵树归纳下去。
+
+`crates/wbwpty-core/src/supervisor.rs` 做这件事：每 15ms 拍一次进程表，
+对每个新出现的 pid `OpenProcess` → 映射 payload → 改写它的 IAT 槽 → 写 console 哨兵。
+
+**为什么放在宿主侧而不是 payload 侧**：宿主已经有整套注入器，而 payload 自注入意味着
+在一个不许碰堆的 `no_std` DLL 里重写一遍（映像映射 / 重定位 / 对子进程 loader 状态解析导入 / 远程线程）。
+宿主也已经能碰到后代——树里所有进程都是同一个用户，
+`tests/descendant_conhost.rs` 早就在从宿主往后代写哨兵了。
+
+三件**不是可选项**的事：
+
+1. **整个处理过程持有句柄**。pid 单独存在时，进程一退出它就被复用；
+   往继承了那个 pid 的无辜进程里写 payload 是这里能犯的最严重的 bug。
+2. **非 x64 的后代直接放弃，不尝试**。`remote.rs` 里每个偏移都是 x64 的，
+   把 x64 映像写进 WOW64 地址空间不是"降级"，是**破坏**。
+3. **loader 等待只有 150ms**（不是会话目标的 10s），失败就下一轮重试。
+   后代往往只活几毫秒，为它阻塞十秒会把后面所有后代一起堵死。
+
+覆盖记录是**边做边发**的，不是结束时才给：`Session::coverage()` 能区分
+"在它来得及 spawn 之前就被接管"和"接管了但已经晚了"——这两者在输出上完全一样。
+
+#### 还没关掉的竞态
+
+supervisor 是**轮询**的：后代是被发现之后才存在的，所以一个在起来后几毫秒内就 spawn 的后代
+可以跑赢这一轮。这个竞态没有被藏起来——它就是 `Coverage` 记录的东西。
+要关掉它，需要让子进程以 `CREATE_SUSPENDED` 创建并交给宿主，等宿主覆盖完再 resume，
+这是一个独立的改动，而且自带失败模式（宿主一旦挂掉，子进程会永远挂着）。
+
+### 1.8 故意制造 console host 的测试一律 `#[ignore]`
+
+`cargo test` 默认会跑 46 条测试，其中 **9 条被 ignore**，全部是同一个理由：
+它们**按设计会在操作者桌面上弹出真实的 conhost 窗口**——
+而那正是本项目要阻止的东西，没有它就没法观察。
+
+跑它们必须显式指定，例如：
+
+```powershell
+cargo test --release --test descendant_injection -- --ignored without_the_supervisor
+```
+
+**默认不跑，不要顺手跑。** 唯一例外是 `tests/descendant_injection.rs` 里那两条：
+它们在设计上就不该产生任何 console host（第三代测试还有一道运行时安全闸，
+见该文件），所以它们是普通测试。
+
 ## 2. 架构
 
 ```
@@ -184,7 +240,8 @@ ResumeThread  ──►  loader 初始化 ──► ucrtbase!__acrt_initialize_s
  ├─ child.rs   : CreateProcessW(DETACHED_PROCESS|CREATE_SUSPENDED, 自定义环境块)
  │               环境变量契约：WBWPTY_IN / WBWPTY_OUT / WBWPTY_CTL / WBWPTY_ROWS /
  │                            WBWPTY_COLS / WBWPTY_CP / WBWPTY_SHIM / WBWPTY_LOG
- ├─ inject.rs  : PEB 遍历 + 手工映射 + CreateRemoteThread
+ ├─ manual_map/: PEB 遍历 + 手工映射 + CreateRemoteThread + IAT 改写
+ ├─ supervisor.rs: 轮询进程表，把上面那套铺到每一个后代（§1.7）
  └─ session.rs : 输出泵(stdout/stderr→本机) + 输入泵(本机 stdin→in 管道) + 退出码 + EOF
                               │
  ═════════════════════════════▼ 进程边界（无 conhost）
@@ -193,10 +250,14 @@ ResumeThread  ──►  loader 初始化 ──► ucrtbase!__acrt_initialize_s
  │    CreateFileW 打开管道 → SetStdHandle(0/1/2) → 标记可继承
  │    → PEB ConsoleHandle/ConsoleFlags 打桩 → CreateThread 起 worker
  └─ worker 线程
-      CRT 修复（_open_osfhandle/_dup2/setvbuf(_IOLBF)/读前 _flushall）
-      + [可选] KernelBase 内联 hook（console API shim）
+      CRT 修复（setvbuf(_IONBF)，见 §1.6）
+      + create_process_w()：替身（§1.2 / §1.7）
+      + [未实现] console API 替身
       + ctl 管道轮询（窗口尺寸变化）
 ```
+
+> **每一个被接管的进程里都有这份 DLL**——目标，以及每一个后代（§1.7）。
+> 正是这一点让"创建子进程时不冒 conhost"这个性质能沿整棵树归纳下去。
 
 ---
 
@@ -210,32 +271,33 @@ D:\wbwpty
 ├── AGENTS.md                   # 开发者/AI 协作注意事项
 ├── crates/
 │   ├── wbwpty-core/            # lib：可嵌入的终端核心
-│   │   └── src/
-│   │       ├── lib.rs          # 公开 API：Session / SessionBuilder
-│   │       ├── error.rs
-│   │       ├── pipe.rs         # 命名管道传输层（overlapped + pump）
-│   │       ├── child.rs        # 挂起 + DETACHED_PROCESS 创建、环境块
-│   │       ├── inject.rs       # 注入入口（手工映射）
-│   │       ├── manual_map/     # PE 解析 / PEB 遍历 / 重定位 / 导入 / stub
-│   │       ├── session.rs      # 会话生命周期、双泵、退出码
-│   │       ├── console.rs      # 宿主终端状态（rows/cols/codepage）
-│   │       └── inspect.rs      # Toolhelp32 快照：conhost 校验
+│   │   ├── src/
+│   │   │   ├── lib.rs          # 模块表 + 公开 API：Session / SessionConfig
+│   │   │   ├── error.rs
+│   │   │   ├── pipe.rs         # 命名管道传输层（overlapped + pump）
+│   │   │   ├── child.rs        # 挂起 + DETACHED_PROCESS 创建、环境块契约
+│   │   │   ├── manual_map/     # PE 解析 / PEB 遍历 / 重定位 / 导入 / stub / IAT / hook
+│   │   │   ├── supervisor.rs   # 进程树监督：把注入铺到每一个后代（§1.7）
+│   │   │   ├── session.rs      # 会话生命周期、双泵、退出码、supervisor 接线
+│   │   │   ├── inspect.rs      # Toolhelp32 快照 + ancestry 归因
+│   │   │   └── bin/            # 测试夹具：wbwpty-spawn-probe / wbwpty-crt-probe
+│   │   └── tests/              # 集成测试（见 §1.8 哪些不能默认跑）
 │   ├── wbwpty/                 # bin：CLI
-│   │   ├── src/main.rs
-│   │   └── tests/it_*.rs       # 集成测试
+│   │   └── src/main.rs
 │   └── wbwpty-redirect/        # cdylib：注入 DLL（no_std）
 │       └── src/
-│           ├── lib.rs          # DllMain 入口 + 调度
+│           ├── lib.rs          # DllMain 入口 + worker 调度 + 发布的状态字
 │           ├── ffi.rs          # 手写 extern "system" 声明
 │           ├── config.rs       # 环境变量契约解析
 │           ├── log.rs          # OutputDebugStringA + 可选文件日志
 │           ├── stdio.rs        # SetStdHandle + 继承标记
 │           ├── peb.rs          # NtCurrentTeb→PEB 补丁 + 偏移自检
-│           ├── crt.rs          # _open_osfhandle/_dup2/setvbuf/_flushall
-│           ├── hook.rs         # x64 内联跳板（iced-x86 长度校验）
-│           ├── console_api.rs  # 控制台 API 替身
-│           └── keys.rs         # 字节流 ↔ 按键事件 / VT 翻译
+│           ├── crt.rs          # setvbuf(_IONBF)（见 §1.6）
+│           └── hook.rs         # create_process_w 替身（§1.2/§1.7）
 ```
+
+> 尚未实现：`console_api.rs`（控制台 API 替身，见 §1.5）与 `keys.rs`（按键事件 / VT 翻译）。
+> `--shim` 目前是空承诺，见 §5.1。
 
 ---
 
@@ -271,25 +333,30 @@ cargo test --release
 | 5 | CLI | 会话循环：双泵 / EOF / 退出码 / `--dump-conhost` / `--verbose` | （同上） | ✅ |
 | 6 | PEB | 宿主侧（挂起态 + 注入后各一次）读/写目标 `ConsoleHandle`，偏移断言 + 运行时自检；**实测无法阻止孙进程分配 console**，见 §1.2 | `fix(peb): own the console state from the host side` | ✅（机制被证伪，已记录） |
 | 7 | CRT | `config.rs` 环境契约 + 接上 `log::init_from_env` + worker 线程 + `setvbuf(_IONBF)`（**不是 `_IOLBF`**，见 §1.6） | `feat(dll): unbuffer the target stdio streams so output is not held back` | ✅ |
-| 8 | shim | KernelBase 内联 hook：`CreateProcess*` 拦截（`DETACHED_PROCESS` + `STARTF_USESTDHANDLES`，见 §1.2）+ console API shim | ⏳ |
+| 8 | shim | `CreateProcess*` 的 IAT 拦截（`DETACHED_PROCESS` + `STARTF_USESTDHANDLES`，见 §1.2）+ **supervisor 把同样的替换铺到每一个后代**（见 §1.7）；console API shim 仍未实现 | `feat: cover every generation of the process tree with a descendant supervisor` | ✅（shim 未实现，见 §5.1） |
 | 9 | 测试 | cmd/python/大输出/stderr/无 conhost/孙进程 | ⏳ |
 | 10 | 文档 | README 定稿 | ⏳ |
 
 ### 5.1 已完成部分的实际状态（截至本次提交）
 
-- `cargo build --release` 绿；`cargo test --release` = **30 passed / 0 failed / 1 ignored**（ignored 的是下面 §1.2 那个已知缺口）。
-- `wbwpty.exe --dump-conhost -- cmd.exe /c echo hello` 实测：**hello 原样输出，exit=0，conhost.exe 数量不变**，stderr 干净。
+- `cargo build --release` 绿；`cargo test --release` = **46 passed / 0 failed / 9 ignored**
+  （ignored 的全是**故意制造 console host** 的对照组，默认不跑，见 §1.8）。
+- `wbwpty.exe --dump-conhost -- cmd.exe /c echo hello` 实测：**hello 原样输出，exit=0，conhost.exe 数量不变**。
+- **三代进程树实测无 console host**（`probe → probe → ping`）：第三代的 `DETACHED_PROCESS`
+  是从**后代自己 payload 里发布的 `WBWPTY_HOOK_FLAGS`** 读出来的，不是"碰巧没弹窗"。
+  见 §1.7 与 `tests/descendant_injection.rs`。
+- `--shim` **目前是空承诺**：payload 只读 `WBWPTY_SHIM` 拿去打日志，
+  §1.5 描述的那套 `GetConsoleMode` / `WriteConsoleW` 替身一行都没写。
 - 手工映射每一段机器码都有**真正执行**的单测（不是只比对字节），`stub.rs` 已简化为只负责"调 DllMain"，不再携带死代码。
 - 核心注入失败根因已定位：**stub 用 `r9d` 而不是 `edx` 传 `DLL_PROCESS_ATTACH`**（Win64 第 2 参数在 `rdx`），导致 `DllMain` 拿到假 reason 直接 return TRUE 而不做任何事；修完后 stub 调用真实成功。
-- **本轮把 Stage 6 的前提证伪了，并找到了真正的开关**（见 §1.2）：`ConsoleHandle` 哨兵
-  挡不住孙进程拿到 console；实测矩阵表明只有 `DETACHED_PROCESS` + `STARTF_USESTDHANDLES`
-  同时满足"不冒 conhost"和"输出进管道"，两半缺一不可。方案已定，**尚未实现**。
 - **Stage 7 完成并实测有效**：同样的探针、同样的管道、同样的写，
   无 payload 时输出 702ms 才到，有 payload 时 **0ms**（`tests/crt_buffering.rs`）。
   `WBWPTY_LOG` 也第一次真正生效——之前 `log::init_from_env()` 从来没被调用过。
 - `cmd /c <短命令>` 这类目标**基本永远注不进去**：`stable_modules` 需要 ~100ms 稳定窗口，
   而目标几毫秒就退出。stdio 走 `STARTF_USESTDHANDLES` 所以不影响它工作，但任何注入侧的
   语义补丁（哨兵、shim、CRT）对它都不生效。**这也包括 Stage 7 的缓冲修复。**
+  → 更要命的是：这种目标如果在自己起来的前几毫秒里就 spawn 子进程，
+  那时连 supervisor 都还没覆盖到它，**子进程会拿到自己的 console**（§1.7 末尾）。
 
 ### 5.2 关键技术发现（全部本机实测，恢复工作时不要推翻）
 
@@ -322,12 +389,13 @@ wbwpty: pid 4328 sentinel Written(ConsoleState { console_handle: 291, console_fl
 wbwpty: pid 4328 payload stage=ConsoleAlreadySet reason=1 attach_path_ran=true
 ```
 
-**孙进程问题还没修好，但方案已经测出来了**（§1.2）。下一步：
-- **Stage 8 里的 `CreateProcess` 拦截**：同时做两件事——`dwCreationFlags |= DETACHED_PROCESS`，
-  并用父进程的 std handle 填 `STARTF_USESTDHANDLES`。两半缺一不可，都有实测支撑。
-  注意句柄要取自 CRT（`as_raw_handle`），不能取 `GetStdHandle`。
-- Stage 7：CRT 行缓冲修复（`setvbuf(_IOLBF)`）—— 目前目标 stdout 是全缓冲，大输出会延迟。
+**孙进程问题已经修好了两代，第三代靠 supervisor（§1.7）。** 下一步：
+
+- **关掉 supervisor 的轮询竞态**：子进程以 `CREATE_SUSPENDED` 创建 → pid 日志 →
+  宿主注入完再 resume。这是唯一能把 §1.7 末尾那个"几毫秒内 spawn 就能跑赢"消掉的做法。
+- **实现 console API shim**（§1.5）。`--shim` 现在是空承诺。
 - Stage 9：端到端测试（python、大输出、stderr）。
+- Stage 10：README 定稿。
 
 ### 5.4 Stage-3 阻塞点的**根因**（已定位，方案已定）
 

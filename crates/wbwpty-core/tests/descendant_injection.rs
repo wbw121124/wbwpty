@@ -357,7 +357,7 @@ fn observe(cover_descendants: bool, release: Release) -> Observation {
     seen.coverage = session.coverage();
     eprintln!(
         "\ncover_descendants={cover_descendants} released={:?}\n\
-         probe2={:?} ping={:?}\n\
+         probe2={:?} ping={:?} original={:?} published_handles={:?}\n\
          probe2 coverage: {:#?}\n\
          console_host={:?}\n\
          tree:\n  {}\n\
@@ -365,6 +365,8 @@ fn observe(cover_descendants: bool, release: Release) -> Observation {
         seen.released,
         seen.probe2,
         seen.ping,
+        seen.original,
+        seen.published_handles,
         seen.probe2_coverage,
         seen.console_host.as_ref().map(|h| (h.pid, h.parent)),
         seen.tree.join("\n  "),
