@@ -31,7 +31,7 @@ struct Cli {
     ///
     /// Deliberately an off-switch rather than `--shim`: the default is on, and a
     /// flag whose name reads "do the thing" while meaning "don't" is how this flag
-    /// spent its life meaning the opposite of [`SessionConfig::shim`].
+    /// spent its life meaning the opposite of SessionConfig::shim.
     #[arg(long)]
     no_shim: bool,
 
