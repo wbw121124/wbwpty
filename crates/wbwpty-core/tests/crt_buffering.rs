@@ -40,10 +40,13 @@ enum Outcome {
     Buffered,
     /// Reached the pipe while the process was still running.
     Immediate,
-    /// The process ended before the sleep elapsed and never wrote. `setvbuf`
-    /// rejects a mode it does not recognise by running the invalid parameter
-    /// handler, which aborts - so this is "not a mode", not "a mode that
-    /// buffers".
+    /// The process ended before the sleep elapsed and never wrote.
+    ///
+    /// This is *not* how an unrecognised mode announces itself: `setvbuf`
+    /// rejects those by returning `EINVAL` and carrying on, so the probe stays
+    /// alive and buffers normally. Read `Measurement::setvbuf_rc` for that;
+    /// this variant only shows up when the probe died for some other reason,
+    /// which makes it a flake signal rather than a mode verdict.
     Died,
     /// Nothing came down the pipe at all.
     Silent,
@@ -54,11 +57,20 @@ struct Measurement {
     mode: Option<i32>,
     outcome: Outcome,
     first_payload_ms: u128,
+    /// `setvbuf`'s own return code, as reported by the probe on its stderr.
+    ///
+    /// This is the ground truth about whether ucrtbase *accepted* a mode. The
+    /// process surviving is only a proxy for it, and the proxy turned out to
+    /// disagree with reality: an unrecognised mode makes `setvbuf` return
+    /// `EINVAL` without necessarily aborting, so "the probe lived" cannot be
+    /// read as "the mode was valid".
+    setvbuf_rc: Option<i32>,
 }
 
 impl Measurement {
+    /// A mode is only usable if `setvbuf` said yes.
     fn is_valid_mode(&self) -> bool {
-        !matches!(self.outcome, Outcome::Died)
+        self.setvbuf_rc == Some(0)
     }
 }
 
@@ -144,7 +156,26 @@ fn measure_with(mode: Option<i32>, inject: bool) -> Measurement {
         mode,
         outcome,
         first_payload_ms: elapsed.as_millis(),
+        setvbuf_rc: parse_setvbuf_rc(&text),
     }
+}
+
+/// Pulls `setvbuf(mode=N) -> RC` back out of what the probe printed.
+///
+/// The probe writes that line to its stderr, which this project points at the
+/// same pipe as stdout, so it arrives interleaved with the payload bytes.
+fn parse_setvbuf_rc(text: &str) -> Option<i32> {
+    let at = text.rfind("setvbuf(mode=")?;
+    let rest = &text[at + "setvbuf(mode=".len()..];
+    let close = rest.find(')')?;
+    rest[close + 1..]
+        .split("->")
+        .nth(1)?
+        .trim()
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// What buffering mode does a stream over a pipe actually get?
@@ -167,18 +198,28 @@ fn a_pipe_gets_block_buffered_stdio_by_default() {
 ///
 /// Swept rather than looked up: `_IOFBF` / `_IOLBF` / `_IONBF` are macros, not
 /// exports, so the only source of truth is what ucrtbase does with the number.
-/// A value it does not recognise runs the invalid parameter handler and aborts
-/// the process, which is itself the answer - "not a mode".
+///
+/// "Accepts" is read from `setvbuf`'s own return code, which the probe reports.
+/// That is not the same question as "did the probe survive the call": ucrtbase
+/// rejects a mode it does not recognise by returning `EINVAL` and *continuing*,
+/// so a process-level liveness check cannot tell a valid mode from an invalid
+/// one, and reports whichever modes happened not to die that run. The earlier
+/// version of this test did exactly that and flapped between `[0, 4, 0x40]` and
+/// `[0, 2, 3, 4, 8, 0x20, 0x40, 0x80]` depending on the machine's mood.
 #[test]
 fn setvbuf_accepts_exactly_three_modes_and_only_one_of_them_flushes() {
     let mut rows = Vec::new();
     for mode in [0i32, 1, 2, 3, 4, 8, 0x20, 0x40, 0x80] {
         let m = measure(Some(mode));
-        eprintln!("  mode {mode:#5}: {:?} at {}ms", m.outcome, m.first_payload_ms);
+        eprintln!(
+            "  mode {mode:#5}: {:?} at {}ms setvbuf->{:?}",
+            m.outcome, m.first_payload_ms, m.setvbuf_rc
+        );
         rows.push(m);
     }
 
-    let valid: Vec<i32> = rows.iter().filter(|m| m.is_valid_mode()).map(|m| m.mode.unwrap()).collect();
+    let valid: Vec<i32> =
+        rows.iter().filter(|m| m.is_valid_mode()).map(|m| m.mode.unwrap()).collect();
     let immediate: Vec<i32> = rows
         .iter()
         .filter(|m| m.outcome == Outcome::Immediate)

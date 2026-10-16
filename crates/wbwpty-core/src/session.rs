@@ -1276,7 +1276,16 @@ mod tests {
     /// `STATUS_DLL_INIT_FAILED` (`0xC0000142`) before its first instruction
     /// retires. This pins the boundary so the next person to try "just write it
     /// earlier" does not lose an afternoon to it.
+    ///
+    /// `#[ignore]`d because the failure it provokes is a *startup* failure, and
+    /// the shell answers a console program that dies at init with a modal
+    /// "应用程序无法正常启动(0xc0000142)" dialog plus a real `conhost.exe`. That
+    /// is unavoidable for this scenario - it is the whole point - so running it
+    /// unattended means popping UI on someone's desktop. Same reason as the
+    /// other conhost-producing controls; run it deliberately:
+    /// `cargo test -p wbwpty-core rewriting_the_console_handle -- --ignored`.
     #[test]
+    #[ignore = "deliberately provokes STATUS_DLL_INIT_FAILED, which pops a modal dialog and a conhost window"]
     fn rewriting_the_console_handle_before_startup_kills_the_target() {
         let mut pipes = crate::pipe::PipePair::new(0x11_0008).unwrap();
         let mut stdio = pipes.open_target_stdio().unwrap();

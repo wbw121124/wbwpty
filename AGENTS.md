@@ -171,9 +171,12 @@ cargo test --release                  # 相关测试必须全绿
     现在两种遍历失败都当作"还没就绪"重试到超时。
 21. **`setvbuf(_IOLBF)` 对管道完全没用**：实测 UCRT 的 `_IOLBF == 0x40` 对非 console 流
     行为和 `_IOFBF` 一样；真正能消除延迟的是 **`_IONBF == 4`**。UCRT 只接受 `0 / 4 / 0x40`
-    三个值，其余（1,2,3,8,32,128）会触发非法参数处理器**直接把进程 abort 掉**。
+    三个值，其余（1,2,3,8,32,128）**返回 `EINVAL` 但不会 abort 进程**——探针照样活着，
+    只是缓冲区行为跟全缓冲一样。
     这三个值跟 mingw 的不一样（mingw: 0/1/2），**别照头文件"修正"**。
-    完整扫描见 README §1.6 与 `tests/crt_buffering.rs`。
+    **判据必须是 `setvbuf` 的返回值，不是"进程还在不在"**：早期版本用进程存活当代理，
+    结果在 `[0,4,0x40]` 和 `[0,2,3,4,8,0x20,0x40,0x80]` 之间来回跳（flaky）。
+    完整扫描见 README §1.6 与 `tests/crt_buffering.rs`（探针会回报 `setvbuf(mode=N) -> RC`）。
 22. **`_open_osfhandle` / `_dup2` 在本项目里用不上**：标准描述符本来就是会话管道，
     宿主在目标执行任何指令之前就通过 `STARTF_USESTDHANDLES` 交出去了。
     旧计划里的"完整 CRT 修复"包含它们，是照抄别的项目的做法，没有实测依据。
@@ -215,6 +218,21 @@ cargo test --release                  # 相关测试必须全绿
     变成管道 EOF，交互式 `cmd.exe` 立刻退出。要跑一个必须活着的目标，
     用 `SessionConfig { pump_input: false, .. }`——它不会去读宿主 stdin，
     也就不会替测试决定目标什么时候死。
+33. **别用 `Start-Process cmd.exe /c "cargo test ..."` 当测试外壳**（2026-10-16 踩过）：
+    承载它的 `pwsh.exe` 自己没有 console，于是**每跑一次测试就分配一个 console
+    → 弹出一个 `conhost.exe`，有时还会带出 Windows Terminal 窗口**。
+    这跟被测代码毫无关系，但用户看到的就是"测试在乱弹窗口"。
+    正确做法是**直接在当前 shell 里调用**并重定向到文件：
+    ```powershell
+    & cargo test --workspace --release 2>&1 | Out-File $out -Encoding utf8
+    ```
+    套在 `cmd.exe /c` 里只是为了拿退出码和重定向，其实都不需要。
+    核对方法：跑之前记一个时间戳，跑完数一下新增的 `conhost.exe`
+    （父进程是 `pwsh.exe` 就说明是外壳而不是被测代码）。
+34. **"探针还活着"不能当成"这个参数被接受了"**：`crt_buffering` 曾用进程存活来推断
+    `setvbuf` 认不认某个 mode，结果在 `[0,4,0x40]` 和 `[0,2,3,4,8,0x20,0x40,0x80]`
+    之间来回跳。UCRT 对非法 mode 只是 `return EINVAL` 并继续跑，**不 abort**。
+    → 判据要用 API 自己的返回值（探针把它回报出来），别用间接代理指标。
 
 ## 10. 外部可复用模块（评估过再用）
 

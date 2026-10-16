@@ -394,9 +394,13 @@ cargo test --release
 
 ### 5.1 已完成部分的实际状态（截至本次提交）
 
-- `cargo build --release` 绿；`cargo test --release` = **144 passed / 0 failed / 9 ignored**
+- `cargo build --release` 绿；`cargo test --release` = **147 passed / 0 failed / 12 ignored**
   （其中 **88 条来自 vendor 进来的 `vt-parser` / `term-input`**，它们自带的测试在本机全绿；
-  9 条 ignored 的是**故意制造 console host** 的对照组，默认不跑，见 §1.8）。
+  12 条 ignored 的分两类，都会弹窗或断言尚未实现的阶段，默认不跑：
+  9 条**故意制造 console host** 的对照组（见 §1.8）；
+  3 条断言**还没做的功能**——`rewriting_the_console_handle_before_startup_kills_the_target`
+  会故意触发 `0xC0000142`（必然弹模态框+conhost），两个 python 端到端测试分别
+  需要"输入回显"与"supervisor 竞态已关闭"，见 §5.3）。
 - `wbwpty.exe --dump-conhost -- cmd.exe /c echo hello` 实测：**hello 原样输出，exit=0，conhost.exe 数量不变**。
 - **三代进程树实测无 console host**（`probe → probe → ping`）：第三代的 `DETACHED_PROCESS`
   是从**后代自己 payload 里发布的 `WBWPTY_HOOK_FLAGS`** 读出来的，不是"碰巧没弹窗"。
@@ -453,11 +457,22 @@ wbwpty: pid 4328 payload stage=ConsoleAlreadySet reason=1 attach_path_ran=true
 
 **孙进程问题已经修好了两代，第三代靠 supervisor（§1.7）。** 下一步：
 
-- **关掉 supervisor 的轮询竞态**：子进程以 `CREATE_SUSPENDED` 创建 → pid 日志 →
-  宿主注入完再 resume。这是唯一能把 §1.7 末尾那个"几毫秒内 spawn 就能跑赢"消掉的做法。
-- **实现 console API shim**（§1.5）。`--shim` 现在是空承诺。
-- Stage 9：端到端测试（python、大输出、stderr）。
+- **关掉 supervisor 的轮询竞态**（最高优先）：子进程在自己起来的前几毫秒内就 spawn 时，
+  supervisor 还没覆盖到它，**它会拿到自己的 console，输出因此进不了管道**。
+  最短的复现就是被标 ignored 的 `cmd_runs_python_through_the_substitution`
+  （`cmd /c python -c ...` 输出全空）。注意 README §5.3 里曾经建议的
+  "子进程 `CREATE_SUSPENDED` → 注入完再 resume"是**死路**，AGENTS.md 规则 31 记着
+  两个独立的阻塞点；唯一可行的是把注入拆成"挂起期间只映射 + 改 IAT（纯数据写入），
+  resume 之后再补 `CreateRemoteThread` 调入口"。
+- **实现输入侧的 console API**（§1.5）。`ReadConsoleInputW` + 行编辑 + **回显**。
+  没有回显时 Python REPL 的结果会跟在提示符后面同一行
+  （`>>> NEU7Q2K5`），这也是被标 ignored 的 `python_in_a_repl_reads_from_the_pipe`
+  卡住的原因——标记值确实回来了，缺的是 tty 回显。
+- Stage 9：端到端测试（大输出、stderr）。
 - Stage 10：README 定稿。
+
+> 上一版这里写的"`--shim` 现在是空承诺"已经不成立：第一批与第二批都已实现并有单测，
+> 见 §5.1。
 
 ### 5.4 Stage-3 阻塞点的**根因**（已定位，方案已定）
 
