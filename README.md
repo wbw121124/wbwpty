@@ -146,11 +146,34 @@ ResumeThread  ──►  loader 初始化 ──► ucrtbase!__acrt_initialize_s
 | `AllocConsole` / `FreeConsole` | no-op 且**返回成功**（真分配就会冒出 conhost） |
 | `AttachConsole` | 恒定失败（没有 console 可附着） |
 
-**尚未实现（需要屏幕）**：`GetConsoleScreenBufferInfo(Ex)` 这一族要光标位置和单元格网格，
-而网格需要堆——注入 DLL 是 `no_std` 无分配器（AGENTS 规则 3），**虚拟屏不能放在 DLL 里**，
-它在宿主那边（§5.6 的 `vt-parser`）。要回答这些调用就得往返宿主。
-在做完之前这些函数**故意不被拦截**：放着不管会诚实地失败，
-而用编出来的光标位置去应答会失败得莫名其妙。
+**第二批（已实现，屏幕在宿主侧）**：
+
+| API | 实现 |
+| --- | --- |
+| `GetConsoleScreenBufferInfo` | 宿主虚拟屏的光标位置 + 窗口尺寸 |
+| `GetConsoleCursorInfo` | 光标位置 + 可见性（`dwSize = 100`） |
+| `GetConsoleWindow` | 返回非 NULL 句柄——程序只用它判"有没有窗口" |
+| `Set/GetConsoleTextAttribute` | 传统属性字 |
+
+**机制**：宿主把状态**推进** payload 的映像里（和 `WBWPTY_STATUS` 同一个手段：
+`WriteProcessMemory` 写到一个从导出表解析出来的 RVA），不是每次调用往返。
+程序调 `GetConsoleScreenBufferInfo` 太频繁，同步往返会显形。
+
+40 字节的状态记录用 **seqlock** 写：一个进程写、另一个进程读的 40 字节结构，
+撕裂读是迟早的事，而撕裂的光标位置意味着程序跳到随机位置。
+`generation` 奇数 = 正在写，偶数 = 完整；读到值变了的读者重读一次。
+
+**仍然没做**：`ReadConsoleInputW`（要按键事件 → `term-input`，且需要独立的事件通道，
+不能和目标的 stdin 抢同一根管道）、`FillConsoleOutputCharacter` 这一族
+（要改屏幕，得由宿主代发控制序列）。
+
+> ⚠️ **陈旧是设计内的**：宿主是在**处理输出时**才推进状态的，也就是写已经离开管道之后。
+> 所以刚写完就问的程序可能读到写之前的位置。这个窗口 = 管道延迟，有界、不增长；
+> 要消掉它就得每次调用同步往返。
+
+**仍然没做（第一批就说明的）**：注入 DLL 是 `no_std` 无分配器（AGENTS 规则 3），
+所以**虚拟屏不能放在 DLL 里**，它在宿主（§5.6 的 `vt-parser`），
+payload 只能"被告知"而不能"自己算"。
 
 > 实测依据：`kernel32` 的控制台导出只是 6 字节跳转桩，真实实现在 `KernelBase.dll`；
 > 但**不需要**内联跳板——改写目标的**导入槽**就够了，而导入槽是数据，CFG 看不见它。
@@ -371,18 +394,21 @@ cargo test --release
 
 ### 5.1 已完成部分的实际状态（截至本次提交）
 
-- `cargo build --release` 绿；`cargo test --release` = **138 passed / 0 failed / 9 ignored**
+- `cargo build --release` 绿；`cargo test --release` = **144 passed / 0 failed / 9 ignored**
   （其中 **88 条来自 vendor 进来的 `vt-parser` / `term-input`**，它们自带的测试在本机全绿；
   9 条 ignored 的是**故意制造 console host** 的对照组，默认不跑，见 §1.8）。
 - `wbwpty.exe --dump-conhost -- cmd.exe /c echo hello` 实测：**hello 原样输出，exit=0，conhost.exe 数量不变**。
 - **三代进程树实测无 console host**（`probe → probe → ping`）：第三代的 `DETACHED_PROCESS`
   是从**后代自己 payload 里发布的 `WBWPTY_HOOK_FLAGS`** 读出来的，不是"碰巧没弹窗"。
   见 §1.7 与 `tests/descendant_injection.rs`。
-- `--shim` **现在是真的了**（第一批）：`WriteConsoleW` / `WriteConsoleA` / `GetConsoleMode` /
-  `SetConsoleMode` / `AllocConsole` / `FreeConsole` / `AttachConsole` 的导入槽被改写，
-  实测 `WriteConsoleW` 的输出真的进了管道，而关掉 shim 同一个调用什么也不产生
-  （`tests/console_shim.rs`，正反两条都断言）。
-  **仍未实现**：需要屏幕的那一族（`GetConsoleScreenBufferInfo` 等），见 §1.5。
+- `--shim` **第一批 + 第二批都实现了**：`WriteConsoleW/A`、`Get/SetConsoleMode`、
+  `Alloc/FreeConsole`、`AttachConsole`，以及需要屏幕的
+  `GetConsoleScreenBufferInfo` / `GetConsoleCursorInfo` / `GetConsoleWindow` /
+  `Get/SetConsoleTextAttribute`——导入槽被改写，屏幕状态由**宿主虚拟屏**推进。
+  实测：正反两条都断言（`tests/console_shim.rs`），
+  以及"目标问到的就是宿主那个屏"（`tests/console_state.rs`：
+  光标增量恰好是它写的字符数、几何恰好是会话配置的 100×30）。
+  **仍未实现**：`ReadConsoleInputW` 与改屏幕的那一族，见 §1.5。
 - 手工映射每一段机器码都有**真正执行**的单测（不是只比对字节），`stub.rs` 已简化为只负责"调 DllMain"，不再携带死代码。
 - 核心注入失败根因已定位：**stub 用 `r9d` 而不是 `edx` 传 `DLL_PROCESS_ATTACH`**（Win64 第 2 参数在 `rdx`），导致 `DllMain` 拿到假 reason 直接 return TRUE 而不做任何事；修完后 stub 调用真实成功。
 - **Stage 7 完成并实测有效**：同样的探针、同样的管道、同样的写，

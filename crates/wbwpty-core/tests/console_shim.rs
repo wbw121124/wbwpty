@@ -117,7 +117,7 @@ fn observe(shim: bool, text: &str) -> Observed {
     // saw half of will parse half a line - which is how "ok=" came to be read as
     // a verdict.
     while Instant::now() < deadline {
-        match session.pipes().with(|p| p.output().read(&mut buf, 200)) {
+        match session.pipes().with(|p| p.read_output(&mut buf, 200)) {
             Some(Ok(ReadEvent::Data(n))) => {
                 output.push_str(&String::from_utf8_lossy(&buf[..n]));
             }

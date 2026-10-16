@@ -26,7 +26,7 @@
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -231,6 +231,14 @@ pub struct Session {
     /// Watches the tree and gives every descendant the same treatment the target
     /// got. `None` when there was nothing to extend - see [`Self::start`].
     supervisor: Option<crate::supervisor::DescendantSupervisor>,
+    /// The virtual screen the target's output is fed into.
+    ///
+    /// `None` when the console shim is off, because nothing would ever ask it
+    /// anything, and feeding every output chunk through a VT parser to answer
+    /// nobody's question is work for nobody.
+    screen: Option<crate::screen::SharedScreen>,
+    /// RVA of the payload's published console state record.
+    console_state_rva: Option<u32>,
     shutting_down: Arc<AtomicBool>,
 }
 
@@ -301,6 +309,7 @@ impl Session {
         let crt_detail_rva = export_rva("WBWPTY_CRT_DETAIL");
         let hook_stats_rva = export_rva("WBWPTY_HOOK_STATS");
         let hook_flags_rva = export_rva("WBWPTY_HOOK_FLAGS");
+        let console_state_rva = export_rva("WBWPTY_CONSOLE_STATE");
 
         // Substitution goes in after the payload is mapped, because it points
         // into it. A target that does not import `CreateProcessW` is not an
@@ -408,6 +417,14 @@ impl Session {
             None
         };
 
+        let screen = match console_hook.as_ref() {
+            Some(_) => {
+                let (cols, rows) = (config.cols, config.rows);
+                Some(Arc::new(Mutex::new(crate::screen::Screen::new(cols, rows))))
+            }
+            None => None,
+        };
+
         let session = Self {
             child,
             pipes: Arc::new(SharedPipes::new(pipes)),
@@ -422,10 +439,41 @@ impl Session {
             console_hook,
             hook_error,
             supervisor,
+            screen,
+            console_state_rva,
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
         if pump_input {
             session.start_input_pump();
+        }
+
+        // The tap runs inside every read of the output pipe, whoever makes it -
+        // the CLI's pump or a test reading `Session::pipes()` itself. Installing
+        // it here rather than in `pump_output` is the point: a tap attached to
+        // one call site works in the demo and silently does nothing everywhere
+        // else, and "silently does nothing" is the failure mode this whole feature
+        // has to avoid.
+        let tap_screen = session.screen.clone();
+        let tap_handle = session.child.process_handle() as isize;
+        let tap_base = session.report.as_ref().map(|r| r.image_base);
+        let tap_rva = session.console_state_rva;
+        if tap_screen.is_some() {
+            let verbose = session.config.verbose;
+            session.pipes.with(|p| {
+                p.set_output_tap(Box::new(move |bytes: &[u8]| -> Vec<u8> {
+                    let Some(screen) = &tap_screen else {
+                        return Vec::new();
+                    };
+                    let (busy, done, replies) = {
+                        let mut screen = crate::screen::lock(screen);
+                        screen.feed(bytes);
+                        let (busy, done) = screen.publish();
+                        (busy, done, screen.take_replies())
+                    };
+                    publish_into(tap_handle, tap_base, tap_rva, busy, done, verbose);
+                    replies
+                }));
+            });
         }
 
         session.describe_console_state();
@@ -717,6 +765,46 @@ impl Session {
                 self.child.pid
             );
         }
+        if let Some(report) = &self.console_hook {
+            eprintln!(
+                "wbwpty: pid {} console API substitution: {} slot(s){}{}",
+                self.child.pid,
+                report.installed.len(),
+                if report.needed_protection_change {
+                    ", image pages made writable"
+                } else {
+                    ""
+                },
+                if report.not_intercepted.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; left alone: {}",
+                        report.not_intercepted.join(", ")
+                    )
+                }
+            );
+            // The address the state record is published at. Printed because a
+            // payload that reads a different one produces "the host never
+            // published anything" with no other symptom, and that is not
+            // diagnosable from outside without it.
+            eprintln!(
+                "wbwpty: pid {} console state at {:#x} (payload base {:#x}, rva {:#x})",
+                self.child.pid,
+                self.report
+                    .as_ref()
+                    .map(|r| r.image_base)
+                    .unwrap_or(0)
+                    + self.console_state_rva.unwrap_or(0) as u64,
+                self.report.as_ref().map(|r| r.image_base).unwrap_or(0),
+                self.console_state_rva.unwrap_or(0),
+            );
+        } else if self.report.is_some() && self.config.shim {
+            eprintln!(
+                "wbwpty: pid {} console API substitution: target uses none, or none could be written",
+                self.child.pid
+            );
+        }
     }
 
     /// The session's pipes, for a caller that wants to read the output itself
@@ -769,9 +857,12 @@ impl Session {
         let mut stdout = std::io::stdout();
 
         loop {
+            // Through `read_output`, not the bare end: that is the call which runs
+            // the tap, and the tap is what keeps the virtual screen and the
+            // payload's published state in step with what the target has printed.
             let read = self
                 .pipes
-                .with(|p| p.output().read(&mut buf, 100))
+                .with(|p| p.read_output(&mut buf, 100))
                 .ok_or_else(|| anyhow::anyhow!("session pipe lock poisoned"))?;
             match read? {
                 ReadEvent::Data(n) => {
@@ -783,6 +874,63 @@ impl Session {
                 ReadEvent::Timeout => continue,
                 ReadEvent::Eof => return Ok(()),
             }
+        }
+    }
+
+    /// Feeds target output into the virtual screen, publishes what changed, and
+    /// returns whatever the terminal owes the program.
+    ///
+    /// This is the [`crate::pipe::OutputTap`]. It runs inside the pipe read, so
+    /// the answers it returns go straight back down the input end - a program
+    /// that asked a question gets its answer whether or not it goes on to read
+    /// stdin.
+    ///
+    /// The screen is fed *before* the state is published and before the bytes
+    /// are shown, so by the time the cursor has visibly moved the payload can
+    /// already be told where it is.
+    fn absorb_output(&self, bytes: &[u8]) -> Vec<u8> {
+        let Some(screen) = &self.screen else {
+            return Vec::new();
+        };
+
+        let (busy, done, replies) = {
+            let mut screen = crate::screen::lock(screen);
+            screen.feed(bytes);
+            let (busy, done) = screen.publish();
+            (busy, done, screen.take_replies())
+        };
+
+        self.publish_console_state(busy, done);
+        replies
+    }
+
+    /// Writes the two halves of the seqlock into the payload's image.
+    fn publish_console_state(&self, busy: [u8; 40], done: [u8; 40]) {
+        publish_into(
+            self.child.process_handle() as isize,
+            self.report.as_ref().map(|r| r.image_base),
+            self.console_state_rva,
+            busy,
+            done,
+            self.config.verbose,
+        );
+    }
+
+    /// The virtual screen, for a caller that wants to look at it.
+    pub fn screen(&self) -> Option<crate::screen::SharedScreen> {
+        self.screen.clone()
+    }
+
+    /// Resizes the virtual screen, as a window change would.
+    ///
+    /// Not wired to anything yet: there is no control channel from the host
+    /// terminal to here (README 1.4 lists `WBWPTY_CTL` as the place for it, and it
+    /// is still just a name in the contract).
+    pub fn resize_screen(&self, cols: u16, rows: u16) {
+        if let Some(screen) = &self.screen {
+            crate::screen::lock(screen).resize(cols, rows);
+            let (busy, done) = crate::screen::lock(screen).publish();
+            self.publish_console_state(busy, done);
         }
     }
 
@@ -853,6 +1001,43 @@ impl Drop for Session {
         // after the terminate: a thread still covering the tree would otherwise
         // be writing into descendants of a process we just killed.
         drop(self.supervisor.take());
+    }
+}
+
+/// Writes the two halves of the seqlock into a live target.
+///
+/// A free function because the tap that calls it lives on the pipe read with
+/// nothing but its captures, and it has to be `Send` to sit in that closure.
+fn publish_into(
+    handle: isize,
+    base: Option<u64>,
+    rva: Option<u32>,
+    busy: [u8; 40],
+    done: [u8; 40],
+    verbose: bool,
+) {
+    let (Some(base), Some(rva)) = (base, rva) else {
+        return;
+    };
+    // SAFETY: `handle` is the session's own process handle, captured by value
+    // into the closure. A kernel handle is a value rather than a pointer into
+    // anything, and the session owns it for as long as the tap exists.
+    let proc = crate::manual_map::remote::RemoteProcess::new(handle as _);
+    let at = base + rva as u64;
+
+    // The odd half goes first: a payload that reads between them sees a counter
+    // saying a write is in progress and reads again, rather than believing a
+    // record that is half old and half new.
+    if let Err(err) = proc.write_bytes(at, &busy) {
+        if verbose {
+            eprintln!("wbwpty: could not mark the console state as being written: {err:#}");
+        }
+        return;
+    }
+    if let Err(err) = proc.write_bytes(at, &done) {
+        if verbose {
+            eprintln!("wbwpty: could not publish the console state: {err:#}");
+        }
     }
 }
 
@@ -961,7 +1146,7 @@ mod tests {
         while std::time::Instant::now() < deadline {
             let event = session
                 .pipes
-                .with(|p| p.output().read(&mut buf, 200))
+                .with(|p| p.read_output(&mut buf, 200))
                 .unwrap();
             match event {
                 Ok(ReadEvent::Data(n)) => text.push_str(&String::from_utf8_lossy(&buf[..n])),
@@ -1260,7 +1445,7 @@ fn grandchild_output_reaches_the_pipe() {
         let mut saw_marker = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while std::time::Instant::now() < deadline && !saw_marker {
-            match session.pipes.with(|p| p.output().read(&mut buf, 200)).unwrap() {
+            match session.pipes.with(|p| p.read_output(&mut buf, 200)).unwrap() {
                 Ok(ReadEvent::Data(n)) => {
                     for line in String::from_utf8_lossy(&buf[..n]).lines() {
                         if line.trim() == MARKER {
@@ -1309,7 +1494,7 @@ fn grandchild_output_reaches_the_pipe() {
         let mut text = String::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
-            match session.pipes.with(|p| p.output().read(&mut buf, 200)).unwrap() {
+            match session.pipes.with(|p| p.read_output(&mut buf, 200)).unwrap() {
                 Ok(ReadEvent::Data(n)) => text.push_str(&String::from_utf8_lossy(&buf[..n])),
                 Ok(ReadEvent::Eof) => break,
                 Ok(ReadEvent::Timeout) => {}

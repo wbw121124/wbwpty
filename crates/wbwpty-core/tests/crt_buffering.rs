@@ -111,7 +111,7 @@ fn measure_with(mode: Option<i32>, inject: bool) -> Measurement {
     let deadline = started + SLEEP * 4;
 
     while Instant::now() < deadline {
-        match session.pipes().with(|p| p.output().read(&mut buf, 50)) {
+        match session.pipes().with(|p| p.read_output(&mut buf, 50)) {
             Some(Ok(ReadEvent::Data(n))) => {
                 text.push_str(&String::from_utf8_lossy(&buf[..n]));
                 if first_payload.is_none() && text.contains("AAAAAAAA") {

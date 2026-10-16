@@ -67,6 +67,26 @@ pub const CONSOLE_APIS: &[ConsoleApi] = &[
         export: "wbwpty_write_console_a",
     },
     ConsoleApi {
+        win32_name: "GetConsoleScreenBufferInfo",
+        export: "wbwpty_get_console_screen_buffer_info",
+    },
+    ConsoleApi {
+        win32_name: "GetConsoleCursorInfo",
+        export: "wbwpty_get_console_cursor_info",
+    },
+    ConsoleApi {
+        win32_name: "GetConsoleWindow",
+        export: "wbwpty_get_console_window",
+    },
+    ConsoleApi {
+        win32_name: "SetConsoleTextAttribute",
+        export: "wbwpty_set_console_text_attribute",
+    },
+    ConsoleApi {
+        win32_name: "GetConsoleTextAttribute",
+        export: "wbwpty_get_console_text_attribute",
+    },
+    ConsoleApi {
         win32_name: "AllocConsole",
         export: "wbwpty_alloc_console",
     },
@@ -226,11 +246,90 @@ mod tests {
             .is_some());
     }
 
+    /// The walk must see every descriptor, not stop at the first plausible module.
+    ///
+    /// `wbwpty-spawn-probe.exe` imports `GetConsoleMode` and
+    /// `GetConsoleScreenBufferInfo` through **two separate import descriptors**
+    /// that both name kernel32 - one contributed by the CRT, one by the probe's own
+    /// `extern "system"` block. A walk that stops as soon as it has seen the module
+    /// it was looking for would find the first and miss the second, and the
+    /// symptom is indistinguishable from a target that does not use the console
+    /// API: "the substitution installed nothing".
+    ///
+    /// Both are asserted found, in the same image, with distinct slots.
+    #[test]
+    fn the_walk_sees_every_kernel32_descriptor() {
+        let Some(path) = probe_path() else {
+            eprintln!("skipping: wbwpty-spawn-probe.exe not built yet");
+            return;
+        };
+        let image = std::fs::read(&path).expect("read the probe");
+        let wanted: Vec<&str> = CONSOLE_APIS.iter().map(|a| a.win32_name).collect();
+        let found = iat::find_imports(&image, &wanted).expect("walk the probe's imports");
+
+        let slot_of = |name: &str| {
+            found
+                .iter()
+                .find(|s| s.symbol == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the probe calls {name} but the walk did not find it; it found {:?}",
+                        found.iter().map(|s| &s.symbol).collect::<Vec<_>>()
+                    )
+                })
+                .clone()
+        };
+
+        let first = slot_of("GetConsoleMode");
+        let second = slot_of("GetConsoleScreenBufferInfo");
+        assert_ne!(
+            first.iat_rva, second.iat_rva,
+            "two imports of the same module must resolve to different slots"
+        );
+
+        // And the substitute has to be findable for what the probe *does* import,
+        // because a slot with no substitute behind it is a silently dead rewrite.
+        let substitute_of = |name: &str| {
+            CONSOLE_APIS
+                .iter()
+                .find(|a| a.win32_name == name)
+                .unwrap_or_else(|| panic!("{name} is not in the intercepted set"))
+                .export
+        };
+        let payload = payload_image();
+        for name in ["GetConsoleMode", "GetConsoleScreenBufferInfo", "WriteConsoleW"] {
+            let export = substitute_of(name);
+            assert!(
+                crate::manual_map::find_export_rva(&payload, export)
+                    .expect("look up the export")
+                    .is_some(),
+                "the payload does not export {export} for {name}"
+            );
+        }
+    }
+
+    fn payload_image() -> Vec<u8> {
+        let Some(path) = payload_dll_path() else {
+            return Vec::new();
+        };
+        std::fs::read(path).unwrap_or_default()
+    }
+
     fn payload_dll_path() -> Option<std::path::PathBuf> {
         let exe = std::env::current_exe().ok()?;
         [
             exe.with_file_name("wbwpty_redirect.dll"),
             exe.parent()?.join("..").join("wbwpty_redirect.dll"),
+        ]
+        .into_iter()
+        .find(|c| c.is_file())
+    }
+
+    fn probe_path() -> Option<std::path::PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        [
+            exe.with_file_name("wbwpty-spawn-probe.exe"),
+            exe.parent()?.join("..").join("wbwpty-spawn-probe.exe"),
         ]
         .into_iter()
         .find(|c| c.is_file())

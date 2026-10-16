@@ -16,6 +16,7 @@ pub mod error;
 pub mod inspect;
 pub mod manual_map;
 pub mod pipe;
+pub mod screen;
 pub mod session;
 pub mod supervisor;
 

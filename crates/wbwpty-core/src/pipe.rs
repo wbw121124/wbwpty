@@ -305,7 +305,24 @@ impl PipeEnd {
 pub struct PipePair {
     input: PipeEnd,
     output: PipeEnd,
+    /// Sees every byte that leaves the output end, and may hand some back.
+    ///
+    /// Attached by [`Self::set_output_tap`]; see there for why reading has to go
+    /// through [`Self::read_output`] rather than straight at the end.
+    output_tap: Option<OutputTap>,
 }
+
+/// A bidirectional hook on the byte stream.
+///
+/// It is given output bytes and returns anything the target should be *sent* -
+/// for a terminal, the answers to the queries the program embedded in that
+/// output. Returning nothing is normal and costs nothing.
+///
+/// Bidirectional on purpose, and it lives here rather than in the caller: the
+/// read and the write happen inside one `&mut PipePair`, so a tap cannot deadlock
+/// against the mutex that guards the pipes, and no caller has to remember to
+/// flush anything.
+pub type OutputTap = Box<dyn FnMut(&[u8]) -> Vec<u8> + Send>;
 
 /// `PipePair` shared between the session's input and output pumps.
 ///
@@ -346,7 +363,48 @@ impl PipePair {
             &format!(r"\\.\pipe\wbwpty-{pid}-{nonce:016x}-out"),
             Direction::FromTarget,
         )?;
-        Ok(Self { input, output })
+        Ok(Self {
+            input,
+            output,
+            output_tap: None,
+        })
+    }
+
+    /// Attaches a tap that sees output bytes and may answer them.
+    ///
+    /// # Why reads have to go through [`Self::read_output`]
+    ///
+    /// Because whoever reads the target's output is who knows about it. This
+    /// project has more than one reader - the CLI's pump, and every test that
+    /// wants to assert on what the target printed - and the thing being tapped
+    /// (a virtual screen that has to exist before the target can ask about the
+    /// cursor) is wrong for whichever reader was not chosen. Bolting the tap onto
+    /// one call site is how a feature ends up working in the demo and silently
+    /// doing nothing in every test.
+    pub fn set_output_tap(&mut self, tap: OutputTap) {
+        self.output_tap = Some(tap);
+    }
+
+    /// Reads target output, and sends whatever the tap answers back to it.
+    ///
+    /// The write goes to the input end, which is where the target is listening:
+    /// a program that asked the terminal a question is waiting for the answer
+    /// where it asked it, and writing it to stdout would put the terminal's own
+    /// answer into the user's terminal.
+    pub fn read_output(&mut self, buf: &mut [u8], timeout_ms: u32) -> Result<ReadEvent> {
+        let event = self.output.read(buf, timeout_ms)?;
+        if let ReadEvent::Data(n) = &event {
+            if let Some(tap) = self.output_tap.as_mut() {
+                let answer = tap(&buf[..*n]);
+                if !answer.is_empty() {
+                    // Best effort, like every other write to a pipe here: a
+                    // target that has gone away is not an error worth failing a
+                    // read for.
+                    let _ = self.input.write_all(&answer);
+                }
+            }
+        }
+        Ok(event)
     }
 
     pub fn input(&mut self) -> &mut PipeEnd {

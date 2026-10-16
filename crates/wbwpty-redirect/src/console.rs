@@ -92,7 +92,300 @@ pub static mut WBWPTY_CONSOLE_STATS: u32 = 0;
 #[no_mangle]
 pub static mut WBWPTY_CONSOLE_MODE: u32 = DEFAULT_CONSOLE_MODE;
 
-/// `GetConsoleMode`.
+/// The screen state the host publishes for the substitutes below to answer from.
+///
+/// # Why it is pushed and not fetched
+///
+/// Because programs call `GetConsoleScreenBufferInfo` often enough that a
+/// synchronous question would show up, and this DLL cannot ask one: it has no
+/// heap, so it cannot hold a screen, so the screen is in the host. Pushing turns
+/// every query into a read of 40 bytes in our own address space.
+///
+/// # The seqlock
+///
+/// `generation` is odd while the host is writing the rest of the record and even
+/// when it is whole. A reader that sees it change between its two reads knows it
+/// caught a write in progress and reads again. Without it, a 40-byte struct
+/// written by one process and read by another is a torn read waiting to happen,
+/// and a torn cursor position is a program that jumps somewhere random.
+///
+/// `valid` is what the counter cannot say: an all-zero record and a record the
+/// host has never written both read as zeroes, and "the host does not know where
+/// the cursor is" and "the cursor is at 0,0" are different answers for a program.
+///
+/// Mirrors `wbwpty_core::screen::ConsoleState`. The two crates cannot depend on
+/// each other - one is the payload, one is its injector - so the layout is
+/// written twice, and a test on the host side checks the size.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ConsoleState {
+    pub generation: u32,
+    pub valid: u32,
+    pub cursor_x: u32,
+    pub cursor_y: u32,
+    pub cols: u32,
+    pub rows: u32,
+    pub attributes: u32,
+    pub cursor_visible: u32,
+    pub alt_screen: u32,
+    pub wrap: u32,
+}
+
+/// Where the host writes it. Read-only here: everything in this module is about
+/// answering questions, and the answers come from the host.
+#[no_mangle]
+pub static mut WBWPTY_CONSOLE_STATE: ConsoleState = ConsoleState {
+    generation: 0,
+    valid: 0,
+    cursor_x: 0,
+    cursor_y: 0,
+    cols: 0,
+    rows: 0,
+    attributes: 0,
+    cursor_visible: 0,
+    alt_screen: 0,
+    wrap: 0,
+};
+
+/// Reads the published state, retrying once if the host was mid-write.
+///
+/// Bounded on purpose: the substitute runs inside the target's call, and a program
+/// waiting on `GetConsoleScreenBufferInfo` is waiting on *us*. One retry is
+/// enough to cover a write that overlaps a read by a few instructions, which is
+/// what the seqlock is for; more would be a hostage situation.
+fn read_state() -> Option<ConsoleState> {
+    // A one-shot diagnostic, because "the host published and the payload did not
+    // see it" has three candidate causes - wrong address, wrong layout, no
+    // publish at all - and guessing between them from outside is how an afternoon
+    // goes missing.
+    let log = LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 3;
+
+    for _ in 0..2 {
+        // SAFETY: a read of our own published word. The host writes it with
+        // `WriteProcessMemory`, so the value can change underneath us - which is
+        // precisely what the two reads below are checking for.
+        let before = unsafe { core::ptr::addr_of!(WBWPTY_CONSOLE_STATE).read() };
+        if log {
+            crate::dlog!(
+                "console: state at {:p} size {} valid={} gen={} cursor={},{} cols={} rows={}",
+                core::ptr::addr_of!(WBWPTY_CONSOLE_STATE),
+                core::mem::size_of::<ConsoleState>(),
+                before.valid,
+                before.generation,
+                before.cursor_x,
+                before.cursor_y,
+                before.cols,
+                before.rows
+            );
+        }
+        if before.valid == 0 {
+            return None;
+        }
+        // SAFETY: as above.
+        let after = unsafe { core::ptr::addr_of!(WBWPTY_CONSOLE_STATE).read() };
+        if before.generation == after.generation && before.generation & 1 == 0 {
+            return Some(after);
+        }
+    }
+    None
+}
+
+/// How many times [`read_state`] has been asked, so the diagnostic stays quiet
+/// after the first few.
+static LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// `SMALL_RECT`: four shorts. `Left`/`Top` are the origin and `Right`/`Bottom`
+/// the inclusive far corner, so a size is the far corner plus one.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CoordRect {
+    left: i16,
+    top: i16,
+    right: i16,
+    bottom: i16,
+}
+
+/// `COORD`: **two** shorts.
+///
+/// Its own type on purpose. A `dwCursorPosition` declared as a `SMALL_RECT` is
+/// four bytes too wide, which shifts every field after it and produces a struct
+/// that looks right in a debugger and answers with the wrong rectangle.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Coord {
+    x: i16,
+    y: i16,
+}
+
+/// `CONSOLE_SCREEN_BUFFER_INFO`: exactly the layout a caller expects to read
+/// back, so the struct is the ABI rather than something built field by field.
+///
+/// Two things about the order are load bearing, and both are silent when wrong:
+/// the last two rects are `dwMaximumWindowSize` **then** `dwWindow`, and the
+/// cursor is a `COORD` and not a rect.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ScreenBufferInfo {
+    size: CoordRect,
+    cursor_position: Coord,
+    attributes: u16,
+    maximum_window_size: CoordRect,
+    window: CoordRect,
+}
+
+/// `CONSOLE_CURSOR_INFO`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CursorInfo {
+    size: u32,
+    visible: i32,
+}
+
+/// Geometry used when the host has published nothing yet.
+///
+/// Not "the cursor is at 0,0": a program that gets 80x25 and a visible cursor has
+/// something to work with, where a program that gets zero has to guess. The
+/// defaults are the ones the host publishes anyway, so this only applies between
+/// startup and the first output.
+const FALLBACK_COLS: u32 = 80;
+const FALLBACK_ROWS: u32 = 25;
+
+/// `GetConsoleScreenBufferInfo`.
+///
+/// The call this whole second batch exists for. A program that asks gets a real
+/// cursor position and a real window size, from the host's virtual screen.
+#[no_mangle]
+pub unsafe extern "system" fn wbwpty_get_console_screen_buffer_info(
+    _console: HANDLE,
+    info: *mut ScreenBufferInfo,
+) -> BOOL {
+    if info.is_null() {
+        return fail();
+    }
+    let state = read_state();
+    let (cols, rows) = match state {
+        Some(state) => (state.cols, state.rows),
+        None => (FALLBACK_COLS, FALLBACK_ROWS),
+    };
+    let (cx, cy, attrs, visible) = match state {
+        Some(state) => (
+            state.cursor_x,
+            state.cursor_y,
+            state.attributes,
+            state.cursor_visible,
+        ),
+        None => (0, 0, 0, 1),
+    };
+
+    // SAFETY: the caller passed an out parameter, and every field below is the
+    // right width for the one it stands for.
+    unsafe {
+        *info = ScreenBufferInfo {
+            // There are no scrollback lines in front of the window, because the
+            // host's screen keeps none (see `screen::Screen::new`).
+            size: CoordRect {
+                left: 0,
+                top: 0,
+                right: cols as i16 - 1,
+                bottom: rows as i16 - 1,
+            },
+            cursor_position: Coord {
+                x: cx as i16,
+                y: cy as i16,
+            },
+            attributes: attrs as u16,
+            maximum_window_size: CoordRect {
+                left: 0,
+                top: 0,
+                right: cols as i16 - 1,
+                bottom: rows as i16 - 1,
+            },
+            window: CoordRect {
+                left: 0,
+                top: 0,
+                right: cols as i16 - 1,
+                bottom: rows as i16 - 1,
+            },
+        };
+    }
+    let _ = visible;
+    count(ffi::TRUE)
+}
+
+/// `GetConsoleCursorInfo`.
+///
+/// `dwSize` is 100, which is the documented size of a console cursor. A program
+/// that is handed 0 concludes there is no cursor and stops drawing one.
+#[no_mangle]
+pub unsafe extern "system" fn wbwpty_get_console_cursor_info(
+    _console: HANDLE,
+    info: *mut CursorInfo,
+) -> BOOL {
+    if info.is_null() {
+        return fail();
+    }
+    let visible = read_state().map(|s| s.cursor_visible).unwrap_or(1);
+    // SAFETY: the caller's out parameter, and both fields are the right width.
+    unsafe {
+        *info = CursorInfo {
+            size: 100,
+            visible: visible as i32,
+        };
+    }
+    count(ffi::TRUE)
+}
+
+/// `GetConsoleWindow`.
+///
+/// A non-null handle, and that is the whole contract: programs call this to ask
+/// whether they have a window, and the honest answer - "no, and here is a
+/// surrogate" - is a value that is not `NULL`. The value itself is never used
+/// for anything but being compared against zero.
+///
+/// Pointing it at the target's own stdout would be a lie with consequences:
+/// `GetWindowRect` on a pipe handle fails, but some programs take the branch that
+/// says "I have a window" and go on to `ShowWindow` it.
+#[no_mangle]
+pub unsafe extern "system" fn wbwpty_get_console_window() -> HANDLE {
+    // SAFETY: the payload's own console handle word, a single word the host wrote
+    // before the substitution was installed. Non-null is the promise.
+    let handle = unsafe { WBWPTY_STD_HANDLES[1] as HANDLE };
+    let ok: BOOL = if handle.is_null() { ffi::FALSE } else { ffi::TRUE };
+    count(ok);
+    handle
+}
+
+/// `SetConsoleTextAttribute` / `GetConsoleTextAttribute` - the legacy attribute
+/// word, which is a palette index rather than a colour.
+///
+/// Reported as 7 on black, the default, because a program that sets an attribute
+/// and reads it back is checking that its own write round-tripped.
+#[no_mangle]
+pub unsafe extern "system" fn wbwpty_set_console_text_attribute(
+    _console: HANDLE,
+    attributes: u16,
+) -> BOOL {
+    TEXT_ATTRIBUTE.store(attributes as u32, core::sync::atomic::Ordering::Relaxed);
+    count(ffi::TRUE)
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn wbwpty_get_console_text_attribute(
+    _console: HANDLE,
+    attributes: *mut u16,
+) -> BOOL {
+    if attributes.is_null() {
+        return fail();
+    }
+    // SAFETY: the caller's out parameter.
+    unsafe { *attributes = TEXT_ATTRIBUTE.load(core::sync::atomic::Ordering::Relaxed) as u16 };
+    count(ffi::TRUE)
+}
+
+/// The legacy text attribute, default 7 (light on dark).
+static TEXT_ATTRIBUTE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0x07);
+
+/// `GetConsoleMode` without a handle changing anything.
 ///
 /// Reports a terminal's mode word for **any** handle, including one that is not a
 /// console. Refusing a pipe would be the honest answer and the useless one: the

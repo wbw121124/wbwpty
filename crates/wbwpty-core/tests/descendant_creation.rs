@@ -157,7 +157,7 @@ fn measure_output(args: &[&str]) -> bool {
     let mut saw = false;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline && !saw {
-        match session.pipes().with(|p| p.output().read(&mut buf, 100)) {
+        match session.pipes().with(|p| p.read_output(&mut buf, 100)) {
             Some(Ok(ReadEvent::Data(n))) => {
                 for line in String::from_utf8_lossy(&buf[..n]).lines() {
                     if line.trim() == MARKER {
@@ -402,7 +402,7 @@ fn drain_pipe(session: &Session) -> String {
     let mut text = String::new();
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
-        match session.pipes().with(|p| p.output().read(&mut buf, 100)) {
+        match session.pipes().with(|p| p.read_output(&mut buf, 100)) {
             Some(Ok(ReadEvent::Data(n))) => {
                 text.push_str(&String::from_utf8_lossy(&buf[..n]))
             }

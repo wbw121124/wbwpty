@@ -311,7 +311,7 @@ fn observe(cover_descendants: bool, release: Release) -> Observation {
     let mut buf = [0u8; 4096];
     let deadline = Instant::now() + OBSERVE;
     while Instant::now() < deadline {
-        match session.pipes().with(|p| p.output().read(&mut buf, 0)) {
+        match session.pipes().with(|p| p.read_output(&mut buf, 0)) {
             Some(Ok(ReadEvent::Data(n))) => {
                 for line in String::from_utf8_lossy(&buf[..n]).lines() {
                     let line = line.trim_end().to_string();

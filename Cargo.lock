@@ -307,6 +307,7 @@ dependencies = [
  "anyhow",
  "iced-x86",
  "tempfile",
+ "vt-parser",
  "windows-sys",
 ]
 

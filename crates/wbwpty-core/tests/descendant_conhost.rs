@@ -238,7 +238,7 @@ fn observe(inject: bool, patch_descendants: bool) -> Observation {
     while Instant::now() < deadline {
         match session
             .pipes()
-            .with(|p| p.output().read(&mut buf, 0))
+            .with(|p| p.read_output(&mut buf, 0))
         {
             Some(Ok(ReadEvent::Data(n))) => {
                 for line in String::from_utf8_lossy(&buf[..n]).lines() {

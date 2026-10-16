@@ -9,6 +9,9 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# The host's virtual screen. Zero platform dependencies, and `std` - which is
+# exactly why it cannot live in the `no_std` payload (see `src/screen.rs`).
+vt-parser = { path = "../vt-parser" }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",

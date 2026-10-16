@@ -17,7 +17,7 @@
 //! ```text
 //! wbwpty-spawn-probe [--std-handles|--no-std-handles] [--inherit|--no-inherit]
 //!                    [--pidfile <path>] [--gate <path>]
-//!                    [--console-write <text>]
+//!                    [--console-write <text>] [--console-info]
 //!                    <flag>...  --  <command line>
 //! ```
 //!
@@ -28,6 +28,10 @@
 //! `--console-write <text>` is a mode rather than a flag: it writes `text` to
 //! stdout through `WriteConsoleW` and exits, with nothing to spawn. It exists to
 //! be a subject for the console API substitution - see `tests/console_shim.rs`.
+//!
+//! `--console-info` is the other such mode: it writes a few characters, waits for
+//! the host's virtual screen to say where the cursor now is, and reports what
+//! `GetConsoleScreenBufferInfo` answered.
 //!
 //! # `--gate`
 //!
@@ -75,6 +79,7 @@ fn main() {
     let mut pidfile: Option<OsString> = None;
     let mut gate: Option<std::path::PathBuf> = None;
     let mut console_text: Option<OsString> = None;
+    let mut console_info_mode = false;
     let mut command: Option<OsString> = None;
 
     let mut args = std::env::args_os().skip(1);
@@ -88,6 +93,7 @@ fn main() {
             "--pidfile" => pidfile = args.next(),
             "--gate" => gate = args.next().map(std::path::PathBuf::from),
             "--console-write" => console_text = args.next(),
+            "--console-info" => console_info_mode = true,
             "--" => {
                 command = args.next();
                 break;
@@ -104,6 +110,10 @@ fn main() {
 
     if let Some(gate) = gate {
         wait_for_gate(&gate);
+    }
+
+    if console_info_mode {
+        console_info();
     }
 
     if let Some(text) = console_text {
@@ -252,6 +262,201 @@ extern "system" {
         chars_written: *mut u32,
         reserved: *mut std::ffi::c_void,
     ) -> i32;
+    #[allow(non_snake_case)]
+    fn GetConsoleScreenBufferInfo(
+        console_output: *mut std::ffi::c_void,
+        info: *mut ConsoleScreenBufferInfo,
+    ) -> i32;
+}
+
+/// `SMALL_RECT`, as a caller of `GetConsoleScreenBufferInfo` sees them.
+///
+/// Four shorts, and the *far* corner is what carries a size: `Left`/`Top` are the
+/// origin. Reading `Left` where a size was wanted gives `0`, which is why the
+/// first version of this fixture reported a 1x1 window and called it a day.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SmallRect {
+    left: i16,
+    top: i16,
+    right: i16,
+    bottom: i16,
+}
+
+/// `COORD`: two shorts and nothing else.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Coord {
+    x: i16,
+    y: i16,
+}
+
+/// `CONSOLE_SCREEN_BUFFER_INFO`.
+///
+/// Field order is the SDK's: `dwSize`, `dwCursorPosition`, `dwAttributes`,
+/// `dwMaximumWindowSize`, `dwWindow`. The last two are the pair that is easy to
+/// get backwards, and backwards is silent.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ConsoleScreenBufferInfo {
+    size: SmallRect,
+    cursor: Coord,
+    attributes: u16,
+    maximum_window_size: SmallRect,
+    window: SmallRect,
+}
+
+/// The geometry a `--console-info` run should report.
+///
+/// Distinct from the 80x25 everything defaults to, on both axes, so an answer
+/// that came from the payload's fallback cannot pass for one that came from the
+/// host's screen.
+pub const PROBE_COLS: u16 = 100;
+pub const PROBE_ROWS: u16 = 30;
+
+/// How many characters `--console-info` writes before asking where the cursor is.
+///
+/// Three, because the assertion is "the cursor moved by exactly this much", and a
+/// number the test chose is worth more than one read back from somewhere else.
+const PROBE_INFO_MOVES: usize = 3;
+
+/// Reported when the published screen state never caught up with the write.
+///
+/// Distinct from every other exit code here, because "the answer was wrong" and
+/// "there was no answer" are different failures.
+const CONSOLE_INFO_UNSETTLED: u32 = 0x42;
+
+/// How many consecutive identical cursor readings count as "the screen has
+/// stopped moving".
+const QUIET_POLLS: u32 = 4;
+
+/// Reads the screen, once.
+fn screen_info(handle: *mut std::ffi::c_void) -> Option<ConsoleScreenBufferInfo> {
+    let mut info = ConsoleScreenBufferInfo::default();
+    let ok = unsafe { GetConsoleScreenBufferInfo(handle, &mut info as *mut ConsoleScreenBufferInfo) };
+    (ok != 0).then_some(info)
+}
+
+/// The host's geometry, or `None` if it never showed up.
+fn is_host_geometry(info: &ConsoleScreenBufferInfo) -> bool {
+    i32::from(info.window.right) + 1 == i32::from(PROBE_COLS)
+        && i32::from(info.window.bottom) + 1 == i32::from(PROBE_ROWS)
+}
+
+/// Waits until the screen shows the host's geometry **and has stopped moving**.
+///
+/// The quiet part is not decoration. This probe's own log lines travel down the
+/// same pipe as its output, and the host drains that pipe in chunks it chooses -
+/// so a baseline taken the instant the geometry appears can still be followed by
+/// a chunk of "probe: released\r\n", and the measured delta then includes the
+/// fixture's own diagnostics. Waiting for the cursor to hold still removes the
+/// fixture from its own measurement.
+fn settled_baseline(handle: *mut std::ffi::c_void) -> Option<ConsoleScreenBufferInfo> {
+    let mut last_x = i16::MIN;
+    let mut quiet = 0u32;
+    let mut found = None;
+    for _ in 0..400 {
+        let Some(info) = screen_info(handle) else {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        };
+        if is_host_geometry(&info) {
+            found = Some(info);
+            if info.cursor.x == last_x {
+                quiet += 1;
+                if quiet >= QUIET_POLLS {
+                    return found;
+                }
+            } else {
+                quiet = 0;
+            }
+            last_x = info.cursor.x;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    found
+}
+
+/// Reports where the screen says the cursor is, once the screen says so.
+///
+/// Four steps, and each one exists because the obvious version of it measures
+/// the wrong thing:
+///
+/// 1. **Wait for the host's geometry, and for the screen to go quiet.** Until the
+///    state has been published the answer is the payload's fallback, and a
+///    fallback of 80x25 would sail through a test that never asked for 100x30.
+/// 2. **Record where the cursor is.** What is comparable is a *delta*: the
+///    probe's own log lines went down the same pipe as its output.
+/// 3. **Write three characters.**
+/// 4. **Wait for the cursor to catch up**, then report.
+///
+/// # Why the waits at all
+///
+/// The state is published, not fetched: the host writes it when it processes the
+/// output, which is after the write has left the pipe. So the first query
+/// legitimately sees the position from *before* the write. That is not a defect to
+/// be asserted away - it is the documented cost of not answering synchronously -
+/// and the property worth asserting is that the state **converges**. Polling for
+/// it is the honest way to measure convergence; a fixed sleep would only be
+/// measuring the machine's mood.
+fn console_info() -> ! {
+    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+
+    let baseline = settled_baseline(handle);
+    let before = baseline.unwrap_or_default();
+
+    write_console(handle, "abc");
+
+    let want_x = before.cursor.x as i32 + PROBE_INFO_MOVES as i32;
+    let mut last = before;
+    let mut settled = false;
+    for _ in 0..400 {
+        if let Some(info) = screen_info(handle) {
+            last = info;
+            if info.cursor.x as i32 == want_x {
+                settled = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let report = format!(
+        "info: cursor={},{} delta={} cols={} rows={} window={},{},{},{} baseline={} settled={}",
+        last.cursor.x,
+        last.cursor.y,
+        last.cursor.x - before.cursor.x,
+        last.window.right + 1,
+        last.window.bottom + 1,
+        last.window.left,
+        last.window.top,
+        last.window.right,
+        last.window.bottom,
+        baseline.is_some(),
+        settled
+    );
+    // Trailing newline: this line arrives twice on the same pipe - once through
+    // the shim, once through the probe's own stderr - and without a terminator the
+    // two copies fuse into one unreadable line.
+    write_console(handle, &format!("{report}\r\n"));
+    eprintln!("probe: {report}");
+
+    std::process::exit(if baseline.is_some() && settled { 0 } else { CONSOLE_INFO_UNSETTLED as i32 });
+}
+
+/// Writes `text` through `WriteConsoleW`, ignoring the result.
+fn write_console(handle: *mut std::ffi::c_void, text: &str) {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide: Vec<u16> = std::ffi::OsStr::new(text)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let chars = (wide.len() - 1) as u32;
+    let mut written = 0u32;
+    unsafe {
+        WriteConsoleW(handle, wide.as_ptr(), chars, &mut written, std::ptr::null_mut())
+    };
 }
 
 /// `STD_OUTPUT_HANDLE`.
