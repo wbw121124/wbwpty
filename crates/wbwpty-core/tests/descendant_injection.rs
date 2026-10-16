@@ -166,6 +166,10 @@ fn observe(cover_descendants: bool, release: Release) -> Observation {
         shim: false,
         inject: true,
         cover_descendants,
+        // Neither probe reads stdin, and the pump would deliver host stdin EOF
+        // at a moment the fixture does not control. The gates are what decide
+        // when these processes act, and stdin EOF is not on that list.
+        pump_input: false,
         ..Default::default()
     };
     let session = Session::start(

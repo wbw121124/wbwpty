@@ -59,6 +59,19 @@ pub struct SessionConfig {
     /// behaviour this project had before, and which only holds for two
     /// generations.
     pub cover_descendants: bool,
+    /// Mirror the host's stdin into the `-in` pipe.
+    ///
+    /// Off leaves the target's stdin open for the life of the session, which is
+    /// the only way to run an interactive target that is supposed to stay alive.
+    ///
+    /// This is not a convenience. The pump turns host stdin EOF into pipe EOF,
+    /// and an interactive `cmd.exe` exits the moment it sees one - so a test that
+    /// wants to assert something about a *live* target has to either keep host
+    /// stdin open (not something a test can arrange) or turn the pump off. Under
+    /// `cargo test` host stdin is whatever the harness inherited, which is how a
+    /// test that asserts "the target survived" comes to depend on whether the
+    /// machine it ran on had a terminal attached.
+    pub pump_input: bool,
     /// Report injection and shim decisions on stderr.
     pub verbose: bool,
     /// Virtual terminal geometry reported to the payload.
@@ -75,6 +88,7 @@ impl Default for SessionConfig {
             shim: true,
             inject: true,
             cover_descendants: true,
+            pump_input: true,
             verbose: false,
             rows: 25,
             cols: 80,
@@ -346,6 +360,7 @@ impl Session {
             _ => None,
         };
 
+        let pump_input = config.pump_input;
         let session = Self {
             child,
             pipes: Arc::new(SharedPipes::new(pipes)),
@@ -361,7 +376,9 @@ impl Session {
             supervisor,
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
-        session.start_input_pump();
+        if pump_input {
+            session.start_input_pump();
+        }
 
         session.describe_console_state();
         Ok(session)
@@ -919,7 +936,16 @@ mod tests {
             stdout: stdio.stdout,
             stderr: stdio.stderr,
         });
-        let config = SessionConfig { shim: false, verbose: true, inject: true, ..Default::default() };
+        let config = SessionConfig {
+            shim: false,
+            verbose: true,
+            inject: true,
+            // No input pump: this test's whole claim is that the target is still
+            // alive, and the pump delivers host stdin EOF - which an interactive
+            // `cmd.exe` exits on - at a moment this test does not control.
+            pump_input: false,
+            ..Default::default()
+        };
         let inject_flag = config.inject;
         let session = Session::start(&spec, config).unwrap();
 
@@ -1144,7 +1170,15 @@ mod tests {
 fn grandchild_output_reaches_the_pipe() {
         const MARKER: &str = "NEU7Q2K5";
         let spec = ChildSpec::new("cmd.exe");
-        let config = SessionConfig { shim: false, ..Default::default() };
+        // No input pump: the target has to stay alive for this test to mean
+        // anything, and the pump delivers host stdin EOF, which an interactive
+        // `cmd.exe` exits on. The test feeds the input pipe itself, a few lines
+        // below.
+        let config = SessionConfig {
+            shim: false,
+            pump_input: false,
+            ..Default::default()
+        };
         let session = Session::start(&spec, config).unwrap();
         session
             .report()
