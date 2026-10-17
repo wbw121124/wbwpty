@@ -273,7 +273,12 @@ impl std::fmt::Display for ModuleNotMapped {
 impl std::error::Error for ModuleNotMapped {}
 
 /// `GetModuleHandleW` in the host, 0 when the DLL is not loaded here.
-fn host_module_base(name: &str) -> u64 {
+/// A module's load address in *this* process.
+///
+/// Used as a candidate for a module's address in a target: system DLLs are
+/// loaded at the same address in every process on a boot, which is
+/// [Self::base_for_name] relies on after verifying it.
+pub fn host_module_base(name: &str) -> u64 {
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     // SAFETY: NUL terminated; a NULL return simply means "not loaded".
     unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(wide.as_ptr()) as u64 }

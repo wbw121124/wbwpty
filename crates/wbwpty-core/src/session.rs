@@ -1639,6 +1639,44 @@ fn inject_payload_two_phase(
         std::fs::read(&dll).with_context(|| format!("reading payload {}", dll.display()))?;
     let proc = crate::manual_map::remote::RemoteProcess::new(child.process_handle());
 
+    // Hook process creation while the target cannot yet run anything.
+    //
+    // The target is suspended, and a suspended process has only its executable and
+    // `ntdll` mapped - `kernelbase` arrives later, with the loader, at about 25 ms.
+    // `cmd.exe`'s first `CreateProcess` happens before 10 ms. So there is no moment
+    // at which `kernelbase` is both present and early enough, and every mechanism
+    // that waits for it is late by construction.
+    //
+    // `ntdll` is different: it is there from the moment the kernel creates the
+    // process, and `NtCreateUserProcess` is the one point every Win32 process
+    // creation API funnels into, with the creation flags as a plain value. So the
+    // hook goes in now, while the target is still at its entry point, and the first
+    // thing the target does when it runs - spawn - is intercepted.
+    //
+    // Best effort. A target that refuses the patch still runs; it just does not
+    // have this one protection.
+    if config.forced_stub && !child.is_resumed() {
+        match install_nt_creation_hook(&proc, config.verbose) {
+            Ok(at) => {
+                if config.verbose {
+                    eprintln!(
+                        "wbwpty: pid {} NtCreateUserProcess forced at {at:#x}, {}ms after spawn",
+                        child.pid,
+                        resume_at.elapsed().as_millis()
+                    );
+                }
+            }
+            Err(err) => {
+                if config.verbose {
+                    eprintln!(
+                        "wbwpty: pid {} could not hook NtCreateUserProcess: {err:#}",
+                        child.pid
+                    );
+                }
+            }
+        }
+    }
+
     let Some(mapping) = (if !child.is_resumed() {
         match crate::manual_map::SuspendedMapping::map_suspended(&proc, &file, "DllMain") {
             Ok(mapping) => Some(mapping),
@@ -1731,6 +1769,30 @@ fn default_dll_path() -> std::path::PathBuf {
         .ok()
         .and_then(|e| e.parent().map(|d| d.join("wbwpty_redirect.dll")))
         .unwrap_or_else(|| std::path::PathBuf::from("wbwpty_redirect.dll"))
+}
+
+/// Hooks `ntdll!NtCreateUserProcess` in a target that is still suspended.
+///
+/// Returns the address of the stub it installed.
+///
+/// System DLLs are loaded at the same address in every process on a boot, so the
+/// host's own `ntdll` is nearly always the right base - but "nearly" is not good
+/// enough for something about to be overwritten, so the base is confirmed by
+/// reading the image header out of the target first.
+fn install_nt_creation_hook(
+    proc: &crate::manual_map::remote::RemoteProcess,
+    verbose: bool,
+) -> Result<u64> {
+    use crate::manual_map::inline;
+    use anyhow::bail;
+
+    let ntdll = crate::manual_map::remote::host_module_base("ntdll.dll");
+    if ntdll == 0 {
+        bail!("ntdll is not mapped in the host, so its address in the target is unknown");
+    }
+    let stub = proc.allocate(inline::nt_forced_stub_size())?;
+    let _ = verbose;
+    Ok(inline::install_nt_forced_stub(proc, ntdll, stub)?.stub)
 }
 
 /// Waits for `kernelbase`, then forces `DETACHED_PROCESS` on every child the

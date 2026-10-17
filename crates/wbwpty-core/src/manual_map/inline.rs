@@ -341,21 +341,80 @@ pub fn publish_payload_image(image: Vec<u8>) {
 /// with a `[rsp+disp32]` memory destination omits. That is why these are 8 and 10
 /// bytes rather than the 6 and 8 they would otherwise be.
 pub fn force_detached_stub(flags_at_rsp_offset: u32) -> Vec<u8> {
-    let offset = flags_at_rsp_offset;
-    let mut out = Vec::with_capacity(18);
-    // `or dword ptr [rsp+offset], 8` - ModRM `0x8C` is mod `10`, reg `001`
-    // (/1 = OR), rm `100` (SIB).
-    out.extend_from_slice(&[0x83, 0x8C, 0x24]);
+    force_flags_at(flags_at_rsp_offset, 4)
+}
+
+/// Offset of `ProcessFlags` from `rsp` at the entry of `NtCreateUserProcess`.
+///
+/// Four register parameters, so the fifth is the first on the stack. It is a
+/// `ULONG_PTR` - eight bytes - unlike `CreateProcessW`'s `DWORD`, which is why the
+/// stub is generated at a different width rather than reused.
+pub const NT_CREATE_USER_PROCESS_FLAGS_OFFSET: u32 = 0x28;
+
+/// Forces `DETACHED_PROCESS` on the `ProcessFlags` argument of
+/// `NtCreateUserProcess`.
+///
+/// # Why this hook point rather than `CreateProcessW`
+///
+/// Because it exists in a process that has not started. `cmd.exe` is created
+/// suspended, and a suspended process has only its executable and `ntdll` mapped -
+/// `kernelbase` arrives later, with the loader, which is measured at about 25 ms.
+/// `cmd.exe`'s first `CreateProcess` happens before even 10 ms. So there is no
+/// moment at which `kernelbase` is both mapped and still early enough to matter.
+///
+/// `ntdll` is a different proposition: it is there from the moment the kernel
+/// creates the process, `NtCreateUserProcess` is the single point every Win32
+/// process-creation API funnels into, and it takes the creation flags as a plain
+/// value. So the child can be created suspended, the hook installed while it
+/// cannot run anything, and only then resumed.
+///
+/// # Encoding
+///
+/// 64-bit operand, so a REX.W prefix on both instructions - which also makes them
+/// longer than the 32-bit pair:
+///
+///   48 83 8C 24 28 00 00 00 08          or  qword [rsp+0x28], 8
+///   48 81 A4 24 28 00 00 00 00 F0FFFFFF and qword [rsp+0x28], 0xFFFFFFFFFFFFFFF0
+pub fn force_detached_stub_nt() -> Vec<u8> {
+    force_flags_at(NT_CREATE_USER_PROCESS_FLAGS_OFFSET, 8)
+}
+
+/// The flag-forcing pair, at a given stack offset and operand width.
+fn force_flags_at(offset: u32, width: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(22);
+    // `or` - group 1, /1; ModRM `0x8C` is mod `10`, reg `001`, rm `100` (SIB),
+    // which is what makes the operand `[rsp+disp32]` rather than a register.
+    if width == 8 {
+        // Sign-extended 32-bit operand, which does *not* mean a 32-bit operation:
+        // 0x83 has no qword form and REX.W promotes it. This is not a stylistic
+        // choice - a 32-bit operation would clear the low half of the flags and
+        // leave the top half, and the kernel reads the whole thing.
+        //
+        // The 32-bit encoding below is *not* usable here: with REX.W, `0x83 /1`
+        // is `or rbx, imm32` - ModRM rm `100` is REX.B rather than a SIB byte, so
+        // the displacement has nowhere to go and the instruction lands in a
+        // register. It decodes, which is how it survived a first attempt.
+        out.extend_from_slice(&[0x48, 0x83, 0x8C, 0x24]);
+        out.extend_from_slice(&offset.to_le_bytes());
+        out.push(0x08);
+    } else {
+        out.extend_from_slice(&[0x83, 0x8C, 0x24]);
+        out.extend_from_slice(&offset.to_le_bytes());
+        out.push(0x08);
+    }
+    // `and` - group 1, /4; ModRM `0xA4` is reg `100`. `0x8C` would be OR, and
+    // OR-ing a mask sets the bit instead of clearing it.
+    if width == 8 {
+        out.extend_from_slice(&[0x48, 0x81, 0xA4, 0x24]);
+    } else {
+        out.extend_from_slice(&[0x81, 0xA4, 0x24]);
+    }
     out.extend_from_slice(&offset.to_le_bytes());
-    out.push(0x08);
-    // `and dword ptr [rsp+offset], ~0x10` - clears `CREATE_NEW_CONSOLE`, which the
-    // docs call undefined in combination with `DETACHED_PROCESS`.
-    //
-    // ModRM `0xA4`, not `0x8C`: `0xA4` is reg `100`, which is `/4` = AND. `0x8C`
-    // is `/1` = OR, and OR-ing a mask is the exact opposite operation - it would
-    // *set* `CREATE_NEW_CONSOLE`, the flag this is meant to remove.
-    out.extend_from_slice(&[0x81, 0xA4, 0x24]);
-    out.extend_from_slice(&offset.to_le_bytes());
+    // `0x81 /4` takes an imm32 and *sign-extends* it, which is what makes this one
+    // four bytes wide enough for a 64-bit operand: 0xFFFFFFF0 becomes
+    // 0xFFFFFFFFFFFFFFF0. Writing the full eight bytes instead leaves four of them
+    // stranded after the instruction, and the stub then fails to decode at its own
+    // length - the mask's high dwords were never encoded anywhere.
     out.extend_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
     out
 }
@@ -403,12 +462,103 @@ pub fn install_forced_stub(proc: &RemoteProcess, entry: u64, stub: u64) -> Resul
     let mut body = force_detached_stub(CREATE_PROCESS_W_FLAGS_OFFSET);
     body.extend_from_slice(&prologue);
     body.extend_from_slice(&jump_absolute(entry + PROLOGUE_LEN as u64));
-    proc.write_bytes(stub, &body)
+proc.write_bytes(stub, &body)
         .with_context(|| format!("writing the stub at {stub:#x}"))?;
+    make_writable(proc, entry, PROLOGUE_LEN)?;
     proc.write_bytes(entry, &jump_absolute(stub))
         .with_context(|| format!("patching {entry:#x}"))?;
 
     Ok(ForcedStub { entry, stub })
+}
+
+/// Bytes [`install_nt_forced_stub`] writes.
+pub fn nt_forced_stub_size() -> usize {
+    force_detached_stub_nt().len() + PROLOGUE_LEN * 2
+}
+
+/// Patches `ntdll!NtCreateUserProcess` so it forces `DETACHED_PROCESS`.
+///
+/// Unlike [`install_forced_stub`] this is meant to be called while the target is
+/// **suspended**, which is the point: `ntdll` is mapped from the moment the kernel
+/// creates a process, so this can be in place before the target runs a single
+/// instruction. `kernelbase` cannot - it arrives with the loader, by which time a
+/// target like `cmd.exe` has already spawned.
+///
+/// `ntdll_base` is where `ntdll` is in the target. System DLLs are loaded at the
+/// same address in every process on a boot, so the host's own is almost always
+/// correct, but it is verified by reading the image header out of the target
+/// before anything is written - a wrong address here would patch whatever happens
+/// to live there in someone else's process.
+pub fn install_nt_forced_stub(
+    proc: &RemoteProcess,
+    ntdll_base: u64,
+    stub: u64,
+) -> Result<ForcedStub> {
+    let entry = resolve_nt_export(proc, ntdll_base, "NtCreateUserProcess")?;
+    let prologue = proc
+        .read_bytes(entry, PROLOGUE_LEN)
+        .with_context(|| format!("reading the prologue of NtCreateUserProcess at {entry:#x}"))?;
+    if !is_relocatable(&prologue) {
+        bail!(
+            "the first {PROLOGUE_LEN} bytes of NtCreateUserProcess at {entry:#x} are \
+             not position-independent, so they cannot be relocated"
+        );
+    }
+    if stub == 0 {
+        bail!("no stub buffer was provided");
+    }
+
+    let mut body = force_detached_stub_nt();
+    body.extend_from_slice(&prologue);
+    body.extend_from_slice(&jump_absolute(entry + PROLOGUE_LEN as u64));
+    proc.write_bytes(stub, &body)
+        .with_context(|| format!("writing the NtCreateUserProcess stub at {stub:#x}"))?;
+    make_writable(proc, entry, PROLOGUE_LEN)?;
+    proc.write_bytes(entry, &jump_absolute(stub))
+        .with_context(|| format!("patching NtCreateUserProcess at {entry:#x}"))?;
+
+    Ok(ForcedStub { entry, stub })
+}
+
+/// The address of an `ntdll` export, read from the *target's* `ntdll` on disk.
+///
+/// The file is read locally rather than across the process: `ntdll.dll` is about
+/// two megabytes and its export directory is large, and this runs while the
+/// target is suspended and every microsecond of the startup budget still matters.
+fn resolve_nt_export(proc: &RemoteProcess, ntdll_base: u64, export: &str) -> Result<u64> {
+    // Confirm the assumed base before using it. Reading two bytes cannot fault and
+    // costs nothing; writing to the wrong address would.
+    let magic = proc.read_bytes(ntdll_base, 2)?;
+    if &magic != b"MZ" {
+        bail!(
+            "ntdll does not appear to be mapped at {ntdll_base:#x} in the target \
+             (found {magic:?} instead of MZ)"
+        );
+    }
+
+    let path = std::path::Path::new("C:\\Windows\\System32\\ntdll.dll");
+    let module = crate::manual_map::RemoteModule {
+        base: ntdll_base,
+        size: 0,
+        full_name: path.display().to_string(),
+        base_name: "ntdll.dll".to_string(),
+    };
+    let table = crate::manual_map::exports::load_exports_from_file(path, &module)?;
+    find_export(ntdll_base, &table, export)
+}
+
+/// Makes `len` bytes at `addr` writable in the target, remembering nothing.
+///
+/// An image section is not writable by contract even when it happens to be, and
+/// the failure otherwise is `WriteProcessMemory` refusing with a bare
+/// `ERROR_ACCESS_DENIED` that says nothing about which of the two it was.
+fn make_writable(proc: &RemoteProcess, addr: u64, len: usize) -> Result<()> {
+    proc.protect(
+        addr,
+        len,
+        windows_sys::Win32::System::Memory::PAGE_EXECUTE_READWRITE,
+    )
+    .with_context(|| format!("making {addr:#x} executable and writable"))
 }
 
 #[cfg(test)]
@@ -536,7 +686,11 @@ mod tests {
         let mut decoder = Decoder::with_ip(64, &code, 0, DecoderOptions::NONE);
         let mut seen: Vec<Mnemonic> = Vec::new();
 
-        while decoder.can_decode() {
+        // can_decode is true whenever *any* further decode would succeed, including
+        // one that runs off the end - which is why it must not be the loop
+        // condition here. The trailing position() == len assertion below is what
+        // proves the whole buffer was covered rather than a prefix of it.
+        while decoder.position() < code.len() {
             let i = decoder.decode();
             assert_ne!(
                 i.code(),
@@ -613,5 +767,47 @@ mod tests {
             "the constant and the calling convention disagree about where \
              dwCreationFlags lives"
         );
+    }
+    /// The ntdll stub is the same pair, in 64 bits.
+    ///
+    /// `ProcessFlags` on `NtCreateUserProcess` is a `ULONG_PTR`, so both
+    /// instructions need a REX.W prefix - and a prefix changes the encoding length,
+    /// so this cannot be assumed to be the 32-bit stub with two extra bytes.
+    #[test]
+    fn the_nt_stub_decodes_as_a_64_bit_flag_forcer() {
+        use iced_x86::{Code, Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+
+        let code = force_detached_stub_nt();
+        let mut decoder = Decoder::with_ip(64, &code, 0, DecoderOptions::NONE);
+        let mut seen: Vec<Mnemonic> = Vec::new();
+
+        // can_decode is true whenever *any* further decode would succeed, including
+        // one that runs off the end - which is why it must not be the loop
+        // condition here. The trailing position() == len assertion below is what
+        // proves the whole buffer was covered rather than a prefix of it.
+        while decoder.position() < code.len() {
+            let i = decoder.decode();
+            assert_ne!(i.code(), Code::INVALID, "does not decode at {:#x}", i.ip());
+            assert_eq!(i.op_kind(0), OpKind::Memory, "{:?}", i.mnemonic());
+            assert_eq!(i.memory_base(), Register::RSP, "{:?}", i.mnemonic());
+            assert_eq!(
+                i.memory_displacement64(),
+                NT_CREATE_USER_PROCESS_FLAGS_OFFSET as u64,
+                "{:?} addresses the wrong stack slot",
+                i.mnemonic()
+            );
+            // The whole point of the REX.W: a 32-bit operation would leave the top
+            // half of the flags alone, so clearing CREATE_NEW_CONSOLE in the low
+            // dword while the kernel reads a qword would not clear it at all.
+            assert_eq!(
+                i.memory_size(),
+                iced_x86::MemorySize::UInt64,
+                "{:?} is not 64-bit - it would only half-modify the flags",
+                i.mnemonic()
+            );
+            seen.push(i.mnemonic());
+        }
+        assert_eq!(seen, vec![Mnemonic::Or, Mnemonic::And]);
+        assert_eq!(code.len(), decoder.position(), "trailing bytes");
     }
 }
