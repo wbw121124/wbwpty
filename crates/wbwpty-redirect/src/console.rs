@@ -166,17 +166,24 @@ fn read_state() -> Option<ConsoleState> {
         // precisely what the two reads below are checking for.
         let before = unsafe { core::ptr::addr_of!(WBWPTY_CONSOLE_STATE).read() };
         if log {
-            crate::dlog!(
-                "console: state at {:p} size {} valid={} gen={} cursor={},{} cols={} rows={}",
-                core::ptr::addr_of!(WBWPTY_CONSOLE_STATE),
-                core::mem::size_of::<ConsoleState>(),
-                before.valid,
-                before.generation,
-                before.cursor_x,
-                before.cursor_y,
-                before.cols,
-                before.rows
-            );
+            crate::dlog!(|m| {
+                m.str("console: state at ")
+                    .hex(core::ptr::addr_of!(WBWPTY_CONSOLE_STATE) as u64)
+                    .str(" size ")
+                    .u64(core::mem::size_of::<ConsoleState>() as u64)
+                    .str(" valid=")
+                    .flag(before.valid != 0)
+                    .str(" gen=")
+                    .u64(before.generation as u64)
+                    .str(" cursor=")
+                    .u64(before.cursor_x as u64)
+                    .bytes(b",")
+                    .u64(before.cursor_y as u64)
+                    .str(" cols=")
+                    .u64(before.cols as u64)
+                    .str(" rows=")
+                    .u64(before.rows as u64);
+            });
         }
         if before.valid == 0 {
             return None;

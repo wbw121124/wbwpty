@@ -343,6 +343,11 @@ extern "system" {
     pub fn Sleep(dwMilliseconds: DWORD);
     pub fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) -> DWORD;
     pub fn GetCurrentProcessId() -> DWORD;
+    // Used by `crt_shim`'s `_exit`, which needs to express "leave now" without
+    // importing `ExitProcess` - an import here is a module the *target* would
+    // have to have loaded before this payload could be injected. See `crt_shim`.
+    pub fn GetCurrentProcess() -> HANDLE;
+    pub fn TerminateProcess(hProcess: HANDLE, uExitCode: DWORD) -> BOOL;
     pub fn GetModuleHandleW(lpModuleName: LPCWSTR) -> HMODULE;
     pub fn GetProcAddress(hModule: HMODULE, lpProcName: LPCSTR) -> FARPROC;
     pub fn LoadLibraryW(lpLibFileName: LPCWSTR) -> HMODULE;

@@ -15,5 +15,20 @@ crate-type = ["cdylib"]
 test = false
 doctest = false
 
+# Deliberately empty. `iced-x86` was declared here for the decoder that
+# `hook.rs` carries a hand-written fallback for (AGENTS pitfall: `iced-x86` does
+# not build under `no_std`), and the fallback is what actually ships - the crate
+# was never referenced by a single line of this crate's source.
+#
+# It mattered anyway. A cdylib's import list is the set of modules injection has
+# to wait for the *target* to load, and an unused dependency still contributes
+# code: linking `iced-x86` dragged in `memcpy`, `memset`, `strlen` and the
+# compiler-builtins support around them, which pulled in five
+# `api-ms-win-crt-*` DLLs. `cmd.exe` needs about 50 ms to load those, and
+# `cmd.exe /c <command>` spawns its first child well inside that, so the
+# `CreateProcess` substitution could never be installed in time - measured at
+# 59 ms after spawn, with the child's `conhost.exe` already created.
+#
+# See `log.rs` for the other half: the payload's own formatting was the rest of
+# it.
 [dependencies]
-iced-x86.workspace = true

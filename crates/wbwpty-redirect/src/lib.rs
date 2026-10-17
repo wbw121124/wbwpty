@@ -14,6 +14,7 @@
 pub mod config;
 pub mod console;
 pub mod crt;
+pub mod crt_shim;
 pub mod ffi;
 pub mod hook;
 pub mod log;
@@ -196,15 +197,20 @@ unsafe extern "system" fn worker(arg: *mut c_void) -> DWORD {
             },
             reason,
         );
-        crate::dlog!(
-            "crt: ucrt_resolved={} streams_set={} streams_refused={} rows={} cols={} shim={}",
-            outcome.ucrt_resolved,
-            outcome.streams_set,
-            outcome.streams_refused,
-            crate::config::rows(),
-            crate::config::cols(),
-            crate::config::shim(),
-        );
+        crate::dlog!(|m| {
+            m.str("crt: ucrt_resolved=")
+                .flag(outcome.ucrt_resolved)
+                .str(" streams_set=")
+                .u64(outcome.streams_set as u64)
+                .str(" streams_refused=")
+                .u64(outcome.streams_refused as u64)
+                .str(" rows=")
+                .u64(crate::config::rows() as u64)
+                .str(" cols=")
+                .u64(crate::config::cols() as u64)
+                .str(" shim=")
+                .flag(crate::config::shim());
+        });
         WBWPTY_STATUS = status_word(stage::DONE, reason);
     }
     0
@@ -228,6 +234,15 @@ extern "C" fn rust_eh_personality() {}
 /// A panic in a `no_std` DLL must not unwind. Report and spin forever; the host
 /// watchdog will terminate the target rather than corrupt its state.
 ///
+/// The message deliberately does **not** include the `PanicInfo`. Formatting it
+/// means `core::fmt`, and `core::fmt` means `strlen`, `memcpy` and
+/// `__stdio_common_vfprintf` - which means the payload cannot be injected until
+/// the target has loaded the UCRT, which means it loses the race against the
+/// target's own first `CreateProcess`. See [`crate::log`].
+///
+/// A panic location would be nice to have and is not worth 50 ms of the
+/// injection window; `WBWPTY_STATUS` still records how far the attach path got.
+///
 /// `cfg(not(test))` because the `[lib] test = false` setting is not enough on
 /// its own: a workspace-wide `cargo test <filter>` still builds this crate's lib
 /// test target, and two `#[panic_handler]`s in one binary is `E0152`. The lib is
@@ -235,8 +250,9 @@ extern "C" fn rust_eh_personality() {}
 /// a real target process - so under `cfg(test)` the harness' handler is fine.
 #[cfg(not(test))]
 #[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-    crate::dlog!("panic in DllMain: {}", info);
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    crate::dlog_line!("panic in DllMain (message suppressed: formatting would \
+                       pull the C runtime into the payload)");
     loop {
         // SAFETY: `Sleep` has no preconditions; `INFINITE` keeps us parked.
         unsafe { ffi::Sleep(0xffff_ffff) };

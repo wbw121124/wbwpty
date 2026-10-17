@@ -314,9 +314,6 @@ dependencies = [
 [[package]]
 name = "wbwpty-redirect"
 version = "0.1.0"
-dependencies = [
- "iced-x86",
-]
 
 [[package]]
 name = "windows-link"
