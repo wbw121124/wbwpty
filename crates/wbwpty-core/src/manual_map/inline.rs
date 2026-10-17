@@ -561,6 +561,68 @@ fn make_writable(proc: &RemoteProcess, addr: u64, len: usize) -> Result<()> {
     .with_context(|| format!("making {addr:#x} executable and writable"))
 }
 
+/// Patches `ntdll!RtlCreateUserProcess` so it forces `DETACHED_PROCESS`.
+///
+/// # Why this function and not `NtCreateUserProcess`
+///
+/// `NtCreateUserProcess` is where everything funnels into, and it cannot be hooked
+/// this way: its first twelve bytes contain a RIP-relative test
+/// (`f6 04 25 08 ...`), so they cannot be relocated into a trampoline, and
+/// refusing is the correct outcome rather than a near miss. The same test byte
+/// opens `NtCreateProcess` and `NtCreateProcessEx`.
+///
+/// `RtlCreateUserProcess` has a prologue of three ordinary instructions -
+/// `mov r11, rsp; sub rsp, 0x78; and qword [rsp+0x34], 0` - which relocates
+/// cleanly. It is the user-mode entry the Win32 implementation goes through, and
+/// `Rtl` is where the flag translation happens.
+///
+/// # The argument position, and why it is not the ntdll one
+///
+/// `ProcessFlags` is the fifth parameter, so at entry it is at `rsp + 0x28` - the
+/// same offset `NtCreateUserProcess` uses.
+///
+/// Careful here, though: the relocation puts those three instructions *after* the
+/// `sub rsp, 0x78`, so the stack the relocated code sees is 0x78 deeper than the
+/// one the flag-forcing ran on. They do not interfere - the flag forcing runs
+/// before the prologue and the prologue does not touch `rsp + 0x28` - but a stub
+/// that were to read its arguments *after* the relocated prologue would be
+/// reading the wrong slot, and nothing about the failure would say so.
+pub fn install_rtl_creation_hook(
+    proc: &RemoteProcess,
+    ntdll_base: u64,
+    stub: u64,
+) -> Result<ForcedStub> {
+    let entry = resolve_nt_export(proc, ntdll_base, "RtlCreateUserProcess")?;
+    let prologue = proc
+        .read_bytes(entry, PROLOGUE_LEN)
+        .with_context(|| format!("reading the prologue of RtlCreateUserProcess at {entry:#x}"))?;
+    if !is_relocatable(&prologue) {
+        bail!(
+            "the first {PROLOGUE_LEN} bytes of RtlCreateUserProcess at {entry:#x} are \
+             not position-independent, so they cannot be relocated"
+        );
+    }
+    if stub == 0 {
+        bail!("no stub buffer was provided");
+    }
+
+    let mut body = force_detached_stub_nt();
+    body.extend_from_slice(&prologue);
+    body.extend_from_slice(&jump_absolute(entry + PROLOGUE_LEN as u64));
+    proc.write_bytes(stub, &body)
+        .with_context(|| format!("writing the RtlCreateUserProcess stub at {stub:#x}"))?;
+    make_writable(proc, entry, PROLOGUE_LEN)?;
+    proc.write_bytes(entry, &jump_absolute(stub))
+        .with_context(|| format!("patching RtlCreateUserProcess at {entry:#x}"))?;
+
+    Ok(ForcedStub { entry, stub })
+}
+
+/// Bytes [`install_rtl_creation_hook`] writes.
+pub fn rtl_forced_stub_size() -> usize {
+    force_detached_stub_nt().len() + PROLOGUE_LEN * 2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,5 +871,65 @@ mod tests {
         }
         assert_eq!(seen, vec![Mnemonic::Or, Mnemonic::And]);
         assert_eq!(code.len(), decoder.position(), "trailing bytes");
+    }
+    /// Scratch, kept because the answer is worth more than the code that finds it.
+    ///
+    /// Which of ntdll's process-creation entry points has a relocatable prologue?
+    /// `NtCreateUserProcess` - the one everything funnels into - does not, which is
+    /// what stopped the suspended-injection path. The others are listed so the
+    /// question does not have to be answered again by hand.
+    #[test]
+    fn which_ntdll_entry_points_have_a_relocatable_prologue() {
+        use crate::manual_map::pe::{PeImage, DIRECTORY_ENTRY_EXPORT};
+
+        let path = std::path::Path::new("C:\\Windows\\System32\\ntdll.dll");
+        let Ok(bytes) = std::fs::read(path) else {
+            eprintln!("no ntdll to look at");
+            return;
+        };
+        let Ok(pe) = PeImage::parse(&bytes) else {
+            eprintln!("could not parse ntdll");
+            return;
+        };
+        let Some(dir) = pe.info.directory(DIRECTORY_ENTRY_EXPORT) else {
+            return;
+        };
+        let Ok(header) = pe.read_rva(dir.virtual_address, 0x28) else {
+            return;
+        };
+        let at = |o: usize| u32::from_le_bytes(header[o..o + 4].try_into().unwrap());
+        let number_of_names = at(0x18) as usize;
+        let functions = pe.read_rva(at(0x1c), number_of_names * 4).unwrap();
+        let names = pe.read_rva(at(0x20), number_of_names * 4).unwrap();
+        let ordinals = pe.read_rva(at(0x24), number_of_names * 2).unwrap();
+
+        let want = [
+            "NtCreateUserProcess",
+            "NtCreateProcess",
+            "NtCreateProcessEx",
+            "RtlCreateUserProcess",
+        ];
+        for i in 0..number_of_names {
+            let name_rva = u32::from_le_bytes(names[i * 4..i * 4 + 4].try_into().unwrap());
+            let ord = u16::from_le_bytes(ordinals[i * 2..i * 2 + 2].try_into().unwrap()) as usize;
+            let Some(nb) = pe.read_rva(name_rva, 64).ok() else { continue };
+            let end = nb.iter().position(|&b| b == 0).unwrap_or(0);
+            let name = String::from_utf8_lossy(&nb[..end]).into_owned();
+            if !want.contains(&name.as_str()) {
+                continue;
+            }
+            let rva = u32::from_le_bytes(functions[ord * 4..ord * 4 + 4].try_into().unwrap());
+            if (dir.virtual_address..dir.virtual_address + dir.size).contains(&rva) {
+                eprintln!("{name:24} forwarder");
+                continue;
+            }
+            let Ok(window) = pe.read_rva(rva, 12) else { continue };
+            let hex: Vec<String> = window.iter().map(|b| format!("{b:02x}")).collect();
+            eprintln!(
+                "{name:24} rva=0x{rva:08x} relocatable={} bytes=[{}]",
+                is_relocatable(&window),
+                hex.join(" ")
+            );
+        }
     }
 }

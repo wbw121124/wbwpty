@@ -161,7 +161,7 @@ impl Default for SessionConfig {
             cover_descendants: true,
             handover: true,
             inline_process_hook: true,
-            forced_stub: false,
+            forced_stub: true,
             pump_input: true,
             verbose: false,
             explicit_environment: false,
@@ -1639,68 +1639,26 @@ fn inject_payload_two_phase(
         std::fs::read(&dll).with_context(|| format!("reading payload {}", dll.display()))?;
     let proc = crate::manual_map::remote::RemoteProcess::new(child.process_handle());
 
-    // Hook process creation while the target cannot yet run anything.
+    // Order matters, and it is the opposite of what it looks like.
     //
-    // The target is suspended, and a suspended process has only its executable and
-    // `ntdll` mapped - `kernelbase` arrives later, with the loader, at about 25 ms.
-    // `cmd.exe`'s first `CreateProcess` happens before 10 ms. So there is no moment
-    // at which `kernelbase` is both present and early enough, and every mechanism
-    // that waits for it is late by construction.
+    // The stub needs only `kernelbase`'s address, and the loader maps that before
+    // it transfers control to the target's entry point - so it is there within a
+    // fraction of a millisecond of the resume, measured at 194 µs. Writing the
+    // 276 KB payload first pushes the resume back by several milliseconds, and by
+    // then `cmd.exe` has already spawned: it reaches its entry point and creates
+    // its child within about eight milliseconds of resuming.
     //
-    // `ntdll` is different: it is there from the moment the kernel creates the
-    // process, and `NtCreateUserProcess` is the one point every Win32 process
-    // creation API funnels into, with the creation flags as a plain value. So the
-    // hook goes in now, while the target is still at its entry point, and the first
-    // thing the target does when it runs - spawn - is intercepted.
+    // So: resume, patch, and only then start the payload work. The payload can
+    // take as long as it likes - by the time it is ready the spawn it needed to
+    // intercept has already been intercepted.
     //
-    // Best effort. A target that refuses the patch still runs; it just does not
-    // have this one protection.
-    if config.forced_stub && !child.is_resumed() {
-        match install_nt_creation_hook(&proc, config.verbose) {
-            Ok(at) => {
-                if config.verbose {
-                    eprintln!(
-                        "wbwpty: pid {} NtCreateUserProcess forced at {at:#x}, {}ms after spawn",
-                        child.pid,
-                        resume_at.elapsed().as_millis()
-                    );
-                }
-            }
-            Err(err) => {
-                if config.verbose {
-                    eprintln!(
-                        "wbwpty: pid {} could not hook NtCreateUserProcess: {err:#}",
-                        child.pid
-                    );
-                }
-            }
-        }
-    }
-
-    let Some(mapping) = (if !child.is_resumed() {
-        match crate::manual_map::SuspendedMapping::map_suspended(&proc, &file, "DllMain") {
-            Ok(mapping) => Some(mapping),
-            Err(err) => {
-                if config.verbose {
-                    eprintln!("wbwpty: could not map the payload while suspended: {err:#}");
-                }
-                None
-            }
-        }
-    } else {
-        None
-    }) else {
-        // Nothing was mapped, so the whole thing runs the old way - after the
-        // resume - rather than being abandoned.
-        if !child.is_resumed() {
-            child.resume().context("resuming target")?;
-        }
-        if !child.is_running() {
-            return Ok(None);
-        }
-        return Ok(crate::manual_map::inject_dll(child, &dll, "DllMain").ok());
-    };
-
+    // Measured chain, from x64dbg with breakpoints on all three:
+    //
+    //     cmd.exe entry point
+    //       -> kernelbase!CreateProcessInternalW
+    //         -> ntdll!NtCreateUserProcess
+    //
+    // which also rules out `RtlCreateUserProcess`: cmd does not go through it.
     if !child.is_resumed() {
         child.resume().context("resuming target")?;
     }
@@ -1708,25 +1666,14 @@ fn inject_payload_two_phase(
         return Ok(None);
     }
 
-    // The forced stub goes in *before* the payload is finished, and that ordering
-    // is the entire point of it.
-    //
-    // [`SuspendedMapping::finish`] cannot return before `kernelbase.dll` is
-    // mapped, because the payload's imports resolve through `kernel32`'s
-    // forwarders into it - about 28 ms on this machine, and the full
-    // substitution is live at about 43 ms. `cmd.exe` calls `CreateProcess` at
-    // about 31 ms, in between. The stub needs none of that: it is two
-    // instructions with no imports, so as soon as `kernelbase` appears it can be
-    // in place, and the console question is settled before the target gets to
-    // ask it.
     if config.forced_stub {
         match install_forced_stub(&proc, child.pid, config.verbose) {
             Ok(at) => {
                 if config.verbose {
                     eprintln!(
-                        "wbwpty: pid {} forced DETACHED_PROCESS via a stub at {:#x}, {}ms after spawn",
+                        "wbwpty: pid {} forced DETACHED_PROCESS via a stub at {at:#x}, \
+                         {}ms after spawn",
                         child.pid,
-                        at,
                         resume_at.elapsed().as_millis()
                     );
                 }
@@ -1742,13 +1689,19 @@ fn inject_payload_two_phase(
         }
     }
 
-    match mapping.finish(
-        &proc,
-        child.pid,
-        std::time::Duration::from_secs(10),
-        std::time::Duration::from_millis(1),
-        true,
-    ) {
+    // The payload is mapped after the resume, not before it.
+    //
+    // Mapping it while suspended was an attempt to get it in earlier, and it
+    // measured as counterproductive: the 276 KB write delayed the resume by
+    // several milliseconds, and the stub above - which is the thing that has to
+    // win the race - was therefore installed at 10 ms against a target that
+    // spawns at about 8. Suspending to write bytes that can wait is a bad trade
+    // when what cannot wait is a patch.
+    if !child.is_running() {
+        return Ok(None);
+    }
+
+    match crate::manual_map::inject_dll(child, &dll, "DllMain") {
         Ok(report) => Ok(Some(report)),
         Err(err) => {
             if config.verbose {
@@ -1790,9 +1743,9 @@ fn install_nt_creation_hook(
     if ntdll == 0 {
         bail!("ntdll is not mapped in the host, so its address in the target is unknown");
     }
-    let stub = proc.allocate(inline::nt_forced_stub_size())?;
+    let stub = proc.allocate(inline::rtl_forced_stub_size())?;
     let _ = verbose;
-    Ok(inline::install_nt_forced_stub(proc, ntdll, stub)?.stub)
+    Ok(inline::install_rtl_creation_hook(proc, ntdll, stub)?.stub)
 }
 
 /// Waits for `kernelbase`, then forces `DETACHED_PROCESS` on every child the
