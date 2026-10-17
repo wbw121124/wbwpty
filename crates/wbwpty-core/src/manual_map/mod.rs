@@ -331,6 +331,173 @@ fn inject_bytes_inner(
     })
 }
 
+/// A payload mapped into a *suspended* target, with its imports unresolved.
+///
+/// # Why this exists
+///
+/// Injection cannot be made fast by tuning. Measured on this machine, `cmd.exe`
+/// resumes, finishes its own loader at about 25 ms, and calls `CreateProcess` at
+/// about 31 ms. Everything the injector does after the resume is therefore
+/// already too late: the substitution was live at 39 ms having reported zero
+/// calls.
+///
+/// So the work that does not need the target to be running is moved before it.
+/// Mapping is pure data movement - `VirtualAllocEx` plus `WriteProcessMemory` -
+/// and both work against a suspended process, so the image can be in place before
+/// the target executes a single instruction. What genuinely needs a running
+/// target is small: resolving the payload's imports needs `PEB->Ldr`, and calling
+/// `DllMain` needs a thread to run it.
+///
+/// Concretely, this moves the 276 KB image write off the critical path, leaving
+/// only an import-table write, one remote thread, and the entry patch after the
+/// resume.
+///
+/// # What it cannot do
+///
+/// The payload is *unusable* between [`Self::map_suspended`] and
+/// [`Self::finish`]: its import table still holds whatever the file had. Nothing
+/// may call into it in that window, and [`Self::finish`] is what makes it real.
+/// Ordering them the other way round is the whole point; calling `DllMain`
+/// before the imports are resolved would jump through nulls inside someone
+/// else's process.
+pub struct SuspendedMapping {
+    /// The payload file, kept so the PE can be parsed again in `finish`.
+    image: Vec<u8>,
+    /// Where the image was mapped in the target.
+    base: u64,
+    /// Distance between the preferred base and the mapped one.
+    reloc_delta: i64,
+    /// RVA of the entry point to call.
+    entry_rva: u32,
+    /// The mapped image with relocations applied but imports untouched.
+    mapped: Vec<u8>,
+}
+
+impl SuspendedMapping {
+    /// Parses, relocates and writes `image` into `proc`, which must be suspended.
+    ///
+    /// Calls no remote thread and reads no loader state, so it works against a
+    /// process that has never run an instruction.
+    pub fn map_suspended(proc: &RemoteProcess, image: &[u8], entry_symbol: &str) -> Result<Self> {
+        let pe = PeImage::parse(image)?;
+        if !pe.info.is_dll {
+            bail!(
+                "{} is not a DLL (IMAGE_FILE_DLL is not set)",
+                child_image_hint(image)
+            );
+        }
+        let entry_rva = resolve_entry_rva(&pe, image, entry_symbol)?;
+
+        // Allocation and relocation need nothing from the target but a handle.
+        let (base, reloc_delta) = allocate_image(proc, &pe)?;
+        let mapped = pe.map(reloc_delta)?;
+        proc.write_bytes(base, &mapped)
+            .context("writing the mapped image into the suspended target")?;
+
+        Ok(Self {
+            image: image.to_vec(),
+            base,
+            reloc_delta,
+            entry_rva,
+            mapped,
+        })
+    }
+
+    /// Where the image was mapped, for publishing words into it.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// RVA of the entry point that will be called.
+    pub fn entry_rva(&self) -> u32 {
+        self.entry_rva
+    }
+
+    /// Resolves the imports, writes the image again, and calls the entry point.
+    ///
+    /// The image is written twice in total across the two phases. The second
+    /// write is needed because import resolution patches the IAT *inside* the
+    /// mapped image, and it is small relative to the first: the import table of a
+    /// payload this size is a few hundred bytes.
+    pub fn finish(
+        self,
+        proc: &RemoteProcess,
+        pid: u32,
+        loader_wait: std::time::Duration,
+        poll: std::time::Duration,
+        run_entry: bool,
+    ) -> Result<InjectionReport> {
+        let started = std::time::Instant::now();
+        let deadline = started + loader_wait;
+        let mut pe = PeImage::parse(&self.image)?;
+        let mut mapped = self.mapped;
+
+        let mut modules = proc
+            .poll_modules_ready(poll, loader_wait)
+            .with_context(|| format!("waiting for the loader in pid {pid}"))?;
+
+        let (patch_count, discovered) = loop {
+            let snapshot = RemoteModules::from_snapshot(modules);
+            match resolve_imports(proc, &snapshot, &pe, &mut mapped) {
+                Ok(count) => break (count, snapshot),
+                Err(err) => {
+                    // Every failure here is retryable, for the reason given in
+                    // `inject_bytes_inner`: mid-loader a module can be listed but
+                    // not yet readable, and treating only `ModuleNotMapped` as
+                    // transient made this fail whenever the machine was busy.
+                    if std::time::Instant::now() >= deadline {
+                        return if err.downcast_ref::<ModuleNotMapped>().is_some() {
+                            Err(err).with_context(|| {
+                                format!(
+                                    "pid {pid} never mapped every module the payload imports \
+                                     within {}ms",
+                                    loader_wait.as_millis()
+                                )
+                            })
+                        } else {
+                            Err(err).with_context(|| {
+                                format!(
+                                    "pid {pid} never became resolvable within {}ms",
+                                    loader_wait.as_millis()
+                                )
+                            })
+                        };
+                    }
+                    std::thread::sleep(poll);
+                    modules =
+                        proc.poll_modules_ready(poll, deadline - std::time::Instant::now())?;
+                }
+            }
+        };
+        let loader_wait_ms = started.elapsed().as_millis() as u64;
+
+        proc.write_bytes(self.base, &mapped)?;
+
+        if run_entry {
+            PreparedEntry {
+                base: self.base,
+                entry_rva: self.entry_rva,
+                job: stub::build_job(self.base, self.entry_rva),
+            }
+            .call_entry(proc)?;
+        }
+
+        // Keep the borrow of `pe` alive until the resolution is done with it.
+        drop(pe);
+        let _ = self.reloc_delta;
+
+        Ok(InjectionReport {
+            image_base: self.base,
+            entry_rva: self.entry_rva,
+            patch_count,
+            reloc_delta: self.reloc_delta,
+            module_count: discovered.len(),
+            module_source: discovered.source(),
+            loader_wait_ms,
+        })
+    }
+}
+
 /// A mapped, self-contained payload whose entry point has not been called yet.
 ///
 /// The split exists because mapping and calling have different requirements.

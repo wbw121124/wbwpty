@@ -1557,35 +1557,98 @@ fn install_inline_process_hooks(
 }
 
 fn inject_payload(child: &Child, config: &SessionConfig) -> Option<InjectionReport> {
-    if !config.inject {
-        return None;
-    }
-    // Injection must observe a *running* target (the loader has to have mapped
-    // its modules), so resume first; a dead target cannot be patched and trying
-    // produces nothing but noise.
-    if !child.is_resumed() {
-        if let Err(err) = child.resume() {
-            if config.verbose {
-                eprintln!("wbwpty: could not resume target: {err:#}");
-            }
-            return None;
-        }
-    }
-    if !child.is_running() {
+    inject_payload_two_phase(child, config).unwrap_or_else(|err| {
         if config.verbose {
-            eprintln!("wbwpty: target already exited; skipping payload injection");
+            eprintln!("wbwpty: two-phase injection failed: {err:#}");
         }
-        return None;
+        // A target that will not take the payload must still run: a session that
+        // refuses to start its own target is worse than one whose descendants are
+        // uncovered.
+        if !child.is_resumed() {
+            let _ = child.resume();
+        }
+        None
+    })
+}
+
+/// Maps the payload while the target is suspended, then finishes it once resumed.
+///
+/// The split is the whole point, and it is worth being explicit about why each
+/// half is where it is:
+///
+/// * [`SuspendedMapping::map_suspended`] parses, relocates and writes the image.
+///   All of that is `VirtualAllocEx` plus `WriteProcessMemory`, so it works
+///   against a process that has never executed an instruction, and it moves the
+///   276 KB write off the path the target is running down.
+/// * [`SuspendedMapping::finish`] resolves imports - which needs `PEB->Ldr`, and
+///   that is `NULL` while suspended (AGENTS pitfall 1) - writes the now-patched
+///   image, and calls `DllMain` with a remote thread, which needs the target's
+///   threads to be running (AGENTS pitfall 31).
+///
+/// Before this, the whole thing happened after the resume, and the substitution
+/// went live at 39-47 ms against a `cmd.exe` that spawns at about 31 ms.
+fn inject_payload_two_phase(
+    child: &Child,
+    config: &SessionConfig,
+) -> Result<Option<InjectionReport>> {
+    use anyhow::Context;
+
+    if !config.inject {
+        if !child.is_resumed() {
+            child.resume().context("resuming target")?;
+        }
+        return Ok(None);
     }
 
     let dll = config.dll.clone().unwrap_or_else(default_dll_path);
-    match inject_into_child(child, &dll, "DllMain") {
-        Ok(report) => Some(report),
+    let file =
+        std::fs::read(&dll).with_context(|| format!("reading payload {}", dll.display()))?;
+    let proc = crate::manual_map::remote::RemoteProcess::new(child.process_handle());
+
+    let Some(mapping) = (if !child.is_resumed() {
+        match crate::manual_map::SuspendedMapping::map_suspended(&proc, &file, "DllMain") {
+            Ok(mapping) => Some(mapping),
+            Err(err) => {
+                if config.verbose {
+                    eprintln!("wbwpty: could not map the payload while suspended: {err:#}");
+                }
+                None
+            }
+        }
+    } else {
+        None
+    }) else {
+        // Nothing was mapped, so the whole thing runs the old way - after the
+        // resume - rather than being abandoned.
+        if !child.is_resumed() {
+            child.resume().context("resuming target")?;
+        }
+        if !child.is_running() {
+            return Ok(None);
+        }
+        return Ok(crate::manual_map::inject_dll(child, &dll, "DllMain").ok());
+    };
+
+    if !child.is_resumed() {
+        child.resume().context("resuming target")?;
+    }
+    if !child.is_running() {
+        return Ok(None);
+    }
+
+    match mapping.finish(
+        &proc,
+        child.pid,
+        std::time::Duration::from_secs(10),
+        std::time::Duration::from_millis(1),
+        true,
+    ) {
+        Ok(report) => Ok(Some(report)),
         Err(err) => {
             if config.verbose {
-                eprintln!("wbwpty: payload not mapped ({}): {err:#}", dll.display());
+                eprintln!("wbwpty: payload not mapped ({err:#})");
             }
-            None
+            Ok(None)
         }
     }
 }
