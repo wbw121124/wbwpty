@@ -41,8 +41,8 @@ use std::time::{Duration, Instant};
 
 use wbwpty_core::child::ChildSpec;
 use wbwpty_core::inspect::{self, ProcessEntry};
-use wbwpty_core::pipe::ReadEvent;
 use wbwpty_core::manual_map::remote::ConsoleState;
+use wbwpty_core::pipe::ReadEvent;
 use wbwpty_core::session::{Session, SessionConfig};
 
 /// `ping -n 12` lives about eleven seconds; six is enough to notice a console
@@ -142,11 +142,8 @@ fn observe(sentinel: bool) -> Observation {
         inject: true,
         ..Default::default()
     };
-    let session = Session::start(
-        &ChildSpec::new(probe).arg("--").arg(inner.as_str()),
-        config,
-    )
-    .expect("session");
+    let session = Session::start(&ChildSpec::new(probe).arg("--").arg(inner.as_str()), config)
+        .expect("session");
     let guard = TreeGuard {
         root: session.pid(),
     };
@@ -175,19 +172,14 @@ fn observe(sentinel: bool) -> Observation {
         if probe2.is_none() {
             // probe#2 is the target's only child; there is no shell in the way
             // to misparse the tree.
-            probe2 = inspect::process_table()
-                .ok()
-                .and_then(|table| {
-                    // The child of the target, by parentage. Selecting "some
-                    // descendant" is not enough: the set comes back sorted by pid,
-                    // and a console host in the tree can have a lower one than the
-                    // process we mean - patching the console host teaches nothing
-                    // about console hosts.
-                    table
-                        .iter()
-                        .find(|e| e.parent == guard.root)
-                        .map(|e| e.pid)
-                });
+            probe2 = inspect::process_table().ok().and_then(|table| {
+                // The child of the target, by parentage. Selecting "some
+                // descendant" is not enough: the set comes back sorted by pid,
+                // and a console host in the tree can have a lower one than the
+                // process we mean - patching the console host teaches nothing
+                // about console hosts.
+                table.iter().find(|e| e.parent == guard.root).map(|e| e.pid)
+            });
             if let Some(pid) = probe2 {
                 if let Ok(p) = wbwpty_core::manual_map::remote::RemoteProcess::open(pid) {
                     if probe2_console.is_none() {
@@ -197,7 +189,8 @@ fn observe(sentinel: bool) -> Observation {
                 if sentinel && sentinel_written.is_none() {
                     match wbwpty_core::manual_map::remote::RemoteProcess::open(pid) {
                         Ok(p) => {
-                            sentinel_written = Some(p.patch_console_state().map_err(|e| e.to_string()))
+                            sentinel_written =
+                                Some(p.patch_console_state().map_err(|e| e.to_string()))
                         }
                         Err(err) => sentinel_written = Some(Err(err.to_string())),
                     }
@@ -270,8 +263,16 @@ fn baseline_substitution_alone() {
         seen.probe2_console,
         seen.output
     );
-    assert!(seen.hook_calls >= 1, "probe#2 must go through the substitution");
-    assert_eq!(seen.tree.len(), 2, "expected probe#2 and ping, got {:?}", seen.tree);
+    assert!(
+        seen.hook_calls >= 1,
+        "probe#2 must go through the substitution"
+    );
+    assert_eq!(
+        seen.tree.len(),
+        2,
+        "expected probe#2 and ping, got {:?}",
+        seen.tree
+    );
 }
 
 #[test]
@@ -285,6 +286,14 @@ fn sentinel_in_the_uncovered_generation() {
         seen.probe2_console,
         seen.output
     );
-    assert!(seen.hook_calls >= 1, "probe#2 must go through the substitution");
-    assert_eq!(seen.tree.len(), 2, "expected probe#2 and ping, got {:?}", seen.tree);
+    assert!(
+        seen.hook_calls >= 1,
+        "probe#2 must go through the substitution"
+    );
+    assert_eq!(
+        seen.tree.len(),
+        2,
+        "expected probe#2 and ping, got {:?}",
+        seen.tree
+    );
 }

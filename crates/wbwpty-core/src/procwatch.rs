@@ -152,7 +152,7 @@ pub struct ProcessWatch {
 }
 
 impl ProcessWatch {
-/// Starts watching, degrading to sampling if the kernel provider refuses.
+    /// Starts watching, degrading to sampling if the kernel provider refuses.
     ///
     /// The degradation is visible: [`Self::mode`] reports it, and
     /// [`Mode::is_exhaustive`] is what decides whether an empty answer may be
@@ -169,7 +169,7 @@ impl ProcessWatch {
         Self::try_kernel_events().unwrap_or_else(|_| Self::sampled())
     }
 
-/// Kernel-event watching, with the reason it could not start.
+    /// Kernel-event watching, with the reason it could not start.
     ///
     /// Exposed so a caller can insist on the strong mode: a test that must be
     /// able to fail has to be able to refuse the weak one.
@@ -187,7 +187,7 @@ impl ProcessWatch {
     /// buffer size rather than to the size of the properties struct.
     pub fn try_kernel_events() -> Result<Self> {
         let mut properties: EVENT_TRACE_PROPERTIES = unsafe { std::mem::zeroed() };
-properties.Wnode.BufferSize = MIN_WNODE_BUFFER_SIZE;
+        properties.Wnode.BufferSize = MIN_WNODE_BUFFER_SIZE;
         properties.LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_USE_NOCOPY;
         properties.BufferSize = 64;
         properties.MinimumBuffers = 8;

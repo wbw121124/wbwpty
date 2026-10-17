@@ -171,9 +171,12 @@ fn a_console_write_reaches_the_pipe_with_the_shim() {
         seen.output
     );
 
-    let verdict = seen
-        .verdict
-        .unwrap_or_else(|| panic!("the probe never reported a verdict; got:\n  {}", seen.output));
+    let verdict = seen.verdict.unwrap_or_else(|| {
+        panic!(
+            "the probe never reported a verdict; got:\n  {}",
+            seen.output
+        )
+    });
     assert!(
         verdict.contains("ok=true"),
         "the substitute did not report success: {verdict:?}"
@@ -204,9 +207,12 @@ fn without_the_shim_a_console_write_goes_nowhere() {
         seen.output
     );
 
-    let verdict = seen
-        .verdict
-        .unwrap_or_else(|| panic!("the probe never reported a verdict; got:\n  {}", seen.output));
+    let verdict = seen.verdict.unwrap_or_else(|| {
+        panic!(
+            "the probe never reported a verdict; got:\n  {}",
+            seen.output
+        )
+    });
     assert!(
         verdict.contains("ok=false"),
         "WriteConsoleW on a pipe should have failed, but the probe reported: {verdict:?}"

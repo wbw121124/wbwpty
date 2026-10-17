@@ -240,7 +240,11 @@ fn python_in_a_repl_reads_from_the_pipe() {
         "no REPL prompt arrived, so the interpreter never treated stdin as input:\n  {}",
         output.lines().take(20).collect::<Vec<_>>().join("\n  ")
     );
-    assert_eq!(code, Some(0), "the REPL should have exited cleanly on exit()");
+    assert_eq!(
+        code,
+        Some(0),
+        "the REPL should have exited cleanly on exit()"
+    );
 }
 
 /// A megabyte in one go.
@@ -258,7 +262,8 @@ fn a_megabyte_of_output_arrives_intact() {
 
     let xs = run.output.bytes().filter(|b| *b == b'x').count();
     assert_eq!(
-        xs, BIG_WRITE,
+        xs,
+        BIG_WRITE,
         "{} of {BIG_WRITE} bytes arrived; the reader lost data",
         run.output.len()
     );
@@ -359,7 +364,9 @@ fn cmd_runs_python_through_the_substitution() {
         ..Default::default()
     };
     let session = Session::start(&spec, config).expect("session");
-    let guard = TreeGuard { root: session.pid() };
+    let guard = TreeGuard {
+        root: session.pid(),
+    };
 
     let mut buf = [0u8; 4096];
     let mut output = String::new();
@@ -434,7 +441,10 @@ fn a_grandchild_reaches_the_pipe_without_a_console() {
     // `ChildSpec` quotes arguments containing spaces and escapes their inner
     // quotes; `cmd /c` strips only the outer pair, so the inner ones arrive as
     // literal `\"` and the child never runs. A short path avoids the quoting.
-    let python = python.display().to_string().replace("Program Files", "PROGRA~1");
+    let python = python
+        .display()
+        .to_string()
+        .replace("Program Files", "PROGRA~1");
 
     // A file rather than `-c`, for the same reason plus one more: the code has to
     // survive another layer of shell quoting to reach python intact.
@@ -463,7 +473,9 @@ fn a_grandchild_reaches_the_pipe_without_a_console() {
         ..Default::default()
     };
     let session = Session::start(&spec, config).expect("session");
-    let _guard = TreeGuard { root: session.pid() };
+    let _guard = TreeGuard {
+        root: session.pid(),
+    };
 
     let armed = wait_until(std::time::Duration::from_secs(10), || {
         session.process_creation_substituted()
@@ -549,7 +561,10 @@ fn the_grandchild_tree_is_attributed_and_has_no_console_host() {
     use wbwpty_core::procwatch::ProcessWatch;
 
     let python = python_or_skip!();
-    let python = python.display().to_string().replace("Program Files", "PROGRA~1");
+    let python = python
+        .display()
+        .to_string()
+        .replace("Program Files", "PROGRA~1");
     let script = std::env::temp_dir().join("wbwpty_end_to_end_attributed.py");
     std::fs::write(
         &script,
@@ -593,7 +608,9 @@ fn the_grandchild_tree_is_attributed_and_has_no_console_host() {
         ..Default::default()
     };
     let session = Session::start(&spec, config).expect("session");
-    let _guard = TreeGuard { root: session.pid() };
+    let _guard = TreeGuard {
+        root: session.pid(),
+    };
     // The root existed before the watch could see it, so the tree is incomplete
     // by construction; saying so is what `adopt` is for.
     watch.adopt(session.pid());
@@ -715,7 +732,9 @@ fn a_ping_delay_creates_no_console_host_in_the_tree() {
         ..Default::default()
     };
     let session = Session::start(&spec, config).expect("session");
-    let _guard = TreeGuard { root: session.pid() };
+    let _guard = TreeGuard {
+        root: session.pid(),
+    };
     watch.adopt(session.pid());
 
     let mut buf = [0u8; 4096];
@@ -799,7 +818,10 @@ fn the_inline_patch_replaces_process_creation_on_its_own() {
     use wbwpty_core::procwatch::ProcessWatch;
 
     let python = python_or_skip!();
-    let python = python.display().to_string().replace("Program Files", "PROGRA~1");
+    let python = python
+        .display()
+        .to_string()
+        .replace("Program Files", "PROGRA~1");
     let script = std::env::temp_dir().join("wbwpty_inline_verify.py");
     std::fs::write(
         &script,
@@ -824,7 +846,9 @@ fn the_inline_patch_replaces_process_creation_on_its_own() {
         ..Default::default()
     };
     let session = Session::start(&spec, config).expect("session");
-    let _guard = TreeGuard { root: session.pid() };
+    let _guard = TreeGuard {
+        root: session.pid(),
+    };
     watch.adopt(session.pid());
 
     // 1. The import table route was not used.
@@ -953,7 +977,10 @@ impl TreeGuard {
         let forbidden = |pid: u32| pid == me || pid == ppid;
         for host in inspect::descendant_console_hosts(&table, self.root) {
             if forbidden(host.pid) {
-                eprintln!("cleanup: refusing to terminate pid {} (self/parent)", host.pid);
+                eprintln!(
+                    "cleanup: refusing to terminate pid {} (self/parent)",
+                    host.pid
+                );
                 continue;
             }
             eprintln!("cleanup: console host pid {}", host.pid);
@@ -1008,6 +1035,3 @@ impl Drop for TreeGuard {
         }
     }
 }
-
-
-

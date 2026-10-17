@@ -74,14 +74,14 @@ fn a_started_process_is_recorded() {
     // otherwise "the record grew" is satisfied by the ~250 processes the watcher
     // discovers on its own first poll and tells us nothing about the spawn below.
     let baseline = wait_for(|| watch.recorded().len() > 100, Duration::from_secs(5));
-    assert!(baseline, "the watcher recorded no processes at all to start from");
+    assert!(
+        baseline,
+        "the watcher recorded no processes at all to start from"
+    );
     let before = watch.recorded().len();
 
     let mut child = spawn_console_less();
-    let grew = wait_for(
-        || watch.recorded().len() > before,
-        Duration::from_secs(5),
-    );
+    let grew = wait_for(|| watch.recorded().len() > before, Duration::from_secs(5));
     let recorded = watch.recorded();
     // Killed whether or not the assertions below hold, so a failure here cannot
     // leave an orphaned cmd.exe behind.
@@ -95,7 +95,9 @@ fn a_started_process_is_recorded() {
         recorded.len()
     );
     assert!(
-        recorded.iter().any(|b| b.name.as_deref() == Some("cmd.exe")),
+        recorded
+            .iter()
+            .any(|b| b.name.as_deref() == Some("cmd.exe")),
         "cmd.exe was started but not named in the record: {recorded:?}"
     );
 }
@@ -110,7 +112,7 @@ fn no_console_host_is_reported_under_this_process() {
     let watch = ProcessWatch::start();
     let self_pid = std::process::id();
 
-let mut child = spawn_console_less();
+    let mut child = spawn_console_less();
     let _ = wait_for(|| !watch.recorded().is_empty(), Duration::from_secs(5));
 
     let hosts = watch.console_hosts_under(self_pid);
@@ -147,7 +149,10 @@ fn the_watch_says_which_mode_it_is_in() {
     match ProcessWatch::try_kernel_events() {
         Ok(watch) => {
             let mode = watch.mode();
-            eprintln!("procwatch mode = {mode:?}, exhaustive = {}", mode.is_exhaustive());
+            eprintln!(
+                "procwatch mode = {mode:?}, exhaustive = {}",
+                mode.is_exhaustive()
+            );
             assert_eq!(mode, Mode::KernelEvents);
             assert!(mode.is_exhaustive());
         }
@@ -195,4 +200,3 @@ fn an_adopted_process_makes_the_tree_incomplete() {
         "adopting a process must make its tree incomplete"
     );
 }
-

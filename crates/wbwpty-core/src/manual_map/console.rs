@@ -138,8 +138,8 @@ pub fn install_console_hook(
     };
 
     let wanted: Vec<&str> = CONSOLE_APIS.iter().map(|a| a.win32_name).collect();
-    let slots = iat::find_imports(target_image, &wanted)
-        .context("walking the target's console imports")?;
+    let slots =
+        iat::find_imports(target_image, &wanted).context("walking the target's console imports")?;
     if slots.is_empty() {
         return Ok(None);
     }
@@ -187,8 +187,12 @@ fn write_slot(
     if let Err(err) = proc.write_bytes(address, &substitute.to_le_bytes()) {
         // The loader leaves `.idata` writable in practice, but "in practice" is
         // not something to write a substitution on top of.
-        proc.protect(address, 8, windows_sys::Win32::System::Memory::PAGE_READWRITE)
-            .with_context(|| format!("making an import slot writable: {err:#}"))?;
+        proc.protect(
+            address,
+            8,
+            windows_sys::Win32::System::Memory::PAGE_READWRITE,
+        )
+        .with_context(|| format!("making an import slot writable: {err:#}"))?;
         proc.write_bytes(address, &substitute.to_le_bytes())
             .context("writing the substituted import slot")?;
         *needed_protection_change = true;
@@ -241,9 +245,11 @@ mod tests {
             return;
         };
         let image = std::fs::read(&path).expect("read payload");
-        assert!(crate::manual_map::find_export_rva(&image, "WBWPTY_CONSOLE_STATS")
-            .expect("look up the export")
-            .is_some());
+        assert!(
+            crate::manual_map::find_export_rva(&image, "WBWPTY_CONSOLE_STATS")
+                .expect("look up the export")
+                .is_some()
+        );
     }
 
     /// The walk must see every descriptor, not stop at the first plausible module.
@@ -297,7 +303,11 @@ mod tests {
                 .export
         };
         let payload = payload_image();
-        for name in ["GetConsoleMode", "GetConsoleScreenBufferInfo", "WriteConsoleW"] {
+        for name in [
+            "GetConsoleMode",
+            "GetConsoleScreenBufferInfo",
+            "WriteConsoleW",
+        ] {
             let export = substitute_of(name);
             assert!(
                 crate::manual_map::find_export_rva(&payload, export)

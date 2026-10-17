@@ -28,4 +28,3 @@ pub use pipe::{PipePair, ReadEvent};
 pub use procwatch::ProcessWatch;
 pub use session::{Session, SessionConfig};
 pub use supervisor::{Coverage, SupervisorConfig};
-

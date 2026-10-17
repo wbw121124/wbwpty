@@ -45,14 +45,14 @@
 //! pid one injection. A session that spawns a thousand processes pays a thousand
 //! injections; a session that spawns none pays one snapshot per poll.
 
+use crate::inspect;
+use crate::manual_map::{self, remote::ConsolePatch, remote::RemoteProcess};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use crate::inspect;
-use crate::manual_map::{self, remote::ConsolePatch, remote::RemoteProcess};
 
 /// What the supervisor did to one descendant.
 ///
@@ -237,7 +237,9 @@ impl Drop for DescendantSupervisor {
 /// A `ProcessTreeSnapshot` is cheap to take and the loop is the only place that
 /// takes one, so the helper exists to keep the poison handling in one place.
 fn lock(shared: &Mutex<Vec<Coverage>>) -> MutexGuard<'_, Vec<Coverage>> {
-    shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    shared
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Upper bound on the record, so a session that churns through a very long
@@ -292,7 +294,8 @@ fn run(config: SupervisorConfig, coverage: Arc<Mutex<Vec<Coverage>>>, stop: Arc<
         // every injection is independent - but because a descendant that gets
         // covered early is more likely to be covered before it spawns anything
         // of its own, and the ancestors are the ones doing the spawning.
-        let mut batch: Vec<(u32, usize)> = pending.iter().map(|(&pid, &depth)| (pid, depth)).collect();
+        let mut batch: Vec<(u32, usize)> =
+            pending.iter().map(|(&pid, &depth)| (pid, depth)).collect();
         batch.sort_by_key(|&(_, depth)| depth);
 
         for (pid, depth) in batch {
@@ -313,7 +316,11 @@ fn run(config: SupervisorConfig, coverage: Arc<Mutex<Vec<Coverage>>>, stop: Arc<
                             record.injected,
                             record.hooked,
                             record.sentinel,
-                            record.note.as_deref().map(|n| format!(" ({n})")).unwrap_or_default(),
+                            record
+                                .note
+                                .as_deref()
+                                .map(|n| format!(" ({n})"))
+                                .unwrap_or_default(),
                         );
                     }
                     finished.insert(pid);
@@ -456,13 +463,20 @@ fn serve_handover(
 /// `0x21000028`: an export-table RVA, read as if it were data.
 fn read_published_u32(proc: &RemoteProcess, payload_base: u64, name: &str) -> Option<u32> {
     let image = EXPORT_RVA_IMAGE.get()?;
-    let rva = crate::manual_map::find_export_rva(image, name).ok().flatten()?;
+    let rva = crate::manual_map::find_export_rva(image, name)
+        .ok()
+        .flatten()?;
     let bytes = proc.read_bytes(payload_base + rva as u64, 4).ok()?;
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
 /// Writes a `u32` the payload exports, into a process that has it mapped.
-fn write_published_u32(proc: &RemoteProcess, payload_base: u64, name: &str, value: u32) -> Result<()> {
+fn write_published_u32(
+    proc: &RemoteProcess,
+    payload_base: u64,
+    name: &str,
+    value: u32,
+) -> Result<()> {
     let image = EXPORT_RVA_IMAGE
         .get()
         .ok_or_else(|| anyhow::anyhow!("the payload image was never published"))?;
@@ -513,7 +527,10 @@ fn attempt(config: &SupervisorConfig, pid: u32, depth: usize, attempt_no: u32) -
             return Outcome::Done(Coverage {
                 pid,
                 depth,
-                image: proc.image_path().map(|p| p.display().to_string()).unwrap_or_default(),
+                image: proc
+                    .image_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
                 injected: false,
                 hooked: false,
                 sentinel: false,

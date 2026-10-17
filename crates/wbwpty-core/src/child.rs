@@ -23,7 +23,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH, WAIT_OBJECT_
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, INFINITE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTF_USESHOWWINDOW, STARTUPINFOW,
+    STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 /// `SW_MINIMIZE`, `winuser.h`. Spelled out because the `Win32::UI` feature of

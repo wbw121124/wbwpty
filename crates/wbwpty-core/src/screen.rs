@@ -124,7 +124,9 @@ impl Screen {
             terminal: Terminal::with_options(
                 cols,
                 rows,
-                TerminalOptions { scrollback_limit: 0 },
+                TerminalOptions {
+                    scrollback_limit: 0,
+                },
             ),
             generation: 0,
         }
@@ -296,7 +298,11 @@ mod tests {
         screen.feed(b"1mred");
         let view = screen.terminal.get_screen();
         let cell = view.cell(0, 0).expect("a cell");
-        assert_eq!(cell.fg, Color::Indexed(1), "SGR 31 did not survive the split");
+        assert_eq!(
+            cell.fg,
+            Color::Indexed(1),
+            "SGR 31 did not survive the split"
+        );
     }
 
     /// The seqlock has to hand out an odd word and an even one, or the payload's
@@ -306,7 +312,15 @@ mod tests {
         let mut screen = Screen::new(80, 25);
         let (busy, done) = screen.publish();
         let word = |raw: &[u8]| u32::from_le_bytes(raw[..4].try_into().expect("4 bytes"));
-        assert_eq!(word(&busy) & 1, 1, "the first write must be marked in progress");
-        assert_eq!(word(&done) & 1, 0, "the second write must be marked complete");
+        assert_eq!(
+            word(&busy) & 1,
+            1,
+            "the first write must be marked in progress"
+        );
+        assert_eq!(
+            word(&done) & 1,
+            0,
+            "the second write must be marked complete"
+        );
     }
 }

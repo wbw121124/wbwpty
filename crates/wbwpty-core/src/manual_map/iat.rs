@@ -103,7 +103,11 @@ fn find_in_directory(
     };
 
     let mut slots = Vec::new();
-    let stride = if delay { DELAY_DESCRIPTOR_SIZE } else { IMPORT_DESCRIPTOR_SIZE };
+    let stride = if delay {
+        DELAY_DESCRIPTOR_SIZE
+    } else {
+        IMPORT_DESCRIPTOR_SIZE
+    };
     let mut descriptor_rva = dir.virtual_address;
     for _ in 0..64 {
         let descriptor = pe
@@ -200,7 +204,9 @@ const IMPORT_DESCRIPTOR_SIZE: usize = 20;
 const THUNK_SIZE: usize = 8;
 
 fn read_c_string(pe: &PeImage, at: usize) -> Result<String> {
-    let slice = pe.read_rva_clamped(at as u32, 256).context("reading an import name")?;
+    let slice = pe
+        .read_rva_clamped(at as u32, 256)
+        .context("reading an import name")?;
     let end = slice.iter().position(|&b| b == 0).unwrap_or(0);
     Ok(String::from_utf8_lossy(&slice[..end]).into_owned())
 }
@@ -286,7 +292,9 @@ mod tests {
             .info
             .directory(DIRECTORY_ENTRY_DELAY_IMPORT)
             .expect("cmd.exe has delay imports");
-        let first = pe.read_rva(dir.virtual_address, 32).expect("first descriptor");
+        let first = pe
+            .read_rva(dir.virtual_address, 32)
+            .expect("first descriptor");
         // Walk until the all-zero entry by hand, the way the parser has to.
         let mut index = 0u32;
         let terminator = loop {

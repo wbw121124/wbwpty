@@ -111,6 +111,9 @@ pub const TARGETS: &[InlineTarget] = &[
 /// relocate and the least we have to prove safe.
 const PROLOGUE_LEN: usize = 12;
 
+/// The flag whose presence makes the kernel allocate a console for the child.
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+
 /// `mov rax, imm64; jmp rax` - an unconditional jump to an arbitrary address.
 ///
 /// Twelve bytes because that is what an absolute jump costs in x64. `rax` is
@@ -247,9 +250,9 @@ pub fn install_inline_hook(
     target: &InlineTarget,
 ) -> Result<InlineHook> {
     let entry = find_export(module_base, table, target.export)?;
-    let prologue = proc.read_bytes(entry, PROLOGUE_LEN).with_context(|| {
-        format!("reading the prologue of {} at {entry:#x}", target.export)
-    })?;
+    let prologue = proc
+        .read_bytes(entry, PROLOGUE_LEN)
+        .with_context(|| format!("reading the prologue of {} at {entry:#x}", target.export))?;
 
     if !is_relocatable(&prologue) {
         return Ok(InlineHook::Refused {
@@ -265,17 +268,20 @@ pub fn install_inline_hook(
     // absolute jump, so it does not need to be near anything.
     let built = build_trampoline(&prologue, entry + PROLOGUE_LEN as u64);
     let trampoline = proc.allocate(built.len())?;
-    proc.write_bytes(trampoline, &built)
-        .with_context(|| format!("writing the {} trampoline at {trampoline:#x}", target.export))?;
+    proc.write_bytes(trampoline, &built).with_context(|| {
+        format!(
+            "writing the {} trampoline at {trampoline:#x}",
+            target.export
+        )
+    })?;
 
     // The substitute address is the payload's own export, resolved from the
     // mapped image - which is at `payload_base`, *not* the target's image base.
     // Reading `image_base()` here returns the target executable's base and yields
     // whatever bytes happen to be there.
     let substitute = resolve_substitute(payload_base, target.substitute)?;
-    proc.write_bytes(entry, &jump_absolute(substitute)).with_context(|| {
-        format!("patching {} at {entry:#x}", target.export)
-    })?;
+    proc.write_bytes(entry, &jump_absolute(substitute))
+        .with_context(|| format!("patching {} at {entry:#x}", target.export))?;
 
     Ok(InlineHook::Installed {
         export: target.export,
@@ -415,7 +421,18 @@ fn force_flags_at(offset: u32, width: u8) -> Vec<u8> {
     // 0xFFFFFFFFFFFFFFF0. Writing the full eight bytes instead leaves four of them
     // stranded after the instruction, and the stub then fails to decode at its own
     // length - the mask's high dwords were never encoded anywhere.
-    out.extend_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+    //
+    // The mask is `!CREATE_NEW_CONSOLE`. It was `0xFFFF_FFF0`, which reads like
+    // "clear the low flags" and is off by one bit: it zeroes bits 0-3 and leaves
+    // bit 4, and `CREATE_NEW_CONSOLE` is `0x10` - bit 4. So the AND was a no-op on
+    // the one flag it exists to clear, while still decoding as an AND. Only
+    // executing the stub against a real frame showed it.
+    debug_assert_eq!(
+        !0xFFFF_FFF0u32 & CREATE_NEW_CONSOLE,
+        0,
+        "this mask does not clear CREATE_NEW_CONSOLE"
+    );
+    out.extend_from_slice(&(u32::MAX & !CREATE_NEW_CONSOLE).to_le_bytes());
     out
 }
 
@@ -462,13 +479,85 @@ pub fn install_forced_stub(proc: &RemoteProcess, entry: u64, stub: u64) -> Resul
     let mut body = force_detached_stub(CREATE_PROCESS_W_FLAGS_OFFSET);
     body.extend_from_slice(&prologue);
     body.extend_from_slice(&jump_absolute(entry + PROLOGUE_LEN as u64));
-proc.write_bytes(stub, &body)
+    proc.write_bytes(stub, &body)
         .with_context(|| format!("writing the stub at {stub:#x}"))?;
     make_writable(proc, entry, PROLOGUE_LEN)?;
     proc.write_bytes(entry, &jump_absolute(stub))
         .with_context(|| format!("patching {entry:#x}"))?;
 
     Ok(ForcedStub { entry, stub })
+}
+
+/// Offset of `dwCreationFlags` from `rsp` at the entry of `CreateProcessInternalW`.
+///
+/// `cmd.exe` does not call `CreateProcessW`. It calls `CreateProcessInternalW`
+/// directly, which is why every mechanism anchored on `CreateProcessW` - the IAT
+/// slot, the inline hook, the forced stub - could be installed successfully and
+/// then never run once, sitting next to a `ping` that had a console.
+///
+/// Its argument list is `CreateProcessW`'s, so the offset is unchanged. Read off a
+/// live `cmd.exe` paused at this entry with `RSP = 0x3CF58FF118`:
+///
+///     [rsp+0x20] = 0x00007FFEE31B3124  lpThreadAttributes (kernelbase .data)
+///     [rsp+0x28] = 0x1                   bInheritHandles
+///     [rsp+0x30] = 0x0                   dwCreationFlags
+///     [rsp+0x38] = 0x0000018E5330ABC0   lpEnvironment      (a pointer)
+///     [rsp+0x40] = 0x0000003CF58FF290   lpCurrentDirectory
+///     [rsp+0x48] = 0x0000003CF58FF278   lpStartupInfo
+///
+/// The seventh parameter reading taken here earlier - `0x80000` at `[rsp+0x38]` -
+/// was a different call's frame, and `0x80000` is not a documented flag bit. It is
+/// `lpEnvironment` above, and it is a pointer. An offset is worth nothing without
+/// the frame it was read from, so the frame is recorded with it.
+pub const CREATE_PROCESS_INTERNAL_W_FLAGS_OFFSET: u32 = CREATE_PROCESS_W_FLAGS_OFFSET;
+
+/// What [`install_internal_forced_stub`] patched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InternalForcedStub {
+    /// Address of the patched function entry.
+    pub entry: u64,
+    /// Address of the stub it now jumps to.
+    pub stub: u64,
+}
+
+/// Bytes [`install_internal_forced_stub`] writes into its stub buffer.
+pub fn internal_forced_stub_size() -> usize {
+    force_flags_at(CREATE_PROCESS_INTERNAL_W_FLAGS_OFFSET, 4).len() + PROLOGUE_LEN * 2
+}
+
+/// Patches `CreateProcessInternalW` so it forces `DETACHED_PROCESS`.
+///
+/// This is the entry `cmd.exe` actually reaches, so unlike
+/// [`install_forced_stub`] this one is on the path that matters. Its prologue is
+/// twelve bytes of pushes, which is why it can be patched this early at all.
+pub fn install_internal_forced_stub(
+    proc: &RemoteProcess,
+    entry: u64,
+    stub: u64,
+) -> Result<InternalForcedStub> {
+    let prologue = proc
+        .read_bytes(entry, PROLOGUE_LEN)
+        .with_context(|| format!("reading the prologue at {entry:#x}"))?;
+    if !is_relocatable(&prologue) {
+        bail!(
+            "the first {PROLOGUE_LEN} bytes at {entry:#x} are not position-independent, \
+             so they cannot be relocated"
+        );
+    }
+    if stub == 0 {
+        bail!("no stub buffer was provided");
+    }
+
+    let mut body = force_flags_at(CREATE_PROCESS_INTERNAL_W_FLAGS_OFFSET, 4);
+    body.extend_from_slice(&prologue);
+    body.extend_from_slice(&jump_absolute(entry + PROLOGUE_LEN as u64));
+    proc.write_bytes(stub, &body)
+        .with_context(|| format!("writing the stub at {stub:#x}"))?;
+    make_writable(proc, entry, PROLOGUE_LEN)?;
+    proc.write_bytes(entry, &jump_absolute(stub))
+        .with_context(|| format!("patching {entry:#x}"))?;
+
+    Ok(InternalForcedStub { entry, stub })
 }
 
 /// Bytes [`install_nt_forced_stub`] writes.
@@ -695,7 +784,9 @@ mod tests {
     /// taken from a live disassembly of it.
     #[test]
     fn a_prologue_of_pushes_is_relocatable() {
-        let prologue = [0x40, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57];
+        let prologue = [
+            0x40, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+        ];
         assert!(is_relocatable(&prologue));
     }
 
@@ -727,13 +818,15 @@ mod tests {
     /// The emitted trampoline is the relocated prologue followed by a jump back.
     #[test]
     fn the_trampoline_relocates_then_resumes() {
-        let prologue = [0x40, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57];
+        let prologue = [
+            0x40, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+        ];
         let resume = 0x7FFF_0000_1234u64;
         let built = build_trampoline(&prologue, resume);
         assert_eq!(&built[..prologue.len()], &prologue[..]);
         assert_eq!(&built[prologue.len()..], &jump_absolute(resume));
     }
-/// The forced-flag stub is the two instructions it claims to be.
+    /// The forced-flag stub is the two instructions it claims to be.
     ///
     /// Decoded rather than compared against a byte string, because a byte
     /// comparison cannot tell `81 8C 24` from `81 A4 24` - and that difference is
@@ -792,7 +885,7 @@ mod tests {
         );
     }
 
-/// The flags offset is the sixth parameter, by the calling convention.
+    /// The flags offset is the sixth parameter, by the calling convention.
     ///
     /// Derived rather than measured, and the derivation is the whole of it: under
     /// the Microsoft x64 convention a callee finds the return address at `[rsp]`,
@@ -822,8 +915,7 @@ mod tests {
         /// `bInheritHandles` is the fifth parameter; the flags are the sixth.
         const PARAMETERS_BEFORE_THE_FLAGS: u64 = 5;
 
-        let derived = FIRST_STACK_PARAMETER
-            + (PARAMETERS_BEFORE_THE_FLAGS - 4) * 8;
+        let derived = FIRST_STACK_PARAMETER + (PARAMETERS_BEFORE_THE_FLAGS - 4) * 8;
         assert_eq!(
             derived, CREATE_PROCESS_W_FLAGS_OFFSET as u64,
             "the constant and the calling convention disagree about where \
@@ -912,7 +1004,9 @@ mod tests {
         for i in 0..number_of_names {
             let name_rva = u32::from_le_bytes(names[i * 4..i * 4 + 4].try_into().unwrap());
             let ord = u16::from_le_bytes(ordinals[i * 2..i * 2 + 2].try_into().unwrap()) as usize;
-            let Some(nb) = pe.read_rva(name_rva, 64).ok() else { continue };
+            let Some(nb) = pe.read_rva(name_rva, 64).ok() else {
+                continue;
+            };
             let end = nb.iter().position(|&b| b == 0).unwrap_or(0);
             let name = String::from_utf8_lossy(&nb[..end]).into_owned();
             if !want.contains(&name.as_str()) {
@@ -923,7 +1017,9 @@ mod tests {
                 eprintln!("{name:24} forwarder");
                 continue;
             }
-            let Ok(window) = pe.read_rva(rva, 12) else { continue };
+            let Ok(window) = pe.read_rva(rva, 12) else {
+                continue;
+            };
             let hex: Vec<String> = window.iter().map(|b| format!("{b:02x}")).collect();
             eprintln!(
                 "{name:24} rva=0x{rva:08x} relocatable={} bytes=[{}]",
@@ -931,5 +1027,104 @@ mod tests {
                 hex.join(" ")
             );
         }
+    }
+
+    /// The offset is not a guess about bytes; it is a guess about a *signature*.
+    ///
+    /// So the signature is declared, and the stub is made to run against it. The
+    /// Windows x64 ABI puts parameters five and beyond on the stack at `[rsp+0x28]`
+    /// and up, one eight-byte slot each regardless of type - so declaring a Rust
+    /// function with `bInheritHandles` fifth and `dwCreationFlags` sixth reproduces
+    /// `CreateProcessInternalW`'s frame exactly, without hand-building one.
+    ///
+    /// Then the stub is placed in front of that function on an RWX page and called
+    /// through a function pointer, and what the function receives is checked.
+    /// Decoding the stub would only prove the encoder emitted what we asked for;
+    /// running it proves the flags arrive with `DETACHED_PROCESS` set and
+    /// `CREATE_NEW_CONSOLE` cleared, that an unrelated caller flag survives, and
+    /// that the neighbouring `bInheritHandles` is left alone - an offset one slot
+    /// too high writes into `lpEnvironment` and every one of those checks still
+    /// looks fine.
+    #[test]
+    fn the_internal_stub_really_forces_the_flags_parameter() {
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
+
+        /// The part of `CreateProcessInternalW` the stub depends on: the flags are
+        /// the sixth parameter, between `bInheritHandles` and `lpEnvironment`.
+        extern "C" fn victim(
+            application_name: u64,
+            command_line: u64,
+            process_attributes: u64,
+            thread_attributes: u64,
+            inherit_handles: u64,
+            flags: u64,
+        ) -> u64 {
+            // `inherit_handles` is the fifth parameter, one slot below the flags. If
+            // the stub used the wrong offset it would land here, so the value is
+            // reported rather than discarded.
+            let _ = (
+                application_name,
+                command_line,
+                process_attributes,
+                thread_attributes,
+            );
+            if inherit_handles == 0 {
+                // Unreachable marker: bInheritHandles must survive as 1.
+                u64::MAX
+            } else {
+                flags
+            }
+        }
+
+        let mut body = force_flags_at(CREATE_PROCESS_INTERNAL_W_FLAGS_OFFSET, 4);
+        body.extend_from_slice(&jump_absolute(victim as usize as u64));
+
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+        };
+        // SAFETY: a null address asks the system to choose the location.
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                body.len(),
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_EXECUTE_READWRITE,
+            )
+        };
+        assert!(!page.is_null(), "could not get an RWX page");
+        // SAFETY: `page` is a live RWX reservation of `body.len()` bytes, and it is
+        // released before this function returns.
+        unsafe {
+            std::ptr::copy_nonoverlapping(body.as_ptr(), page as *mut u8, body.len());
+        }
+
+        let stub: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+            unsafe { std::mem::transmute(page) };
+
+        let seen = stub(
+            0x7FFEE31B3124,
+            0x3CF58FF278,
+            0x1111_1111,
+            0x2222_2222,
+            1, // bInheritHandles
+            (CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT) as u64,
+        );
+
+        // SAFETY: `page` is the reservation made above and has not been freed.
+        unsafe { VirtualFree(page, 0, MEM_RELEASE) };
+
+        assert_ne!(
+            seen,
+            u64::MAX,
+            "the stub wrote to the fifth parameter (bInheritHandles)"
+        );
+        assert_eq!(
+            seen,
+            (DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT) as u64,
+            "the stub must leave the flags as DETACHED_PROCESS | \
+             CREATE_UNICODE_ENVIRONMENT; the victim received {seen:#018x}"
+        );
     }
 }

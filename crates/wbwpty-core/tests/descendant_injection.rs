@@ -202,8 +202,7 @@ fn observe(cover_descendants: bool, release: Release) -> Observation {
 
     // Generation 2 is the one only the supervisor can reach. Hold it there until
     // it is covered, or the measurement is of a race.
-    let probe2_coverage = probe2
-        .and_then(|pid| session.wait_for_coverage(pid, COVER_TIMEOUT));
+    let probe2_coverage = probe2.and_then(|pid| session.wait_for_coverage(pid, COVER_TIMEOUT));
     if cover_descendants && probe2.is_some() && probe2_coverage.is_none() {
         eprintln!(
             "probe2={probe2:?} was never covered; records so far: {:#?}",
@@ -349,8 +348,14 @@ fn observe(cover_descendants: bool, release: Release) -> Observation {
                 .next();
         }
         let mine = inspect::descendants_of(&table, guard.root);
-        for entry in table.iter().filter(|e| mine.contains(&e.pid) && e.pid != guard.root) {
-            let line = format!("{} (pid {}, parent {})", entry.name, entry.pid, entry.parent);
+        for entry in table
+            .iter()
+            .filter(|e| mine.contains(&e.pid) && e.pid != guard.root)
+        {
+            let line = format!(
+                "{} (pid {}, parent {})",
+                entry.name, entry.pid, entry.parent
+            );
             if !seen.tree.contains(&line) {
                 seen.tree.push(line);
             }
@@ -447,8 +452,7 @@ fn a_three_generation_tree_keeps_every_generation_off_the_console() {
     // The safety gate is asserted before anything downstream: if the substitution
     // was not going to act, probe#2 was never released and there is nothing to
     // look at.
-    seen
-        .released
+    seen.released
         .clone()
         .expect("probe#2 should have been released");
 
@@ -506,7 +510,9 @@ fn a_three_generation_tree_keeps_every_generation_off_the_console() {
          the combination is undefined and a console host is the likely outcome"
     );
 
-    let ping = seen.ping.expect("probe#2 must have reported the pid it created");
+    let ping = seen
+        .ping
+        .expect("probe#2 must have reported the pid it created");
     // Locale-independent on purpose. `ping.exe` on this machine is the Chinese
     // build, so its output arrives in the OEM code page and every word of it is
     // mojibake when the pipe is read as UTF-8 - an assertion on "Pinging" fails
@@ -562,7 +568,11 @@ fn the_supervisor_covers_a_descendant_while_it_is_still_holding_still() {
         )
     });
 
-    assert!(coverage.injected, "probe#2 was not injected: {:?}", coverage.note);
+    assert!(
+        coverage.injected,
+        "probe#2 was not injected: {:?}",
+        coverage.note
+    );
     assert!(
         coverage.hooked,
         "probe#2 has no CreateProcessW substitution: {:?}",

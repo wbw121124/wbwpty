@@ -55,7 +55,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, WaitForSingleObject, CREATE_NEW_CONSOLE, CREATE_NO_WINDOW,
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, INFINITE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTF_USESHOWWINDOW, STARTUPINFOW,
+    STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 /// `GetExitCodeProcess` reports this while a process has not exited.
@@ -157,9 +157,7 @@ fn main() {
             );
         }
     } else if std::env::var_os("WBWPTY_PROBE_VERBOSE").is_some() {
-        eprintln!(
-            "wbwpty-spawn-probe: handle inheritance only, no STARTF_USESTDHANDLES"
-        );
+        eprintln!("wbwpty-spawn-probe: handle inheritance only, no STARTF_USESTDHANDLES");
     }
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -333,7 +331,8 @@ const QUIET_POLLS: u32 = 4;
 /// Reads the screen, once.
 fn screen_info(handle: *mut std::ffi::c_void) -> Option<ConsoleScreenBufferInfo> {
     let mut info = ConsoleScreenBufferInfo::default();
-    let ok = unsafe { GetConsoleScreenBufferInfo(handle, &mut info as *mut ConsoleScreenBufferInfo) };
+    let ok =
+        unsafe { GetConsoleScreenBufferInfo(handle, &mut info as *mut ConsoleScreenBufferInfo) };
     (ok != 0).then_some(info)
 }
 
@@ -441,7 +440,11 @@ fn console_info() -> ! {
     write_console(handle, &format!("{report}\r\n"));
     eprintln!("probe: {report}");
 
-    std::process::exit(if baseline.is_some() && settled { 0 } else { CONSOLE_INFO_UNSETTLED as i32 });
+    std::process::exit(if baseline.is_some() && settled {
+        0
+    } else {
+        CONSOLE_INFO_UNSETTLED as i32
+    });
 }
 
 /// Writes `text` through `WriteConsoleW`, ignoring the result.
@@ -455,7 +458,13 @@ fn write_console(handle: *mut std::ffi::c_void, text: &str) {
     let chars = (wide.len() - 1) as u32;
     let mut written = 0u32;
     unsafe {
-        WriteConsoleW(handle, wide.as_ptr(), chars, &mut written, std::ptr::null_mut())
+        WriteConsoleW(
+            handle,
+            wide.as_ptr(),
+            chars,
+            &mut written,
+            std::ptr::null_mut(),
+        )
     };
 }
 
@@ -489,7 +498,13 @@ fn console_write(text: &str) -> ! {
     let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
     let mut written = 0u32;
     let ok = unsafe {
-        WriteConsoleW(handle, wide.as_ptr(), chars, &mut written, std::ptr::null_mut())
+        WriteConsoleW(
+            handle,
+            wide.as_ptr(),
+            chars,
+            &mut written,
+            std::ptr::null_mut(),
+        )
     };
 
     eprintln!(

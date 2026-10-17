@@ -54,9 +54,17 @@ fn main() {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--setvbuf" => mode = args.next().and_then(|v| v.parse::<i32>().ok()),
-            "--bytes" => bytes = args.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(bytes),
+            "--bytes" => {
+                bytes = args
+                    .next()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(bytes)
+            }
             "--sleep-ms" => {
-                sleep_ms = args.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(sleep_ms)
+                sleep_ms = args
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(sleep_ms)
             }
             "--newline" => newline = true,
             other => {
@@ -108,7 +116,10 @@ fn main() {
 }
 
 fn ucrtbase() -> HMODULE {
-    let name: Vec<u16> = "ucrtbase.dll".encode_utf16().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = "ucrtbase.dll"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     // SAFETY: the name is NUL terminated and outlives the call.
     let handle = unsafe { LoadLibraryW(name.as_ptr()) };
     if handle.is_null() {

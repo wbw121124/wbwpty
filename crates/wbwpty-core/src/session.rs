@@ -365,14 +365,10 @@ impl Session {
         // substitute in the payload uses these names to reopen the pipe when the
         // published handle stops naming one; with them absent it had no way to
         // tell "not a pipe" from "never told".
-        spec.env.push((
-            contract::ENV_IN.into(),
-            pipes.input_name().to_string(),
-        ));
-        spec.env.push((
-            contract::ENV_OUT.into(),
-            pipes.output_name().to_string(),
-        ));
+        spec.env
+            .push((contract::ENV_IN.into(), pipes.input_name().to_string()));
+        spec.env
+            .push((contract::ENV_OUT.into(), pipes.output_name().to_string()));
         spec.env.push((
             contract::ENV_SHIM.into(),
             if config.shim { "1" } else { "0" }.into(),
@@ -411,13 +407,19 @@ impl Session {
         let dll_path = config
             .dll
             .clone()
-            .or_else(|| std::env::var("WBWPTY_DLL").ok().map(std::path::PathBuf::from))
+            .or_else(|| {
+                std::env::var("WBWPTY_DLL")
+                    .ok()
+                    .map(std::path::PathBuf::from)
+            })
             .unwrap_or_else(default_dll_path);
         let dll_image = std::fs::read(&dll_path).ok();
         let export_rva = |name: &str| -> Option<u32> {
-            dll_image
-                .as_ref()
-                .and_then(|file| crate::manual_map::find_export_rva(file, name).ok().flatten())
+            dll_image.as_ref().and_then(|file| {
+                crate::manual_map::find_export_rva(file, name)
+                    .ok()
+                    .flatten()
+            })
         };
         let status_rva = export_rva("WBWPTY_STATUS");
         let crt_detail_rva = export_rva("WBWPTY_CRT_DETAIL");
@@ -517,12 +519,9 @@ impl Session {
         } else {
             Vec::new()
         };
-        let inline_live = inline.iter().any(|h| {
-            matches!(
-                h,
-                crate::manual_map::inline::InlineHook::Installed { .. }
-            )
-        });
+        let inline_live = inline
+            .iter()
+            .any(|h| matches!(h, crate::manual_map::inline::InlineHook::Installed { .. }));
 
         // The import table substitution is now the fallback rather than the main
         // path. It still earns its place: a target whose inline prologue could not
@@ -588,7 +587,12 @@ impl Session {
         // Started only when there is something to extend: no payload means
         // nothing to point the descendants' slots at, and a watcher that
         // injected nothing would just spend a process table snapshot per poll.
-        let supervisor = match (report.as_ref(), hook.as_ref(), config.inject, config.cover_descendants) {
+        let supervisor = match (
+            report.as_ref(),
+            hook.as_ref(),
+            config.inject,
+            config.cover_descendants,
+        ) {
             (Some(_), Some(_), true, true) => {
                 // The handover reader resolves the payload's exported words by RVA,
                 // so it needs the image itself rather than re-reading the file on
@@ -623,10 +627,9 @@ impl Session {
             if let (Some(injection), Some(_)) = (report.as_ref(), hook.as_ref()) {
                 let proc = crate::manual_map::remote::RemoteProcess::new(child.process_handle());
                 if let Some(rva) = export_rva("WBWPTY_HANDOVER") {
-                    if let Err(err) = proc.write_bytes(
-                        injection.image_base + rva as u64,
-                        &1u32.to_le_bytes(),
-                    ) {
+                    if let Err(err) =
+                        proc.write_bytes(injection.image_base + rva as u64, &1u32.to_le_bytes())
+                    {
                         if config.verbose {
                             eprintln!(
                                 "wbwpty: pid {} could not enable handover: {err:#}",
@@ -649,22 +652,19 @@ impl Session {
         let console_hook = if config.shim {
             match report.as_ref() {
                 Some(injection) => {
-                    let proc_handle = crate::manual_map::remote::RemoteProcess::new(
-                        child.process_handle(),
-                    );
-                    match proc_handle
-                        .image_path()
-                        .and_then(|image| {
-                            let file = std::fs::read(&image).with_context(|| {
-                                format!("reading the target image {}", image.display())
-                            })?;
-                            crate::manual_map::install_console_hook(
-                                &proc_handle,
-                                &file,
-                                &dll_path,
-                                injection,
-                            )
-                        }) {
+                    let proc_handle =
+                        crate::manual_map::remote::RemoteProcess::new(child.process_handle());
+                    match proc_handle.image_path().and_then(|image| {
+                        let file = std::fs::read(&image).with_context(|| {
+                            format!("reading the target image {}", image.display())
+                        })?;
+                        crate::manual_map::install_console_hook(
+                            &proc_handle,
+                            &file,
+                            &dll_path,
+                            injection,
+                        )
+                    }) {
                         Ok(hook) => hook,
                         Err(err) => {
                             if config.verbose {
@@ -704,8 +704,8 @@ impl Session {
             hook,
             console_hook,
             hook_error,
-        inline_live,
-        inline,
+            inline_live,
+            inline,
             supervisor,
             screen,
             console_state_rva,
@@ -1037,11 +1037,11 @@ impl Session {
     }
 
     /// Where the hook counters live: `(payload image base, RVA)`.
-///
-/// The two halves have to be paired against each other and against the payload
-/// on disk; a mismatch reads a zero-filled address and looks exactly like a
-/// hook that never fired. Exposed for the diagnostics that have to check that
-/// without re-deriving the layout.
+    ///
+    /// The two halves have to be paired against each other and against the payload
+    /// on disk; a mismatch reads a zero-filled address and looks exactly like a
+    /// hook that never fired. Exposed for the diagnostics that have to check that
+    /// without re-deriving the layout.
     pub fn payload_stats_location(&self) -> Option<(u64, u32)> {
         Some((self.report.as_ref()?.image_base, self.hook_stats_rva?))
     }
@@ -1154,10 +1154,7 @@ impl Session {
                 if report.not_intercepted.is_empty() {
                     String::new()
                 } else {
-                    format!(
-                        "; left alone: {}",
-                        report.not_intercepted.join(", ")
-                    )
+                    format!("; left alone: {}", report.not_intercepted.join(", "))
                 }
             );
             // The address the state record is published at. Printed because a
@@ -1167,10 +1164,7 @@ impl Session {
             eprintln!(
                 "wbwpty: pid {} console state at {:#x} (payload base {:#x}, rva {:#x})",
                 self.child.pid,
-                self.report
-                    .as_ref()
-                    .map(|r| r.image_base)
-                    .unwrap_or(0)
+                self.report.as_ref().map(|r| r.image_base).unwrap_or(0)
                     + self.console_state_rva.unwrap_or(0) as u64,
                 self.report.as_ref().map(|r| r.image_base).unwrap_or(0),
                 self.console_state_rva.unwrap_or(0),
@@ -1541,7 +1535,10 @@ fn install_inline_process_hooks(
                     }
                     installed.push(InlineHook::Refused {
                         export: target.export,
-                        reason: format!("the payload has no {} to jump back through", target.original_slot),
+                        reason: format!(
+                            "the payload has no {} to jump back through",
+                            target.original_slot
+                        ),
                     });
                     continue;
                 };
@@ -1550,7 +1547,10 @@ fn install_inline_process_hooks(
                     &(trampoline as u64).to_le_bytes(),
                 ) {
                     if verbose {
-                        eprintln!("wbwpty: publishing {} failed: {err:#}", target.original_slot);
+                        eprintln!(
+                            "wbwpty: publishing {} failed: {err:#}",
+                            target.original_slot
+                        );
                     }
                     installed.push(InlineHook::Refused {
                         export: target.export,
@@ -1635,8 +1635,7 @@ fn inject_payload_two_phase(
     }
 
     let dll = config.dll.clone().unwrap_or_else(default_dll_path);
-    let file =
-        std::fs::read(&dll).with_context(|| format!("reading payload {}", dll.display()))?;
+    let file = std::fs::read(&dll).with_context(|| format!("reading payload {}", dll.display()))?;
     let proc = crate::manual_map::remote::RemoteProcess::new(child.process_handle());
 
     // Order matters, and it is the opposite of what it looks like.
@@ -1755,23 +1754,23 @@ fn install_nt_creation_hook(
 ///
 /// This waits for `kernelbase` specifically rather than for "the loader": the
 /// module is what the stub is patched into, and it appears earlier than the point
-/// at which the payload's own imports become resolvable. That difference is the
-/// whole margin - `cmd.exe` spawns at about 31 ms, `kernelbase` is mapped by
-/// about 28 ms, and the payload-based substitution is not live until 43 ms.
+/// at which the payload's own imports become resolvable. Measured: `kernelbase` is
+/// in the loader list about 194 µs after the resume, and the stub that follows is
+/// in place at 7-10 ms, against a target that spawns at about 8.
 ///
 /// Deliberately bounded and deliberately fallible. A target that never maps
-/// `kernelbase`, or whose `CreateProcessW` prologue cannot be relocated, gets an
-/// error and no patch; the session continues without it, exactly as it would
-/// have without this code.
+/// `kernelbase`, or whose `CreateProcessInternalW` prologue cannot be relocated,
+/// gets an error and no patch; the session continues without it, exactly as it
+/// would have without this code.
 fn install_forced_stub(
     proc: &crate::manual_map::remote::RemoteProcess,
     pid: u32,
     verbose: bool,
 ) -> Result<u64> {
-    use anyhow::bail;
     use crate::manual_map::exports::load_exports_from_file;
     use crate::manual_map::inline;
     use crate::manual_map::remote::RemoteModules;
+    use anyhow::bail;
 
     const KERNELBASE: &str = "kernelbase.dll";
     /// Short on purpose: past about 30 ms the target has usually spawned already,
@@ -1804,9 +1803,14 @@ fn install_forced_stub(
                 base_name: KERNELBASE.to_ascii_lowercase(),
             };
             let table = load_exports_from_file(std::path::Path::new(&path), &module)?;
-            let entry = inline::find_export(base, &table, "CreateProcessW")?;
-            let stub = proc.allocate(inline::forced_stub_size())?;
-            Ok(inline::install_forced_stub(proc, entry, stub)?.stub)
+            // `CreateProcessInternalW`, not `CreateProcessW`. cmd.exe calls the
+            // internal one directly, so a stub on `CreateProcessW` installs
+            // cleanly and then never runs - which is exactly what it did for the
+            // whole run that produced `CreateProcessW hook: 0 call(s)` next to a
+            // `ping` that had a console.
+            let entry = inline::find_export(base, &table, "CreateProcessInternalW")?;
+            let stub = proc.allocate(inline::internal_forced_stub_size())?;
+            Ok(inline::install_internal_forced_stub(proc, entry, stub)?.stub)
         })();
 
         match ready {
@@ -1902,7 +1906,11 @@ mod tests {
     #[test]
     fn runs_a_command_and_mirrors_its_output() {
         let spec = ChildSpec::new("cmd.exe").args(["/c", "echo wbwpty-session-ok"]);
-        let config = SessionConfig { shim: false, inject: false, ..Default::default() };
+        let config = SessionConfig {
+            shim: false,
+            inject: false,
+            ..Default::default()
+        };
         let session = Session::start(&spec, config).unwrap();
 
         // Read what the target printed straight off the pipe.
@@ -1963,8 +1971,7 @@ mod tests {
         eprintln!("DIAG report={:?}", report.map(|r| r.image_base));
         eprintln!("DIAG status={:#x}", session.payload_status().unwrap_or(0));
         eprintln!("DIAG child_running={}", session.child.is_running());
-        let report = report
-            .expect("payload should map into a running cmd.exe");
+        let report = report.expect("payload should map into a running cmd.exe");
         assert!(report.image_base != 0);
         assert!(report.patch_count > 0, "imports must be resolved");
         assert!(session.child.is_running(), "target survived DllMain");
@@ -2001,7 +2008,9 @@ mod tests {
             });
         let child = Child::spawn(&spec).unwrap();
         let proc = crate::manual_map::remote::RemoteProcess::new(child.process_handle());
-        let state = proc.read_console_state().expect("process parameters are readable");
+        let state = proc
+            .read_console_state()
+            .expect("process parameters are readable");
 
         assert_ne!(
             state.console_handle, 0,
@@ -2062,14 +2071,16 @@ mod tests {
             .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
             .expect("process parameters are readable");
 
-        proc.write_bytes(params + 0x10, &crate::manual_map::CONSOLE_HANDLE_SENTINEL.to_le_bytes())
-            .expect("writing the sentinel is allowed");
+        proc.write_bytes(
+            params + 0x10,
+            &crate::manual_map::CONSOLE_HANDLE_SENTINEL.to_le_bytes(),
+        )
+        .expect("writing the sentinel is allowed");
 
         child.resume().unwrap();
         let code = child.wait().unwrap();
         assert_eq!(
-            code,
-            0xc000_0142,
+            code, 0xc000_0142,
             "expected STATUS_DLL_INIT_FAILED; if this now passes, ConsoleHandle can be \
              written before startup and the whole injection-ordering story changes"
         );
@@ -2084,7 +2095,10 @@ mod tests {
     #[test]
     fn payload_publishes_the_stage_it_reached() {
         let spec = ChildSpec::new("cmd.exe");
-        let config = SessionConfig { shim: false, ..Default::default() };
+        let config = SessionConfig {
+            shim: false,
+            ..Default::default()
+        };
         let session = Session::start(&spec, config).unwrap();
         session
             .report()
@@ -2146,8 +2160,8 @@ mod tests {
     }
 
     /// A process the target creates must write to our pipe.
-///
-/// The first generation of Stage 8 in one test. The target is an interactive
+    ///
+    /// The first generation of Stage 8 in one test. The target is an interactive
     /// `cmd.exe` that is blocked reading its (never written) stdin, which makes
     /// the ordering deterministic: the interception is in place before the
     /// command that creates a descendant is fed in.
@@ -2185,7 +2199,7 @@ mod tests {
     /// which an interactive `cmd.exe` echoes straight back - so it passed while
     /// descendants produced nothing at all.
     #[test]
-fn grandchild_output_reaches_the_pipe() {
+    fn grandchild_output_reaches_the_pipe() {
         const MARKER: &str = "NEU7Q2K5";
         let spec = ChildSpec::new("cmd.exe");
         // No input pump: the target has to stay alive for this test to mean
@@ -2223,8 +2237,9 @@ fn grandchild_output_reaches_the_pipe() {
         let _ = session
             .pipes
             .with(|p| {
-                p.input()
-                    .write_all(format!("cmd.exe /c for %i in (NEU) do @echo %i7Q2K5\r\n").as_bytes())
+                p.input().write_all(
+                    format!("cmd.exe /c for %i in (NEU) do @echo %i7Q2K5\r\n").as_bytes(),
+                )
             })
             .expect("pipe write");
 
@@ -2232,7 +2247,11 @@ fn grandchild_output_reaches_the_pipe() {
         let mut saw_marker = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while std::time::Instant::now() < deadline && !saw_marker {
-            match session.pipes.with(|p| p.read_output(&mut buf, 200)).unwrap() {
+            match session
+                .pipes
+                .with(|p| p.read_output(&mut buf, 200))
+                .unwrap()
+            {
                 Ok(ReadEvent::Data(n)) => {
                     for line in String::from_utf8_lossy(&buf[..n]).lines() {
                         if line.trim() == MARKER {
@@ -2273,7 +2292,11 @@ fn grandchild_output_reaches_the_pipe() {
     #[test]
     fn stdio_works_without_injection() {
         let spec = ChildSpec::new("cmd.exe").args(["/c", "echo no-inject-ok"]);
-        let config = SessionConfig { shim: false, inject: false, ..Default::default() };
+        let config = SessionConfig {
+            shim: false,
+            inject: false,
+            ..Default::default()
+        };
         let session = Session::start(&spec, config).unwrap();
         assert!(session.report().is_none(), "injection was disabled");
 
@@ -2281,7 +2304,11 @@ fn grandchild_output_reaches_the_pipe() {
         let mut text = String::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
-            match session.pipes.with(|p| p.read_output(&mut buf, 200)).unwrap() {
+            match session
+                .pipes
+                .with(|p| p.read_output(&mut buf, 200))
+                .unwrap()
+            {
                 Ok(ReadEvent::Data(n)) => text.push_str(&String::from_utf8_lossy(&buf[..n])),
                 Ok(ReadEvent::Eof) => break,
                 Ok(ReadEvent::Timeout) => {}
@@ -2291,11 +2318,9 @@ fn grandchild_output_reaches_the_pipe() {
                 break;
             }
         }
-        assert!(text.contains("no-inject-ok"), "output missing, got {text:?}");
+        assert!(
+            text.contains("no-inject-ok"),
+            "output missing, got {text:?}"
+        );
     }
 }
-
-
-
-
-

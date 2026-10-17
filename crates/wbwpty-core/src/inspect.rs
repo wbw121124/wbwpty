@@ -271,7 +271,8 @@ pub fn is_elevated() -> bool {
             &raw mut returned,
         )
     };
-    ok != 0 && returned == std::mem::size_of::<TOKEN_ELEVATION>() as u32
+    ok != 0
+        && returned == std::mem::size_of::<TOKEN_ELEVATION>() as u32
         && elevation.TokenIsElevated != 0
 }
 

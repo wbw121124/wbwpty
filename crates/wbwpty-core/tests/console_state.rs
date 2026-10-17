@@ -60,7 +60,10 @@ fn observe() -> (String, Option<u32>) {
         ..Default::default()
     };
     let session = Session::start(
-        &ChildSpec::new(&probe).arg("--gate").arg(&gate).arg("--console-info"),
+        &ChildSpec::new(&probe)
+            .arg("--gate")
+            .arg(&gate)
+            .arg("--console-info"),
         config,
     )
     .expect("session");

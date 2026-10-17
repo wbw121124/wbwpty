@@ -216,7 +216,10 @@ fn measure_console_host(args: &[&str]) -> (bool, bool) {
         }
         if let Some(pid) = child_pid {
             let fresh = wbwpty_core::inspect::conhost_parents().unwrap_or_default();
-            if fresh.iter().any(|(host, parent)| *parent == pid && !baseline.contains(host)) {
+            if fresh
+                .iter()
+                .any(|(host, parent)| *parent == pid && !baseline.contains(host))
+            {
                 saw_host = true;
                 break;
             }
@@ -304,12 +307,24 @@ fn descendant_creation_matrix() {
         ("plain, handle inheritance", vec!["none"]),
         ("plain, no handle inheritance", vec!["--no-inherit", "none"]),
         ("std handles", vec!["--std-handles", "none"]),
-        ("std handles, no inheritance", vec!["--std-handles", "--no-inherit", "none"]),
+        (
+            "std handles, no inheritance",
+            vec!["--std-handles", "--no-inherit", "none"],
+        ),
         ("DETACHED_PROCESS", vec!["detached"]),
-        ("DETACHED_PROCESS + std handles", vec!["--std-handles", "detached"]),
-        ("DETACHED_PROCESS, no inheritance", vec!["--std-handles", "detached", "--no-inherit"]),
+        (
+            "DETACHED_PROCESS + std handles",
+            vec!["--std-handles", "detached"],
+        ),
+        (
+            "DETACHED_PROCESS, no inheritance",
+            vec!["--std-handles", "detached", "--no-inherit"],
+        ),
         ("CREATE_NO_WINDOW", vec!["no_window"]),
-        ("CREATE_NO_WINDOW + std handles", vec!["--std-handles", "no_window"]),
+        (
+            "CREATE_NO_WINDOW + std handles",
+            vec!["--std-handles", "no_window"],
+        ),
         ("CREATE_NEW_CONSOLE", vec!["new_console"]),
     ];
 
@@ -388,9 +403,7 @@ fn the_probe_can_spawn_a_child_at_all() {
     let exists = marker.exists();
     let _ = std::fs::remove_file(&marker);
 
-    eprintln!(
-        "probe sanity: exit={code} marker_exists={exists} marker={text:?} piped={piped:?}"
-    );
+    eprintln!("probe sanity: exit={code} marker_exists={exists} marker={text:?} piped={piped:?}");
     assert_eq!(code, 0, "cmd /c echo should exit 0 through the probe");
     assert!(
         text.contains("PROBE-OK"),
@@ -405,9 +418,7 @@ fn drain_pipe(session: &Session) -> String {
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
         match session.pipes().with(|p| p.read_output(&mut buf, 100)) {
-            Some(Ok(ReadEvent::Data(n))) => {
-                text.push_str(&String::from_utf8_lossy(&buf[..n]))
-            }
+            Some(Ok(ReadEvent::Data(n))) => text.push_str(&String::from_utf8_lossy(&buf[..n])),
             Some(Ok(ReadEvent::Eof)) | None => break,
             Some(Ok(ReadEvent::Timeout)) => {}
             Some(Err(_)) => break,

@@ -177,16 +177,7 @@ pub fn inject_bytes_with(
     loader_wait: std::time::Duration,
     poll: std::time::Duration,
 ) -> Result<InjectionReport> {
-    Ok(inject_bytes_inner(
-        proc,
-        pid,
-        image,
-        entry_symbol,
-        loader_wait,
-        poll,
-        true,
-    )?
-    .report)
+    Ok(inject_bytes_inner(proc, pid, image, entry_symbol, loader_wait, poll, true)?.report)
 }
 
 /// The one implementation both entry points share.
@@ -805,7 +796,11 @@ impl<'a> ImportResolver<'a> {
                 .modules
                 .path_for_base(base)
                 .and_then(|path| {
-                    exports::load_exports_from_file(std::path::Path::new(&path), &self.module_view(base)).ok()
+                    exports::load_exports_from_file(
+                        std::path::Path::new(&path),
+                        &self.module_view(base),
+                    )
+                    .ok()
                 })
                 .filter(|table| !table.is_empty());
 
@@ -1013,7 +1008,7 @@ mod tests {
             "rewriting the entry point must not be assumed to work: see README 5.3"
         );
     }
-/// Bisect probe: mapping the image and running a trivial export must work.
+    /// Bisect probe: mapping the image and running a trivial export must work.
     ///
     /// `wbwpty_probe` only stores a magic into the payload's own writable data,
     /// so a failure here localises the fault to the manual map itself (relocations,
@@ -1046,16 +1041,17 @@ mod tests {
         .unwrap();
         stdio.release();
         let report = inject_into_child(&child, &dll, "wbwpty_probe").expect("probe injection");
-        eprintln!("DIAG probe report image_base={:#x} entry_rva={:#x} wait={}ms",
-            report.image_base, report.entry_rva, report.loader_wait_ms);
+        eprintln!(
+            "DIAG probe report image_base={:#x} entry_rva={:#x} wait={}ms",
+            report.image_base, report.entry_rva, report.loader_wait_ms
+        );
 
         let proc = RemoteProcess::new(child.process_handle());
-        let bytes = proc.read_bytes(report.image_base + status_rva as u64, 4).unwrap();
+        let bytes = proc
+            .read_bytes(report.image_base + status_rva as u64, 4)
+            .unwrap();
         let val = u32::from_le_bytes(bytes.try_into().unwrap());
-        assert_eq!(
-            val, 0xc0de_cafe,
-            "probe wrote its marker, got {val:#x}"
-        );
+        assert_eq!(val, 0xc0de_cafe, "probe wrote its marker, got {val:#x}");
         assert!(child.is_running(), "target survived");
         let _ = child.terminate();
     }
@@ -1088,11 +1084,15 @@ mod tests {
         .unwrap();
         stdio.release();
         let report = inject_into_child(&child, &dll, "DllMain").expect("DllMain injection");
-        eprintln!("DIAG dllmain report image_base={:#x} entry_rva={:#x} wait={}ms",
-            report.image_base, report.entry_rva, report.loader_wait_ms);
+        eprintln!(
+            "DIAG dllmain report image_base={:#x} entry_rva={:#x} wait={}ms",
+            report.image_base, report.entry_rva, report.loader_wait_ms
+        );
 
         let proc = RemoteProcess::new(child.process_handle());
-        let bytes = proc.read_bytes(report.image_base + status_rva as u64, 4).unwrap();
+        let bytes = proc
+            .read_bytes(report.image_base + status_rva as u64, 4)
+            .unwrap();
         let val = u32::from_le_bytes(bytes.try_into().unwrap());
         eprintln!("DIAG dllmain status={val:#x} (non-zero (DllMain ran))");
         if val == 0 {
@@ -1100,7 +1100,7 @@ mod tests {
         }
         // Any value >= 10 means DllMain entered the attach branch.
         // Value 99 = past install(). Values 10-22 = inside install().
-assert!(val != 0, "DllMain must write to status; got {val:#x}");
+        assert!(val != 0, "DllMain must write to status; got {val:#x}");
         assert!(child.is_running(), "target survived DllMain");
         let _ = child.terminate();
     }

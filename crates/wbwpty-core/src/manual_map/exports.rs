@@ -66,12 +66,13 @@ pub fn load_exports(proc: &RemoteProcess, module: &RemoteModule) -> Result<Expor
         return Ok(ExportTable::default());
     };
     let mut at = |rva: u32, len: usize| -> Result<Vec<u8>> {
-        proc.read_bytes(module.base + rva as u64, len).with_context(|| {
-            format!(
-                "reading {len:#x} bytes at rva {rva:#x} of {}",
-                module.base_name
-            )
-        })
+        proc.read_bytes(module.base + rva as u64, len)
+            .with_context(|| {
+                format!(
+                    "reading {len:#x} bytes at rva {rva:#x} of {}",
+                    module.base_name
+                )
+            })
     };
     read_exports_from_parts(module, dir.virtual_address, dir.size, &mut at)
 }
@@ -91,11 +92,17 @@ pub fn load_exports(proc: &RemoteProcess, module: &RemoteModule) -> Result<Expor
 /// The RVAs are a property of the file, so reading the same file from disk gives
 /// identical answers; only the base differs, and that comes from the target's own
 /// module list.
-pub fn load_exports_from_file(path: &std::path::Path, module: &RemoteModule) -> Result<ExportTable> {
+pub fn load_exports_from_file(
+    path: &std::path::Path,
+    module: &RemoteModule,
+) -> Result<ExportTable> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let image = crate::manual_map::pe::PeImage::parse(&bytes)
         .with_context(|| format!("parsing {}", path.display()))?;
-    let Some(dir) = image.info.directory(crate::manual_map::pe::DIRECTORY_ENTRY_EXPORT) else {
+    let Some(dir) = image
+        .info
+        .directory(crate::manual_map::pe::DIRECTORY_ENTRY_EXPORT)
+    else {
         return Ok(ExportTable::default());
     };
     // The closure is handed RVAs and must translate them itself: here the backing
@@ -115,7 +122,6 @@ fn read_exports_from_parts(
     dir_size: u32,
     at: &mut dyn FnMut(u32, usize) -> Result<Vec<u8>>,
 ) -> Result<ExportTable> {
-
     // IMAGE_EXPORT_DIRECTORY header.
     let header = at(dir_rva, 0x28)?;
     let base_index = u32_at(&header, 0x10)?;
@@ -144,20 +150,19 @@ fn read_exports_from_parts(
 
     let dir_start = dir_rva;
     let dir_end = dir_start + dir_size;
-    let mut classify = |at: &mut dyn FnMut(u32, usize) -> Result<Vec<u8>>,
-                         rva: u32|
-     -> Result<ExportTarget> {
-        if (dir_start..dir_end).contains(&rva) {
-            // Inside the export directory => ASCII forwarder string.
-            let blob = at(rva, MAX_EXPORT_NAME)?;
-            let end = blob.iter().position(|&b| b == 0).unwrap_or(MAX_EXPORT_NAME);
-            Ok(ExportTarget::Forwarder(
-                String::from_utf8_lossy(&blob[..end]).into_owned(),
-            ))
-        } else {
-            Ok(ExportTarget::Rva(rva))
-        }
-    };
+    let mut classify =
+        |at: &mut dyn FnMut(u32, usize) -> Result<Vec<u8>>, rva: u32| -> Result<ExportTarget> {
+            if (dir_start..dir_end).contains(&rva) {
+                // Inside the export directory => ASCII forwarder string.
+                let blob = at(rva, MAX_EXPORT_NAME)?;
+                let end = blob.iter().position(|&b| b == 0).unwrap_or(MAX_EXPORT_NAME);
+                Ok(ExportTarget::Forwarder(
+                    String::from_utf8_lossy(&blob[..end]).into_owned(),
+                ))
+            } else {
+                Ok(ExportTarget::Rva(rva))
+            }
+        };
 
     let mut table = ExportTable::default();
     for i in 0..number_of_functions {
@@ -243,4 +248,3 @@ impl ImportBy {
         }
     }
 }
-

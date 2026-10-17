@@ -24,10 +24,10 @@ use windows_sys::Win32::System::Memory::{
     PAGE_EXECUTE_READWRITE,
 };
 use windows_sys::Win32::System::Threading::{
-        CreateRemoteThread, GetExitCodeThread, WaitForSingleObject, INFINITE, LPTHREAD_START_ROUTINE,
-        PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_OPERATION,
-        PROCESS_VM_READ, PROCESS_VM_WRITE,
-    };
+    CreateRemoteThread, GetExitCodeThread, WaitForSingleObject, INFINITE, LPTHREAD_START_ROUTINE,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_OPERATION,
+    PROCESS_VM_READ, PROCESS_VM_WRITE,
+};
 
 use crate::error::last_error_text;
 
@@ -239,7 +239,9 @@ impl RemoteModules {
 
         let host_base = host_module_base(name);
         if host_base == 0 {
-            return Err(anyhow::Error::new(ModuleNotMapped { name: name.to_owned() }));
+            return Err(anyhow::Error::new(ModuleNotMapped {
+                name: name.to_owned(),
+            }));
         }
 
         // Trust but verify: the target must actually have this image at that
@@ -402,8 +404,7 @@ impl RemoteProcess {
         if &dos[0..2] != b"MZ" {
             bail!("no MZ header at the target's image base {base:#x}");
         }
-        let e_lfanew =
-            u32::from_le_bytes(dos[0x3c..0x40].try_into().expect("4 bytes")) as usize;
+        let e_lfanew = u32::from_le_bytes(dos[0x3c..0x40].try_into().expect("4 bytes")) as usize;
         // FILE_HEADER is 24 bytes; `Machine` is its second field.
         let file_header = self.read_bytes(base + e_lfanew as u64, 24)?;
         if &file_header[0..4] != b"PE\0\0" {
@@ -440,7 +441,9 @@ impl RemoteProcess {
         if ok == 0 {
             bail!("QueryFullProcessImageNameW failed: {}", last_error_text());
         }
-        Ok(std::path::PathBuf::from(OsString::from_wide(&buf[..len as usize])))
+        Ok(std::path::PathBuf::from(OsString::from_wide(
+            &buf[..len as usize],
+        )))
     }
 
     /// Reads `len` bytes from the target at `addr`.
@@ -695,9 +698,9 @@ impl RemoteProcess {
         Ok(self.read_u64(peb + PEB_LDR_OFFSET)? == 0)
     }
 
-/// `PEB->ImageBaseAddress`: where the loader mapped the executable itself.
-/// Available even while the process is suspended, because the kernel does
-/// that mapping inside `NtCreateUserProcess`.
+    /// `PEB->ImageBaseAddress`: where the loader mapped the executable itself.
+    /// Available even while the process is suspended, because the kernel does
+    /// that mapping inside `NtCreateUserProcess`.
     pub fn image_base(&self) -> Result<u64> {
         let peb = self.peb()?;
         self.read_u64(peb + PEB_IMAGE_BASE_OFFSET)

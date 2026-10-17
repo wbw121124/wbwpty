@@ -134,7 +134,6 @@ pub fn install_create_process_hook(
     std_handles: [u64; 3],
     explicit_environment: bool,
 ) -> Result<Option<HookReport>> {
-
     let pid = proc.pid().unwrap_or(0);
     let image_path = proc.image_path()?;
     let target_image = std::fs::read(&image_path)
@@ -176,7 +175,7 @@ pub fn install_create_process_hook(
     for (slot, value) in packed.chunks_mut(8).zip(std_handles) {
         slot.copy_from_slice(&value.to_le_bytes());
     }
-proc.write_bytes(report.image_base + handles_rva as u64, &packed)
+    proc.write_bytes(report.image_base + handles_rva as u64, &packed)
         .context("publishing the session standard handles")?;
 
     // Whether the substitute should hand the child an explicit environment
@@ -198,7 +197,7 @@ proc.write_bytes(report.image_base + handles_rva as u64, &packed)
         let slots = iat::find_imports(&target_image, &[t.api])
             .with_context(|| format!("walking the target's import table for {}", t.api))?;
 
-let target_base = proc.image_base()?;
+        let target_base = proc.image_base()?;
         let first = slots[0].address(target_base);
 
         // Wait for the loader to have actually resolved this slot *before*
@@ -271,7 +270,7 @@ let target_base = proc.image_base()?;
         // still working clobbers the write, the mismatch repairs it, and a
         // loader that is already done passes on the first check - which keeps
         // the common case down to one extra read instead of a fixed settle.
-let mut consecutive = 0u32;
+        let mut consecutive = 0u32;
         loop {
             let read = proc
                 .read_bytes(first, 8)
@@ -299,18 +298,14 @@ let mut consecutive = 0u32;
             std::thread::sleep(gap);
         }
 
-// The remaining slots for this API. The first one is the one a
+        // The remaining slots for this API. The first one is the one a
         // single-import target uses and the one whose settling was just
         // verified; the rest are rewritten best effort, because a secondary slot
         // that resists should not discard an interception that is already live.
         for slot in &slots[1..] {
             let addr = slot.address(target_base);
             if proc.write_bytes(addr, &substitute.to_le_bytes()).is_err() {
-                let _ = proc.protect(
-                    addr,
-                    8,
-                    windows_sys::Win32::System::Memory::PAGE_READWRITE,
-                );
+                let _ = proc.protect(addr, 8, windows_sys::Win32::System::Memory::PAGE_READWRITE);
                 proc.write_bytes(addr, &substitute.to_le_bytes())
                     .with_context(|| format!("writing a secondary {} slot", t.api))?;
             }

@@ -146,7 +146,10 @@ mod tests {
 
         let job = build_job(0x7ff0_0000_0000, 0x1234);
         assert_eq!(job.len(), job_size());
-        assert_eq!(u64::from_le_bytes(job[0..8].try_into().unwrap()), 0x7ff0_0000_0000);
+        assert_eq!(
+            u64::from_le_bytes(job[0..8].try_into().unwrap()),
+            0x7ff0_0000_0000
+        );
         assert_eq!(u64::from_le_bytes(job[8..16].try_into().unwrap()), 0x1234);
     }
 
@@ -172,7 +175,10 @@ mod tests {
                 PAGE_EXECUTE_READWRITE,
             )
         } as u64;
-        assert_ne!(page, 0, "VirtualAlloc must succeed for this test to mean anything");
+        assert_ne!(
+            page, 0,
+            "VirtualAlloc must succeed for this test to mean anything"
+        );
 
         // Payload records the two interesting arguments:
         //   mov [rcx+0x400], rdx      ; 48 89 91 00 04 00 00

@@ -199,9 +199,7 @@ fn observe(inject: bool, patch_descendants: bool) -> Observation {
     // interception is in place before the command that creates a descendant is
     // fed in. Nothing here races with setup. The trailing keep-awake is what
     // stops the target from exiting on stdin EOF mid-measurement.
-    let command = format!(
-        "cmd.exe /c \"{DESCENDANT_COMMAND}\"\r\n{KEEP_AWAKE}\r\n"
-    );
+    let command = format!("cmd.exe /c \"{DESCENDANT_COMMAND}\"\r\n{KEEP_AWAKE}\r\n");
     // Two expects, because there are two failure modes and they are not the same
     // one: `with` yields an `Option` (the pipe lock is poisoned) and the write
     // itself yields an `io::Result`. Only the first was being handled, so a
@@ -236,10 +234,7 @@ fn observe(inject: bool, patch_descendants: bool) -> Observation {
     let mut alive_at_end = false;
     let deadline = Instant::now() + OBSERVE;
     while Instant::now() < deadline {
-        match session
-            .pipes()
-            .with(|p| p.read_output(&mut buf, 0))
-        {
+        match session.pipes().with(|p| p.read_output(&mut buf, 0)) {
             Some(Ok(ReadEvent::Data(n))) => {
                 for line in String::from_utf8_lossy(&buf[..n]).lines() {
                     if line.trim() == MARKER {
@@ -268,7 +263,10 @@ fn observe(inject: bool, patch_descendants: bool) -> Observation {
             .iter()
             .filter(|e| e.pid != guard.root && mine.contains(&e.pid))
         {
-            let line = format!("{} (pid {}, parent {})", entry.name, entry.pid, entry.parent);
+            let line = format!(
+                "{} (pid {}, parent {})",
+                entry.name, entry.pid, entry.parent
+            );
             if !descendants.iter().any(|d: &String| *d == line) {
                 descendants.push(line.clone());
             }
@@ -294,7 +292,10 @@ fn observe(inject: bool, patch_descendants: bool) -> Observation {
         std::thread::sleep(SAMPLE);
     }
 
-    let hook_calls = session.payload_hook_stats().map(|(calls, _)| calls).unwrap_or(0);
+    let hook_calls = session
+        .payload_hook_stats()
+        .map(|(calls, _)| calls)
+        .unwrap_or(0);
     eprintln!(
         "root={} alive={:?} image_base={:#x} slot_rva={:#x}\n\
          slot history (slot address -> value): {:?}\n\
@@ -309,7 +310,10 @@ fn observe(inject: bool, patch_descendants: bool) -> Observation {
             .iter()
             .map(|v| format!("{v:#018x}"))
             .collect::<Vec<_>>(),
-        session.hook().and_then(|h| h.primary()).map(|i| i.substitute),
+        session
+            .hook()
+            .and_then(|h| h.primary())
+            .map(|i| i.substitute),
         session.hook().and_then(|h| h.primary()).map(|i| i.original),
         stats_at_marker,
         session.payload_hook_stats(),

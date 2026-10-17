@@ -106,7 +106,8 @@ fn measure_with(mode: Option<i32>, inject: bool) -> Measurement {
         inject,
         ..Default::default()
     };
-    let session = Session::start(&ChildSpec::new(probe_path()).args(args), config).expect("session");
+    let session =
+        Session::start(&ChildSpec::new(probe_path()).args(args), config).expect("session");
 
     // When the payload is mapped, wait for its worker to finish before timing:
     // otherwise the measurement races the repair and can record the broken
@@ -218,8 +219,11 @@ fn setvbuf_accepts_exactly_three_modes_and_only_one_of_them_flushes() {
         rows.push(m);
     }
 
-    let valid: Vec<i32> =
-        rows.iter().filter(|m| m.is_valid_mode()).map(|m| m.mode.unwrap()).collect();
+    let valid: Vec<i32> = rows
+        .iter()
+        .filter(|m| m.is_valid_mode())
+        .map(|m| m.mode.unwrap())
+        .collect();
     let immediate: Vec<i32> = rows
         .iter()
         .filter(|m| m.outcome == Outcome::Immediate)
@@ -288,7 +292,8 @@ fn the_payload_reports_what_it_repaired() {
         std::ffi::OsString::from("--sleep-ms"),
         std::ffi::OsString::from(SLEEP.as_millis().to_string()),
     ];
-    let session = Session::start(&ChildSpec::new(probe_path()).args(args), config).expect("session");
+    let session =
+        Session::start(&ChildSpec::new(probe_path()).args(args), config).expect("session");
 
     let stage = session
         .wait_for_payload(std::time::Duration::from_millis(3000))
@@ -303,7 +308,11 @@ fn the_payload_reports_what_it_repaired() {
         detail.ucrt_resolved, detail.streams_set, detail.streams_refused
     );
 
-    assert!(stage.ran_attach_path(), "DllMain was entered with reason {:#x}", stage.reason);
+    assert!(
+        stage.ran_attach_path(),
+        "DllMain was entered with reason {:#x}",
+        stage.reason
+    );
     assert!(
         detail.ucrt_resolved,
         "ucrtbase should resolve: this fixture writes through it"
@@ -312,7 +321,10 @@ fn the_payload_reports_what_it_repaired() {
         detail.streams_set, 2,
         "stdout and stderr should both be repaired, got {detail:?}"
     );
-    assert_eq!(detail.streams_refused, 0, "no stream should be refused: {detail:?}");
+    assert_eq!(
+        detail.streams_refused, 0,
+        "no stream should be refused: {detail:?}"
+    );
 
     session.shutdown();
 }
