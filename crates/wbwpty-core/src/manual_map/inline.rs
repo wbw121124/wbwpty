@@ -518,12 +518,24 @@ pub struct InternalForcedStub {
     pub entry: u64,
     /// Address of the stub it now jumps to.
     pub stub: u64,
+    /// Address of the call counter inside the stub, so the host can read back how
+    /// many times the function was actually entered.
+    pub counter: u64,
 }
 
 /// Bytes [`install_internal_forced_stub`] writes into its stub buffer.
+///
+/// Six bytes more than the flag pair: an `inc dword [rip+disp32]` and the counter
+/// itself. Without a count, "installed" and "ran" are indistinguishable from the
+/// outside - the patch reporting success says only that twelve bytes were written,
+/// which is exactly how a stub on the wrong function looks while the target still
+/// gets a console. Six bytes is the price of not having to guess which it was.
 pub fn internal_forced_stub_size() -> usize {
-    force_flags_at(CREATE_PROCESS_INTERNAL_W_FLAGS_OFFSET, 4).len() + PROLOGUE_LEN * 2
+    force_flags_at(CREATE_PROCESS_INTERNAL_W_FLAGS_OFFSET, 4).len() + 4 + 4 + PROLOGUE_LEN * 2
 }
+
+/// Length of the `inc` and its displacement operand.
+const COUNTER_INSTRUCTION_LEN: usize = 6;
 
 /// Patches `CreateProcessInternalW` so it forces `DETACHED_PROCESS`.
 ///
@@ -548,7 +560,17 @@ pub fn install_internal_forced_stub(
         bail!("no stub buffer was provided");
     }
 
-    let mut body = force_flags_at(CREATE_PROCESS_INTERNAL_W_FLAGS_OFFSET, 4);
+    let flags = force_flags_at(CREATE_PROCESS_INTERNAL_W_FLAGS_OFFSET, 4);
+    // `inc dword [rip+disp32]` is `FF 05 disp32`; the displacement is relative to
+    // the end of the instruction, so the counter sits immediately after it.
+    let counter_offset = flags.len() + COUNTER_INSTRUCTION_LEN;
+    let displacement = counter_offset as i32 - COUNTER_INSTRUCTION_LEN as i32;
+
+    let mut body = flags;
+    body.extend_from_slice(&[0xFF, 0x05]);
+    body.extend_from_slice(&displacement.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes()); // the counter, zeroed
+    debug_assert_eq!(body.len(), counter_offset + 4);
     body.extend_from_slice(&prologue);
     body.extend_from_slice(&jump_absolute(entry + PROLOGUE_LEN as u64));
     proc.write_bytes(stub, &body)
@@ -557,7 +579,11 @@ pub fn install_internal_forced_stub(
     proc.write_bytes(entry, &jump_absolute(stub))
         .with_context(|| format!("patching {entry:#x}"))?;
 
-    Ok(InternalForcedStub { entry, stub })
+    Ok(InternalForcedStub {
+        entry,
+        stub,
+        counter: stub + counter_offset as u64,
+    })
 }
 
 /// Bytes [`install_nt_forced_stub`] writes.

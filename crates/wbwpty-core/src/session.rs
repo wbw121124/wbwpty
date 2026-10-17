@@ -303,6 +303,10 @@ pub struct Session {
     /// counters come back `None`. Sampling during the session is what makes them
     /// answerable at all.
     hook_stats_seen: Arc<std::sync::Mutex<Option<(u32, u32)>>>,
+    /// Address of the forced stub's call counter inside the target.
+    forced_stub_counter: Option<u64>,
+    /// High-water mark of that counter, for [Self::forced_stub_calls].
+    forced_stub_seen: Arc<std::sync::Mutex<Option<u32>>>,
     /// Cached [`Self::hook_stats_seen`], for the creation flags instead of the
     /// counters.
     hook_flags_seen: Arc<std::sync::Mutex<Option<(u32, u32)>>>,
@@ -391,7 +395,8 @@ impl Session {
 
         // The target must run whether or not we manage to patch it. Resuming is
         // therefore done here, and injection is layered on top.
-        let report = match inject_payload(&child, &config, resume_at) {
+        let (report, forced_stub_counter) = inject_payload(&child, &config, resume_at);
+        let report = match report {
             Some(report) => Some(report),
             None => {
                 if !child.is_resumed() {
@@ -710,6 +715,8 @@ impl Session {
             screen,
             console_state_rva,
             hook_stats_seen: Arc::new(std::sync::Mutex::new(None)),
+            forced_stub_counter,
+            forced_stub_seen: Arc::new(std::sync::Mutex::new(None)),
             hook_flags_seen: Arc::new(std::sync::Mutex::new(None)),
             shutting_down: Arc::new(AtomicBool::new(false)),
         };
@@ -995,6 +1002,23 @@ impl Session {
         self.hook_stats_seen.lock().ok().and_then(|s| *s)
     }
 
+    /// How many times the target has entered `CreateProcessInternalW`.
+    ///
+    /// The high-water mark of a counter inside the forced stub, sampled while the
+    /// target is alive. Sampling matters: read after the target exits and the answer
+    /// is always zero, which is indistinguishable from a stub that was never entered -
+    /// the exact ambiguity this counter exists to remove.
+    pub fn forced_stub_calls(&self) -> Option<u32> {
+        let address = self.forced_stub_counter?;
+        let proc = crate::manual_map::remote::RemoteProcess::new(self.child.process_handle());
+        let bytes = proc.read_bytes(address, 4).ok()?;
+        let live = u32::from_le_bytes(<[u8; 4]>::try_from(bytes.as_slice()).ok()?);
+        if let Ok(mut seen) = self.forced_stub_seen.lock() {
+            *seen = Some(seen.unwrap_or(0).max(live));
+        }
+        self.forced_stub_seen.lock().ok().and_then(|s| *s)
+    }
+
     /// The `dwCreationFlags` the substitution handed to `CreateProcessW`, and
     /// how many children went through it.
     ///
@@ -1138,6 +1162,14 @@ impl Session {
         if let Some((calls, failures)) = self.payload_hook_stats() {
             eprintln!(
                 "wbwpty: pid {} hook calls={calls} failures={failures}",
+                self.child.pid
+            );
+        }
+        // Whether the early stub was actually *entered* is a separate fact from
+        // whether it was installed, and only the first one explains a console.
+        if let Some(entries) = self.forced_stub_calls() {
+            eprintln!(
+                "wbwpty: pid {} CreateProcessInternalW stub entries={entries}",
                 self.child.pid
             );
         }
@@ -1589,7 +1621,7 @@ fn inject_payload(
     child: &Child,
     config: &SessionConfig,
     resume_at: std::time::Instant,
-) -> Option<InjectionReport> {
+) -> (Option<InjectionReport>, Option<u64>) {
     inject_payload_two_phase(child, config, resume_at).unwrap_or_else(|err| {
         if config.verbose {
             eprintln!("wbwpty: two-phase injection failed: {err:#}");
@@ -1600,7 +1632,7 @@ fn inject_payload(
         if !child.is_resumed() {
             let _ = child.resume();
         }
-        None
+        (None, None)
     })
 }
 
@@ -1624,14 +1656,14 @@ fn inject_payload_two_phase(
     child: &Child,
     config: &SessionConfig,
     resume_at: std::time::Instant,
-) -> Result<Option<InjectionReport>> {
+) -> Result<(Option<InjectionReport>, Option<u64>)> {
     use anyhow::Context;
 
     if !config.inject {
         if !child.is_resumed() {
             child.resume().context("resuming target")?;
         }
-        return Ok(None);
+        return Ok((None, None));
     }
 
     let dll = config.dll.clone().unwrap_or_else(default_dll_path);
@@ -1662,12 +1694,14 @@ fn inject_payload_two_phase(
         child.resume().context("resuming target")?;
     }
     if !child.is_running() {
-        return Ok(None);
+        return Ok((None, None));
     }
 
+    let mut forced_stub_counter = None;
     if config.forced_stub {
         match install_forced_stub(&proc, child.pid, config.verbose) {
-            Ok(at) => {
+            Ok((at, counter)) => {
+                forced_stub_counter = Some(counter);
                 if config.verbose {
                     eprintln!(
                         "wbwpty: pid {} forced DETACHED_PROCESS via a stub at {at:#x}, \
@@ -1697,16 +1731,16 @@ fn inject_payload_two_phase(
     // spawns at about 8. Suspending to write bytes that can wait is a bad trade
     // when what cannot wait is a patch.
     if !child.is_running() {
-        return Ok(None);
+        return Ok((None, None));
     }
 
     match crate::manual_map::inject_dll(child, &dll, "DllMain") {
-        Ok(report) => Ok(Some(report)),
+        Ok(report) => Ok((Some(report), forced_stub_counter)),
         Err(err) => {
             if config.verbose {
                 eprintln!("wbwpty: payload not mapped ({err:#})");
             }
-            Ok(None)
+            Ok((None, forced_stub_counter))
         }
     }
 }
@@ -1811,7 +1845,7 @@ fn install_forced_stub(
     proc: &crate::manual_map::remote::RemoteProcess,
     pid: u32,
     verbose: bool,
-) -> Result<u64> {
+) -> Result<(u64, u64)> {
     use crate::manual_map::exports::load_exports_from_file;
     use crate::manual_map::inline;
     use crate::manual_map::remote::RemoteModules;
@@ -1832,7 +1866,7 @@ fn install_forced_stub(
         // path as a hard error, and reported "no path recorded for kernelbase.dll"
         // on a target that was about to have one a fraction of a millisecond later
         // - which is exactly the window this exists to use.
-        let ready = (|| -> Result<u64> {
+        let ready = (|| -> Result<inline::InternalForcedStub> {
             let modules = proc.poll_modules_ready(POLL, POLL)?;
             let listed = std::time::Instant::now();
             let mut parsed = listed;
@@ -1864,17 +1898,37 @@ fn install_forced_stub(
                 }
             };
             let found = std::time::Instant::now();
+            // Cross-check the host-derived RVA against an independent parse of the file.
+            // The prologue check in `install_internal_forced_stub` only proves
+            // twelve relocatable bytes are there; it cannot tell a right answer
+            // from a wrong one that lands somewhere else equally relocatable.
+            // Cheap insurance while the shortcut is this new.
+            if let Ok(table) = load_exports_from_file(std::path::Path::new(&path), &module) {
+                if let Ok(from_file) = inline::find_export(base, &table, "CreateProcessInternalW") {
+                    eprintln!(
+                        "wbwpty: CreateProcessInternalW from host = {entry:#x}, \
+                             from file = {from_file:#x}, {}",
+                        if entry == from_file {
+                            "agree"
+                        } else {
+                            "DISAGREE"
+                        }
+                    );
+                }
+            }
             let stub = proc.allocate(inline::internal_forced_stub_size())?;
             let allocated = std::time::Instant::now();
-            let at = inline::install_internal_forced_stub(proc, entry, stub)?.stub;
+            let installed = inline::install_internal_forced_stub(proc, entry, stub)?;
             let patched = std::time::Instant::now();
             if verbose {
                 // Which of these is the cost is not obvious from the code: parsing
                 // `kernelbase.dll`'s export table off disk is a PE parse of a
                 // megabyte-scale image, and it measured 6.5 ms - the whole margin.
                 eprintln!(
-                    "wbwpty: forced-stub stages: list={}us parse_exports={}us \
-                     find_export={}us allocate={}us patch={}us",
+                    "wbwpty: forced-stub entry={:#x} stub={:#x} stages: \
+                     list={}us parse_exports={}us find_export={}us allocate={}us patch={}us",
+                    installed.entry,
+                    installed.stub,
                     (listed - attempt).as_micros(),
                     (parsed - listed).as_micros(),
                     (found - parsed).as_micros(),
@@ -1882,11 +1936,24 @@ fn install_forced_stub(
                     (patched - allocated).as_micros(),
                 );
             }
-            Ok(at)
+            // Read the counter while the target is still alive. The stub being
+            // installed and the stub being entered are different facts, and only one
+            // of them explains a console appearing.
+            if verbose {
+                match proc.read_bytes(installed.counter, 4) {
+                    Ok(b) if b.len() == 4 => eprintln!(
+                        "wbwpty: CreateProcessInternalW stub entered {} time(s) (still running)",
+                        u32::from_le_bytes(b.try_into().unwrap())
+                    ),
+                    Ok(_) => eprintln!("wbwpty: counter read was short"),
+                    Err(err) => eprintln!("wbwpty: could not read the stub counter: {err:#}"),
+                }
+            }
+            Ok(installed)
         })();
 
         match ready {
-            Ok(at) => return Ok(at),
+            Ok(at) => return Ok((at.stub, at.counter)),
             Err(err) => {
                 if std::time::Instant::now() >= deadline {
                     return Err(err).with_context(|| {
