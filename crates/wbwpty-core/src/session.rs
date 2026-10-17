@@ -92,6 +92,23 @@ pub struct SessionConfig {
     /// before, and which still covers a target that resolves its imports slowly
     /// enough.
     pub inline_process_hook: bool,
+    /// Force `DETACHED_PROCESS` with a stub that needs no payload at all.
+    ///
+    /// The only substitution that can be installed before a target spawns. It is
+    /// two instructions patched into `kernelbase!CreateProcessW` - no imports, no
+    /// data, so it does not have to wait for the payload's own imports to resolve.
+    /// That wait is about 28 ms on this machine, while `cmd.exe` spawns at about
+    /// 31 ms and the payload-based substitution is live at 43 ms; this is what
+    /// lands in the gap.
+    ///
+    /// It cannot publish the session's handles or hand a child over - both need
+    /// the payload. Its job is narrower and entirely about consoles: make sure
+    /// none is ever allocated. The full substitution follows.
+    ///
+    /// Off by default only because it patches a system DLL's code in the target,
+    /// which is a more invasive thing to do than rewriting a slot in the target's
+    /// own import table.
+    pub forced_stub: bool,
     /// Mirror the host's stdin into the `-in` pipe.
     ///
     /// Off leaves the target's stdin open for the life of the session, which is
@@ -133,6 +150,7 @@ impl Default for SessionConfig {
             cover_descendants: true,
             handover: true,
             inline_process_hook: true,
+            forced_stub: true,
             pump_input: true,
             verbose: false,
             explicit_environment: false,
@@ -1636,6 +1654,38 @@ fn inject_payload_two_phase(
         return Ok(None);
     }
 
+    // The forced stub goes in *before* the payload is finished, and that ordering
+    // is the entire point of it.
+    //
+    // [`SuspendedMapping::finish`] cannot return before `kernelbase.dll` is
+    // mapped, because the payload's imports resolve through `kernel32`'s
+    // forwarders into it - about 28 ms on this machine, and the full
+    // substitution is live at about 43 ms. `cmd.exe` calls `CreateProcess` at
+    // about 31 ms, in between. The stub needs none of that: it is two
+    // instructions with no imports, so as soon as `kernelbase` appears it can be
+    // in place, and the console question is settled before the target gets to
+    // ask it.
+    if config.forced_stub {
+        match install_forced_stub(&proc, child.pid, config.verbose) {
+            Ok(at) => {
+                if config.verbose {
+                    eprintln!(
+                        "wbwpty: pid {} forced DETACHED_PROCESS via a stub at {:#x}",
+                        child.pid, at
+                    );
+                }
+            }
+            Err(err) => {
+                if config.verbose {
+                    eprintln!(
+                        "wbwpty: pid {} could not install the forced stub: {err:#}",
+                        child.pid
+                    );
+                }
+            }
+        }
+    }
+
     match mapping.finish(
         &proc,
         child.pid,
@@ -1663,6 +1713,68 @@ fn default_dll_path() -> std::path::PathBuf {
         .ok()
         .and_then(|e| e.parent().map(|d| d.join("wbwpty_redirect.dll")))
         .unwrap_or_else(|| std::path::PathBuf::from("wbwpty_redirect.dll"))
+}
+
+/// Waits for `kernelbase`, then forces `DETACHED_PROCESS` on every child the
+/// target creates.
+///
+/// Returns when the stub is in place.
+///
+/// This waits for `kernelbase` specifically rather than for "the loader": the
+/// module is what the stub is patched into, and it appears earlier than the point
+/// at which the payload's own imports become resolvable. That difference is the
+/// whole margin - `cmd.exe` spawns at about 31 ms, `kernelbase` is mapped by
+/// about 28 ms, and the payload-based substitution is not live until 43 ms.
+///
+/// Deliberately bounded and deliberately fallible. A target that never maps
+/// `kernelbase`, or whose `CreateProcessW` prologue cannot be relocated, gets an
+/// error and no patch; the session continues without it, exactly as it would
+/// have without this code.
+fn install_forced_stub(
+    proc: &crate::manual_map::remote::RemoteProcess,
+    pid: u32,
+    verbose: bool,
+) -> Result<u64> {
+    use anyhow::bail;
+    use crate::manual_map::exports::load_exports_from_file;
+    use crate::manual_map::inline;
+    use crate::manual_map::remote::RemoteModules;
+
+    const KERNELBASE: &str = "kernelbase.dll";
+    /// Short on purpose: past about 30 ms the target has usually spawned already,
+    /// and a later patch stops being worth anything.
+    const WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        if let Ok(modules) = proc.poll_modules_ready(POLL, POLL) {
+            let snapshot = RemoteModules::from_snapshot(modules);
+            if let Ok(base) = snapshot.base_for_name(proc, KERNELBASE) {
+                let path = snapshot
+                    .path_for_base(base)
+                    .with_context(|| format!("no path recorded for {KERNELBASE}"))?;
+                let module = crate::manual_map::RemoteModule {
+                    base,
+                    size: 0,
+                    full_name: path.clone(),
+                    base_name: KERNELBASE.to_ascii_lowercase(),
+                };
+                let table = load_exports_from_file(std::path::Path::new(&path), &module)?;
+                let entry = inline::find_export(base, &table, "CreateProcessW")?;
+                let stub = proc.allocate(inline::forced_stub_size())?;
+                let installed = inline::install_forced_stub(proc, entry, stub)?;
+                return Ok(installed.stub);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("{KERNELBASE} was not mapped within {}ms", WAIT.as_millis());
+        }
+        if verbose && std::time::Instant::now() > deadline - WAIT + WAIT {
+            // once, not every millisecond
+        }
+        std::thread::sleep(POLL);
+    }
 }
 
 /// Per-session unique nonce for pipe names.
