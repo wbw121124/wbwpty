@@ -768,6 +768,158 @@ fn a_ping_delay_creates_no_console_host_in_the_tree() {
     );
 }
 
+/// The inline patch, on its own, actually replaces process creation.
+///
+/// # Why this test exists
+///
+/// Every other claim in this file can be satisfied by *something* being
+/// substituted - the import table route has always been there. So "zero console
+/// hosts" does not say which mechanism did it, and after the inline patch landed
+/// it could not tell a working replacement from a fallback that happened to work
+/// on this target.
+///
+/// Three things are asserted, and together they are what makes it a test of the
+/// inline patch rather than of process creation in general:
+///
+/// 1. the import table route did *not* run - `hook()` is `None` - because
+///    `session.rs` skips it whenever the inline patch is live, so a green run here
+///    cannot have been carried by the old mechanism;
+/// 2. both documented entry points report `Installed`;
+/// 3. the payload's own call counter moved, read from the target *while it is
+///    alive*. That is the substitute being entered; the other two only say the
+///    patch was written.
+///
+/// The counter is sampled rather than read after the fact because a target that
+/// has exited has no memory to read, which is how a substitution installed and
+/// never called once looked identical to one that was never installed
+/// (AGENTS pitfall 1).
+#[test]
+fn the_inline_patch_replaces_process_creation_on_its_own() {
+    use wbwpty_core::manual_map::inline::InlineHook;
+    use wbwpty_core::procwatch::ProcessWatch;
+
+    let python = python_or_skip!();
+    let python = python.display().to_string().replace("Program Files", "PROGRA~1");
+    let script = std::env::temp_dir().join("wbwpty_inline_verify.py");
+    std::fs::write(
+        &script,
+        "import sys\nsys.stdout.write('INLINE-OK-3F9\\n')\nsys.stdout.flush()\n",
+    )
+    .expect("writing the child script");
+
+    let watch = ProcessWatch::start();
+    let test_pid = std::process::id();
+
+    // `cmd /k` because it spawns nothing until it is told to, so the child below
+    // is the first and only thing it creates - and it is created after the
+    // substitution is confirmed live.
+    let spec = ChildSpec::new("cmd.exe").arg("/k");
+    let config = SessionConfig {
+        shim: true,
+        inject: true,
+        // Rule 32: the pump delivers host stdin EOF, which an interactive cmd exits
+        // on, at a moment this test does not control.
+        pump_input: false,
+        verbose: true,
+        ..Default::default()
+    };
+    let session = Session::start(&spec, config).expect("session");
+    let _guard = TreeGuard { root: session.pid() };
+    watch.adopt(session.pid());
+
+    // 1. The import table route was not used.
+    assert!(
+        session.hook().is_none(),
+        "the import table substitution ran as well, so this test cannot attribute \
+         anything to the inline patch: {:?}",
+        session.hook().map(|h| h.intercepts.len())
+    );
+
+    // 2. Both documented entry points were patched.
+    let installed: Vec<&str> = session
+        .inline_hooks()
+        .iter()
+        .filter_map(|h| match h {
+            InlineHook::Installed { export, .. } => Some(*export),
+            InlineHook::Refused { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        installed,
+        vec!["CreateProcessW", "CreateProcessAsUserW"],
+        "expected both documented entry points replaced; refused: {:?}",
+        session
+            .inline_hooks()
+            .iter()
+            .filter_map(|h| match h {
+                InlineHook::Refused { export, reason } => Some(format!("{export}: {reason}")),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    );
+
+    // The counter before the child exists, so a non-zero reading afterwards can
+    // only have come from the call we are about to make.
+    let before = session.payload_hook_stats().map(|(ok, _)| ok).unwrap_or(0);
+
+    let mut buf = [0u8; 4096];
+    let mut output = String::new();
+    session
+        .pipes()
+        .with(|p| {
+            p.input()
+                .write_all(format!("{python} {}\r\n", script.display()).as_bytes())
+                .is_ok()
+        })
+        .expect("input pipe");
+
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline {
+        match session.pipes().with(|p| p.read_output(&mut buf, 200)) {
+            Some(Ok(ReadEvent::Data(n))) => {
+                output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if output.contains("INLINE-OK-3F9") {
+                    break;
+                }
+            }
+            Some(Ok(ReadEvent::Eof)) | None => break,
+            Some(Err(_)) => break,
+            _ => {}
+        }
+    }
+    let after = session.payload_hook_stats().map(|(ok, _)| ok).unwrap_or(0);
+    let flags = session.payload_hook_flags();
+    session.shutdown();
+    let _ = std::fs::remove_file(&script);
+    std::thread::sleep(Duration::from_millis(150));
+
+    // 3. The substitute was actually entered, with DETACHED_PROCESS forced on.
+    assert!(
+        after > before,
+        "the patch was installed but the substitute was never called \
+         (successful calls before = {before}, after = {after}); \
+         a hook nobody calls replaces nothing"
+    );
+    let (flags, _) = flags.expect("the payload publishes the flags it handed the kernel");
+    assert!(
+        flags & 0x8 != 0,
+        "the substitute ran but did not force DETACHED_PROCESS; it passed {flags:#x}"
+    );
+
+    assert!(
+        output.contains("INLINE-OK-3F9"),
+        "the child's output did not reach the pipe; got {output:?}"
+    );
+    let hosts = watch.console_hosts_under(test_pid);
+    assert!(
+        hosts.is_empty(),
+        "a console host was created in this tree: {hosts:?} \
+         (mode {:?}, exhaustive = {})",
+        watch.mode(),
+        watch.mode().is_exhaustive()
+    );
+}
+
 /// Takes down whatever the session left, on every path out.
 ///
 /// Descendants before ancestors: killing a parent first reparents its children
