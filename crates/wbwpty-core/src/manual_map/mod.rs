@@ -789,9 +789,34 @@ impl<'a> ImportResolver<'a> {
 
     fn table(&mut self, base: u64) -> Result<&exports::ExportTable> {
         if !self.exports.contains_key(&base) {
-            let module = self.module_view(base);
-            let table = exports::load_exports(self.proc, &module)
-                .with_context(|| format!("loading exports at {base:#x}"))?;
+            // Read the module's export directory from its file when the loader
+            // recorded a path, and only fall back to reading it out of the
+            // process.
+            //
+            // This is worth the branch. `load_exports` walks *every* export in the
+            // module and reads each forwarder string individually, and it does
+            // that with `ReadProcessMemory`, against a target that is still
+            // starting. `kernel32.dll` has roughly 1500 exports; doing that across
+            // a process boundary measured at about 40 ms, which was the whole
+            // margin this mechanism is trying to win. The same bytes are on disk,
+            // and the RVAs in them are a property of the file - only the base comes
+            // from the target, and that is already known here.
+            let from_file = self
+                .modules
+                .path_for_base(base)
+                .and_then(|path| {
+                    exports::load_exports_from_file(std::path::Path::new(&path), &self.module_view(base)).ok()
+                })
+                .filter(|table| !table.is_empty());
+
+            let table = match from_file {
+                Some(table) => table,
+                None => {
+                    let module = self.module_view(base);
+                    exports::load_exports(self.proc, &module)
+                        .with_context(|| format!("loading exports at {base:#x}"))?
+                }
+            };
             if table.is_empty() {
                 bail!("{base:#x} has no export directory");
             }

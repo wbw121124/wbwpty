@@ -384,7 +384,7 @@ impl Session {
 
         // The target must run whether or not we manage to patch it. Resuming is
         // therefore done here, and injection is layered on top.
-        let report = match inject_payload(&child, &config) {
+        let report = match inject_payload(&child, &config, resume_at) {
             Some(report) => Some(report),
             None => {
                 if !child.is_resumed() {
@@ -1574,8 +1574,12 @@ fn install_inline_process_hooks(
     installed
 }
 
-fn inject_payload(child: &Child, config: &SessionConfig) -> Option<InjectionReport> {
-    inject_payload_two_phase(child, config).unwrap_or_else(|err| {
+fn inject_payload(
+    child: &Child,
+    config: &SessionConfig,
+    resume_at: std::time::Instant,
+) -> Option<InjectionReport> {
+    inject_payload_two_phase(child, config, resume_at).unwrap_or_else(|err| {
         if config.verbose {
             eprintln!("wbwpty: two-phase injection failed: {err:#}");
         }
@@ -1608,6 +1612,7 @@ fn inject_payload(child: &Child, config: &SessionConfig) -> Option<InjectionRepo
 fn inject_payload_two_phase(
     child: &Child,
     config: &SessionConfig,
+    resume_at: std::time::Instant,
 ) -> Result<Option<InjectionReport>> {
     use anyhow::Context;
 
@@ -1670,8 +1675,10 @@ fn inject_payload_two_phase(
             Ok(at) => {
                 if config.verbose {
                     eprintln!(
-                        "wbwpty: pid {} forced DETACHED_PROCESS via a stub at {:#x}",
-                        child.pid, at
+                        "wbwpty: pid {} forced DETACHED_PROCESS via a stub at {:#x}, {}ms after spawn",
+                        child.pid,
+                        at,
+                        resume_at.elapsed().as_millis()
                     );
                 }
             }
@@ -1748,32 +1755,46 @@ fn install_forced_stub(
 
     let deadline = std::time::Instant::now() + WAIT;
     loop {
-        if let Ok(modules) = proc.poll_modules_ready(POLL, POLL) {
+        // Every failure here is "not yet", not "never": the loader links modules
+        // one at a time, so `kernelbase` can be absent from the snapshot this
+        // microsecond and present in the next. The first version treated a missing
+        // path as a hard error, and reported "no path recorded for kernelbase.dll"
+        // on a target that was about to have one a fraction of a millisecond later
+        // - which is exactly the window this exists to use.
+        let ready = (|| -> Result<u64> {
+            let modules = proc.poll_modules_ready(POLL, POLL)?;
             let snapshot = RemoteModules::from_snapshot(modules);
-            if let Ok(base) = snapshot.base_for_name(proc, KERNELBASE) {
-                let path = snapshot
-                    .path_for_base(base)
-                    .with_context(|| format!("no path recorded for {KERNELBASE}"))?;
-                let module = crate::manual_map::RemoteModule {
-                    base,
-                    size: 0,
-                    full_name: path.clone(),
-                    base_name: KERNELBASE.to_ascii_lowercase(),
-                };
-                let table = load_exports_from_file(std::path::Path::new(&path), &module)?;
-                let entry = inline::find_export(base, &table, "CreateProcessW")?;
-                let stub = proc.allocate(inline::forced_stub_size())?;
-                let installed = inline::install_forced_stub(proc, entry, stub)?;
-                return Ok(installed.stub);
+            let base = snapshot.base_for_name(proc, KERNELBASE)?;
+            // The path has to be the target's *own* record of it: the fallback in
+            // `base_for_name` can hand back the host's base, which means nothing
+            // about where the target has it.
+            let path = snapshot
+                .path_for_base(base)
+                .ok_or_else(|| anyhow::anyhow!("{KERNELBASE} is not in the target's list yet"))?;
+            let module = crate::manual_map::RemoteModule {
+                base,
+                size: 0,
+                full_name: path.clone(),
+                base_name: KERNELBASE.to_ascii_lowercase(),
+            };
+            let table = load_exports_from_file(std::path::Path::new(&path), &module)?;
+            let entry = inline::find_export(base, &table, "CreateProcessW")?;
+            let stub = proc.allocate(inline::forced_stub_size())?;
+            Ok(inline::install_forced_stub(proc, entry, stub)?.stub)
+        })();
+
+        match ready {
+            Ok(at) => return Ok(at),
+            Err(err) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(err).with_context(|| {
+                        format!("{KERNELBASE} was not usable within {}ms", WAIT.as_millis())
+                    });
+                }
+                let _ = verbose;
+                std::thread::sleep(POLL);
             }
         }
-        if std::time::Instant::now() >= deadline {
-            bail!("{KERNELBASE} was not mapped within {}ms", WAIT.as_millis());
-        }
-        if verbose && std::time::Instant::now() > deadline - WAIT + WAIT {
-            // once, not every millisecond
-        }
-        std::thread::sleep(POLL);
     }
 }
 
