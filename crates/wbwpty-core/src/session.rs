@@ -94,20 +94,31 @@ pub struct SessionConfig {
     pub inline_process_hook: bool,
     /// Force `DETACHED_PROCESS` with a stub that needs no payload at all.
     ///
-    /// The only substitution that can be installed before a target spawns. It is
-    /// two instructions patched into `kernelbase!CreateProcessW` - no imports, no
-    /// data, so it does not have to wait for the payload's own imports to resolve.
-    /// That wait is about 28 ms on this machine, while `cmd.exe` spawns at about
-    /// 31 ms and the payload-based substitution is live at 43 ms; this is what
-    /// lands in the gap.
+    /// **Off by default, and measured as not worth having on.**
     ///
-    /// It cannot publish the session's handles or hand a child over - both need
-    /// the payload. Its job is narrower and entirely about consoles: make sure
-    /// none is ever allocated. The full substitution follows.
+    /// The idea was to remove the dependency on the payload: two instructions with
+    /// no imports, so nothing to resolve and nothing to wait for. It does get in
+    /// early - 10 ms after spawn.
     ///
-    /// Off by default only because it patches a system DLL's code in the target,
-    /// which is a more invasive thing to do than rewriting a slot in the target's
-    /// own import table.
+    /// Early is not early enough. With it on, `ping` still arrived with a
+    /// `conhost.exe`, which places `cmd.exe`'s first `CreateProcess` *before* the
+    /// stub was installed - earlier than the 31 ms this had assumed from the
+    /// payload substitution missing. That assumption was wrong, and correcting it
+    /// is the useful result: the real margin is under ten milliseconds, not
+    /// thirty, and the payload's own imports take longer than that to resolve. The
+    /// stub cannot close a gap it is itself too slow to reach.
+    ///
+    /// A second failure appeared alongside and is not accounted for: an inner
+    /// `cmd.exe` created through the stub died with `STATUS_DLL_INIT_FAILED`
+    /// (`0xC0000142`) and showed an error dialog. That happens *after* the
+    /// `conhost.exe` appears, so it is not its cause - it is a separate fault, and
+    /// it has the shape of AGENTS pitfall 12 (startup state changed before it is
+    /// safe to change). Left undiagnosed rather than guessed at.
+    ///
+    /// The encoded stub and its installer are correct and tested, and the
+    /// measurements above are only as good as the evidence behind them, so both are
+    /// kept. Enabling this is expected to be useless for the first spawn and to
+    /// produce `0xC0000142` on some descendants.
     pub forced_stub: bool,
     /// Mirror the host's stdin into the `-in` pipe.
     ///
@@ -150,7 +161,7 @@ impl Default for SessionConfig {
             cover_descendants: true,
             handover: true,
             inline_process_hook: true,
-            forced_stub: true,
+            forced_stub: false,
             pump_input: true,
             verbose: false,
             explicit_environment: false,
