@@ -162,6 +162,16 @@ pub fn process_table() -> Result<Vec<ProcessEntry>> {
 /// table really can contain one.
 pub fn descendants_of(table: &[ProcessEntry], root: u32) -> Vec<u32> {
     let mut found = std::collections::BTreeSet::new();
+    // A pid is only ever meaningful for as long as the process object lives.
+    // Windows recycles pids the moment a process exits, so a stale `root` can
+    // belong to an unrelated process - and worse, a recycled *child* of a
+    // recycled root walks a chain that has nothing to do with this session.
+    // Requiring `root` to still be live turns "the tree is gone" into "there is
+    // no tree", which is the honest answer and the one that stops a cleanup pass
+    // from terminating innocent processes (AGENTS pitfall 25).
+    if !table.iter().any(|e| e.pid == root) {
+        return Vec::new();
+    }
     found.insert(root);
     // A process tree is not deep; 64 is far past any chain this produces.
     for _ in 0..64 {
@@ -232,6 +242,37 @@ pub fn terminate(pid: u32) -> Result<bool> {
     // SAFETY: the handle was just opened with terminate access.
     let ok = unsafe { TerminateProcess(handle.as_raw() as HANDLE, 0) } != 0;
     Ok(ok)
+}
+
+/// Whether this process runs with an elevated token.
+///
+/// Not "is the user an administrator": membership in Administrators and an
+/// elevated token are different things, and only the second one can turn on a
+/// kernel ETW provider. The distinction matters because a process can be run by
+/// an administrator with a filtered token and still be refused.
+///
+/// The answer decides whether [`crate::procwatch`] can observe process creation
+/// exhaustively, so it is reported rather than assumed - see
+/// [`crate::procwatch::Mode::is_exhaustive`].
+pub fn is_elevated() -> bool {
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION};
+
+    let mut elevation: TOKEN_ELEVATION = unsafe { std::mem::zeroed() };
+    let mut returned = 0u32;
+    // SAFETY: `elevation` is a correctly sized `TOKEN_ELEVATION` and the class
+    // requested is the one it describes. A short `returned` would mean the struct
+    // changed shape; that is reported as "not elevated" rather than read past.
+    let ok = unsafe {
+        GetTokenInformation(
+            std::ptr::null_mut(), // GetCurrentProcess pseudo-handle, `winnt.h`
+            TokenElevation,
+            (&raw mut elevation).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &raw mut returned,
+        )
+    };
+    ok != 0 && returned == std::mem::size_of::<TOKEN_ELEVATION>() as u32
+        && elevation.TokenIsElevated != 0
 }
 
 /// `PROCESSENTRY32W::szExeFile` is a fixed `[u16; MAX_PATH]` that is not NUL

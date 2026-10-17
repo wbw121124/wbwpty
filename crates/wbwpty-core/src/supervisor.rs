@@ -45,12 +45,12 @@
 //! pid one injection. A session that spawns a thousand processes pays a thousand
 //! injections; a session that spawns none pays one snapshot per poll.
 
+use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-
 use crate::inspect;
 use crate::manual_map::{self, remote::ConsolePatch, remote::RemoteProcess};
 
@@ -134,6 +134,14 @@ pub struct SupervisorConfig {
     pub max_attempts: u32,
     /// Report per-descendant outcomes on stderr.
     pub verbose: bool,
+    /// Where the payload is mapped in the *root* process.
+    ///
+    /// The handover words live inside the payload, so reading or writing them
+    /// needs this rather than `RemoteProcess::image_base` - the payload is mapped
+    /// by hand and has nothing to do with where the loader put the executable.
+    /// `None` means "the root has no payload mapped", which disables handover
+    /// rather than guessing an address.
+    pub root_payload_base: Option<u64>,
 }
 
 impl SupervisorConfig {
@@ -169,6 +177,7 @@ impl SupervisorConfig {
             inject_poll: Duration::from_millis(1),
             max_attempts: 25,
             verbose: false,
+            root_payload_base: None,
         }
     }
 }
@@ -264,6 +273,21 @@ fn run(config: SupervisorConfig, coverage: Arc<Mutex<Vec<Coverage>>>, stop: Arc<
             attempts.insert(pid, 0);
         }
 
+        // Handover first, and before the poll batch: a handed-over child is
+        // suspended and blocked, so it is waiting on *us*, and every millisecond
+        // here is a millisecond the target's own thread spends blocked. It also
+        // would not appear in the table sweep above anyway - it was created
+        // suspended by the root, so it is a direct child and would be swept, but
+        // only on a poll that has not happened yet, and the gate does not care.
+        if let Some(record) = serve_handover(&config, config.root_payload_base, &|pid| {
+            inspect::ancestry_depth(&table, config.root_pid, pid).unwrap_or(1)
+        }) {
+            finished.insert(record.pid);
+            pending.remove(&record.pid);
+            push(&coverage, record);
+            continue;
+        }
+
         // Shallowest first. Not because a child needs its parent patched first -
         // every injection is independent - but because a descendant that gets
         // covered early is more likely to be covered before it spawns anything
@@ -345,6 +369,122 @@ enum Outcome {
 /// process object alive, and a pid on its own can be reused the moment the
 /// process exits. Writing a payload into whatever inherited that pid would be
 /// about the worst bug available here.
+/// Serves one handover: the root's payload has published a suspended child that is
+/// waiting to be released.
+///
+/// Returns the coverage record if there was something to do, `None` when no
+/// handover was pending - which is the overwhelmingly common case, since handover
+/// only happens when the target actually calls the substitution.
+///
+/// The ordering here is the entire point of the protocol, and it must not be
+/// reordered:
+///
+/// 1. the child is *already* suspended and *already* published, so nothing is
+///    discovered late here;
+/// 2. inject into it and install its own substitution;
+/// 3. release the gate, which is what lets the creating thread return.
+///
+/// Releasing before (2) would reintroduce the race in a worse form - the child
+/// would run with no substitution at all, having been explicitly held for one.
+fn serve_handover(
+    config: &SupervisorConfig,
+    root_payload_base: Option<u64>,
+    depth_by_pid: &dyn Fn(u32) -> usize,
+) -> Option<Coverage> {
+    // Without the root's payload base there is nothing to read the pid out of,
+    // and guessing an address is how this briefly reported a pid of 0x21000028.
+    let payload_base = root_payload_base?;
+    let root = RemoteProcess::open(config.root_pid).ok()?;
+    let pending_pid = read_published_u32(&root, payload_base, "WBWPTY_PENDING_PID")?;
+    if pending_pid == 0 {
+        return None;
+    }
+
+    let depth = depth_by_pid(pending_pid);
+    if config.verbose {
+        eprintln!("wbwpty: handover: descendant {pending_pid} depth {depth}");
+    }
+
+    // `attempt` is the same path a polled descendant takes. Reusing it means a
+    // handed-over child is covered by exactly the code that covers a discovered
+    // one, rather than by a second implementation that would drift.
+    let outcome = attempt(config, pending_pid, depth, 1);
+    let record = match outcome {
+        Outcome::Done(record) => record,
+        Outcome::Retry(reason) => {
+            // A retry here means "not ready yet", and the child is suspended, so
+            // there is nothing to be gained by waiting - it cannot make progress
+            // on its own. Recorded as not covered and released below, which is
+            // the same degradation the polling path makes, and it is the reason
+            // the payload's own timeout exists as well.
+            if config.verbose {
+                eprintln!("wbwpty: handover: {pending_pid} not coverable: {reason}");
+            }
+            Coverage {
+                pid: pending_pid,
+                depth,
+                image: String::new(),
+                injected: false,
+                hooked: false,
+                sentinel: false,
+                payload_base: None,
+                note: Some(format!("handover: {reason}")),
+            }
+        }
+    };
+
+    // Release unconditionally, covered or not. Not holding the gate on failure is
+    // deliberate: a suspended child plus a blocked creator is a dead session, and
+    // a child that ran without coverage is merely the behaviour this project had
+    // before handover existed. The record above is how the two stay tellable
+    // apart.
+    if let Err(err) = write_published_u32(&root, payload_base, "WBWPTY_GATE", 1) {
+        if config.verbose {
+            eprintln!("wbwpty: handover: releasing {pending_pid} failed: {err:#}");
+        }
+    }
+
+    Some(record)
+}
+
+/// Reads a `u32` the payload exports, from a process that has it mapped.
+///
+/// `payload_base` is where the payload was mapped, which is *not* the target's
+/// image base - it is manually mapped, and the two differ. Reading from
+/// `image_base()` instead lands somewhere in the target's own image and returns
+/// whatever PE bytes happen to be there, which is how a pid came out as
+/// `0x21000028`: an export-table RVA, read as if it were data.
+fn read_published_u32(proc: &RemoteProcess, payload_base: u64, name: &str) -> Option<u32> {
+    let image = EXPORT_RVA_IMAGE.get()?;
+    let rva = crate::manual_map::find_export_rva(image, name).ok().flatten()?;
+    let bytes = proc.read_bytes(payload_base + rva as u64, 4).ok()?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
+/// Writes a `u32` the payload exports, into a process that has it mapped.
+fn write_published_u32(proc: &RemoteProcess, payload_base: u64, name: &str, value: u32) -> Result<()> {
+    let image = EXPORT_RVA_IMAGE
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("the payload image was never published"))?;
+    let rva = crate::manual_map::find_export_rva(image, name)
+        .with_context(|| format!("the payload must export {name}"))?
+        .with_context(|| format!("the payload does not export {name}"))?;
+    proc.write_bytes(payload_base + rva as u64, &value.to_le_bytes())
+        .with_context(|| format!("writing {name}"))
+}
+
+/// The payload image, published once by the session so the supervisor thread does
+/// not re-read the file per descendant.
+///
+/// A `OnceLock` rather than a field on the config because the read happens on a
+/// different thread and the value is the same for the whole session.
+static EXPORT_RVA_IMAGE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+/// Publishes the payload image for [`read_published_u32`].
+pub fn publish_payload_image(image: Vec<u8>) {
+    let _ = EXPORT_RVA_IMAGE.set(image);
+}
+
 fn attempt(config: &SupervisorConfig, pid: u32, depth: usize, attempt_no: u32) -> Outcome {
     let proc = match RemoteProcess::open(pid) {
         Ok(proc) => proc,

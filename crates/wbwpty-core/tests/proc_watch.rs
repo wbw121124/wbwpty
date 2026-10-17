@@ -127,23 +127,54 @@ let mut child = spawn_console_less();
 /// This exists because the two modes are not interchangeable, and a suite that
 /// passed in the sampled mode while looking like it tested kernel events would be
 /// the exact failure this module was written to prevent. The mode is printed so
-/// that whichever one a run took is visible in the output, and asserted only to
-/// be one of the two - asserting `KernelEvents` here would turn a known gap into
-/// a permanently red test instead of a documented one.
+/// The watch must not quietly be the weak kind, and why it is must be visible.
 ///
-/// As of 2026-10-16 `StartTraceW` on this machine rejects the session with
-/// `ERROR_INVALID_PARAMETER` even with the `LogFileMode` (`0x800100`) that a
-/// session built by PowerShell's `New-EtwTraceSession` reports, so this normally
-/// takes [`Mode::Sampled`]. See AGENTS §11 for what has been ruled out.
+/// Every "no console host appeared" claim in this suite rests on this. In
+/// [`Mode::Sampled`] a host created and reaped between two samples is invisible,
+/// and the point of `is_exhaustive` is to make that impossible to overlook.
+///
+/// So the assertion is deliberately two-sided. Given a token that can enable the
+/// kernel provider, the watch must be in [`Mode::KernelEvents`] - a silent
+/// downgrade there would be a real bug. Without one it must be
+/// [`Mode::Sampled`] *and* `try_kernel_events` must have failed for the
+/// privilege reason rather than any other, which is what distinguishes "this
+/// machine cannot do better" from "we broke it".
 #[test]
 fn the_watch_says_which_mode_it_is_in() {
-    let watch = ProcessWatch::start();
-    let mode = watch.mode();
-    eprintln!("procwatch mode = {mode:?}, exhaustive = {}", mode.is_exhaustive());
-    assert!(
-        matches!(mode, Mode::KernelEvents | Mode::Sampled),
-        "a watch must be in one of its two modes, not {mode:?}"
-    );
+    let elevated = wbwpty_core::inspect::is_elevated();
+    eprintln!("elevated = {elevated}");
+
+    match ProcessWatch::try_kernel_events() {
+        Ok(watch) => {
+            let mode = watch.mode();
+            eprintln!("procwatch mode = {mode:?}, exhaustive = {}", mode.is_exhaustive());
+            assert_eq!(mode, Mode::KernelEvents);
+            assert!(mode.is_exhaustive());
+        }
+        Err(e) => {
+            assert!(
+                !elevated,
+                "an elevated token should be able to enable \
+                 Microsoft-Windows-Kernel-Process, but starting the watch failed: {e:#}"
+            );
+            // Not just "it failed": specifically for want of privilege, so that a
+            // future regression in the session setup is not filed under "the
+            // machine is simply like this". The message is localised, so match the
+            // code too rather than the wording.
+            let reason = format!("{e:#}");
+            assert!(
+                reason.contains('5') || reason.to_lowercase().contains("denied"),
+                "expected an access-denied failure without an elevated token, \
+                 got: {reason}"
+            );
+            let watch = ProcessWatch::start();
+            assert_eq!(watch.mode(), Mode::Sampled);
+            assert!(
+                !watch.mode().is_exhaustive(),
+                "the sampled mode must never claim to be exhaustive"
+            );
+        }
+    }
 }
 
 /// A watch started after the root existed says so, instead of reporting clean.
@@ -164,3 +195,4 @@ fn an_adopted_process_makes_the_tree_incomplete() {
         "adopting a process must make its tree incomplete"
     );
 }
+

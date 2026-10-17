@@ -59,6 +59,39 @@ pub struct SessionConfig {
     /// behaviour this project had before, and which only holds for two
     /// generations.
     pub cover_descendants: bool,
+    /// Let the target's substitution hand each child to the host before letting
+    /// it run.
+    ///
+    /// This is what closes the race [`crate::supervisor`] documents: a descendant
+    /// found by polling was found *after* it started running, and the kernel had
+    /// already given it a console host by then. With handover the target creates
+    /// its children suspended, publishes the pid, and blocks until the host has
+    /// injected - so a child begins executing with the substitution already
+    /// installed rather than being patched afterwards.
+    ///
+    /// Off leaves the substitution doing what it always did, which is safe and
+    /// which is the right choice when the host cannot inject - a second process
+    /// that does not want to block its own `CreateProcessW` calls should not have
+    /// this switched on behind it.
+    pub handover: bool,
+    /// Replace the process-creation functions themselves, rather than only the
+    /// target's import slots.
+    ///
+    /// The import slot is where the substitution used to stop, and on this machine
+    /// it loses: `cmd.exe` imports the API set
+    /// `api-ms-win-core-processthreads-l1-1-1.dll` rather than `KERNEL32.dll`, and
+    /// its single `CreateProcess` call happened at about 31 ms while the slot patch
+    /// completed at 36 ms - the substitution was live and reported zero calls.
+    ///
+    /// Patching the entry points does not care when the loader resolved a slot: a
+    /// caller that resolved before the patch still calls the address that was
+    /// overwritten. That is the difference between replacing process creation and
+    /// asking to be in the right place first.
+    ///
+    /// Off falls back to the import table route alone, which is what this did
+    /// before, and which still covers a target that resolves its imports slowly
+    /// enough.
+    pub inline_process_hook: bool,
     /// Mirror the host's stdin into the `-in` pipe.
     ///
     /// Off leaves the target's stdin open for the life of the session, which is
@@ -98,6 +131,8 @@ impl Default for SessionConfig {
             shim: true,
             inject: true,
             cover_descendants: true,
+            handover: true,
+            inline_process_hook: true,
             pump_input: true,
             verbose: false,
             explicit_environment: false,
@@ -251,6 +286,11 @@ pub struct Session {
     console_hook: Option<crate::manual_map::ConsoleHookReport>,
     /// Why it did not, when it was attempted and failed.
     hook_error: Option<String>,
+    /// Whether the inline patch replaced process creation. See
+    /// [Self::process_creation_substituted].
+    inline_live: bool,
+    /// Per-export outcome of the inline patch.
+    inline: Vec<crate::manual_map::inline::InlineHook>,
     /// Watches the tree and gives every descendant the same treatment the target
     /// got. `None` when there was nothing to extend - see [`Self::start`].
     supervisor: Option<crate::supervisor::DescendantSupervisor>,
@@ -287,6 +327,23 @@ impl Session {
             .push((contract::ENV_ROWS.into(), config.rows.to_string()));
         spec.env
             .push((contract::ENV_COLS.into(), config.cols.to_string()));
+        // The pipe *names*, which are half of the contract in AGENTS §3 and were
+        // specified there but never actually published. A grandchild cannot be
+        // handed a handle number that its parent has already invalidated - and
+        // that is exactly what happens the moment the target redirects its own
+        // stdout, because closing the inherited pipe lets `CreateFile("nul")`
+        // recycle the same value for a handle that is not inheritable. The
+        // substitute in the payload uses these names to reopen the pipe when the
+        // published handle stops naming one; with them absent it had no way to
+        // tell "not a pipe" from "never told".
+        spec.env.push((
+            contract::ENV_IN.into(),
+            pipes.input_name().to_string(),
+        ));
+        spec.env.push((
+            contract::ENV_OUT.into(),
+            pipes.output_name().to_string(),
+        ));
         spec.env.push((
             contract::ENV_SHIM.into(),
             if config.shim { "1" } else { "0" }.into(),
@@ -301,6 +358,11 @@ impl Session {
         // a writer alive on `-out` and suppress EOF forever.
         let std_handles = stdio.handles();
         stdio.release();
+
+        // Timings, because "the injection lost the race" is a claim that has to be
+        // measured rather than argued: what matters is the gap between the moment
+        // the target can run its own code and the moment the substitution is in.
+        let resume_at = std::time::Instant::now();
 
         // The target must run whether or not we manage to patch it. Resuming is
         // therefore done here, and injection is layered on top.
@@ -334,18 +396,123 @@ impl Session {
         let hook_flags_rva = export_rva("WBWPTY_HOOK_FLAGS");
         let console_state_rva = export_rva("WBWPTY_CONSOLE_STATE");
 
-        // Substitution goes in after the payload is mapped, because it points
-        // into it. A target that does not import `CreateProcessW` is not an
-        // error - there is nothing to intercept.
-        let hook = match report.as_ref() {
-            Some(injection) => crate::manual_map::install_create_process_hook(
+        // The session's pipes, published before any substitution exists.
+        //
+        // Previously this happened inside `install_create_process_hook`, which
+        // made it a side effect of *that* strategy: skipping the import table
+        // patch also skipped the handles, and the payload then saw
+        // `have_session_handles() == false` and passed every call through
+        // untouched. Which is what it did - a session with the substitution
+        // "live" that created no children at all.
+        //
+        // Both strategies need them, and nothing else needs them published, so it
+        // belongs here: immediately after the payload is mapped, independent of
+        // how - or whether - it gets patched.
+        if let Some(injection) = report.as_ref() {
+            let publish = |name: &str, bytes: &[u8]| -> Result<()> {
+                let rva = export_rva(name)
+                    .ok_or_else(|| anyhow::anyhow!("the payload does not export {name}"))?;
+                crate::manual_map::remote::RemoteProcess::new(child.process_handle())
+                    .write_bytes(injection.image_base + rva as u64, bytes)
+                    .with_context(|| format!("publishing {name}"))
+            };
+            if let Some(rva) = export_rva("WBWPTY_STD_HANDLES") {
+                let mut packed = [0u8; 24];
+                for (slot, value) in packed.chunks_mut(8).zip(std_handles) {
+                    slot.copy_from_slice(&value.to_le_bytes());
+                }
+                let proc = crate::manual_map::remote::RemoteProcess::new(child.process_handle());
+                match proc.write_bytes(injection.image_base + rva as u64, &packed) {
+                    Ok(()) if config.verbose => eprintln!(
+                        "wbwpty: pid {} published the session handles {std_handles:016x?}",
+                        child.pid
+                    ),
+                    Err(err) if config.verbose => eprintln!(
+                        "wbwpty: pid {} could not publish the session handles: {err:#}",
+                        child.pid
+                    ),
+                    _ => {}
+                }
+            } else if config.verbose {
+                eprintln!(
+                    "wbwpty: pid {} payload exports no WBWPTY_STD_HANDLES; every child \
+                     will be created with the caller's own handles",
+                    child.pid
+                );
+            }
+            if let Some(rva) = export_rva("WBWPTY_EXPLICIT_ENVIRONMENT") {
+                let proc = crate::manual_map::remote::RemoteProcess::new(child.process_handle());
+                let _ = proc.write_bytes(
+                    injection.image_base + rva as u64,
+                    &u32::from(config.explicit_environment).to_le_bytes(),
+                );
+            }
+        }
+
+        // Replace process creation itself, on top of whatever the import table
+        // substitution managed to catch.
+        //
+        // This runs *first* because it is the only one of the two that can win the
+        // race, and the import table route spends several milliseconds proving
+        // that the loader has finished with a slot - time that a target spawning in
+        // its first 30 ms does not have. Measured: `cmd.exe` made its single
+        // `CreateProcess` at about 31 ms and the import substitution went live at
+        // 33 ms with zero calls.
+        //
+        // It also does not import `CreateProcessW` from `KERNEL32.dll` at all, but
+        // from the API set `api-ms-win-core-processthreads-l1-1-1.dll`, so the slot
+        // is at the end of an indirection chain rather than a single hop.
+        //
+        // Patching the entry points does not depend on when the loader resolved
+        // anything: a caller that resolved before the patch still calls the
+        // address that was overwritten.
+        let inline = if config.inline_process_hook {
+            match report.as_ref() {
+                Some(injection) => install_inline_process_hooks(
+                    &crate::manual_map::remote::RemoteProcess::new(child.process_handle()),
+                    injection.image_base,
+                    &dll_image,
+                    &export_rva,
+                    config.verbose,
+                ),
+                None => {
+                    if config.verbose {
+                        eprintln!(
+                            "wbwpty: pid {} cannot replace process creation: no payload",
+                            child.pid
+                        );
+                    }
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let inline_live = inline.iter().any(|h| {
+            matches!(
+                h,
+                crate::manual_map::inline::InlineHook::Installed { .. }
+            )
+        });
+
+        // The import table substitution is now the fallback rather than the main
+        // path. It still earns its place: a target whose inline prologue could not
+        // be proven safe to relocate gets nothing from the patch above, and the slot
+        // route does not care whether the function's first bytes are movable.
+        //
+        // Skipped when the inline patch is live, and not only to save the work -
+        // doing both would have the same substitute reachable by two paths with one
+        // of them pointing at a trampoline the other does not use.
+        let hook = match (report.as_ref(), inline_live) {
+            (_, true) => Ok(None),
+            (Some(injection), false) => crate::manual_map::install_create_process_hook(
                 &crate::manual_map::remote::RemoteProcess::new(child.process_handle()),
                 &dll_path,
                 injection,
                 std_handles,
                 config.explicit_environment,
             ),
-            None => Ok(None),
+            (None, false) => Ok(None),
         };
         let (hook, hook_error) = match hook {
             Ok(hook) => (hook, None),
@@ -359,6 +526,16 @@ impl Session {
                 (None, Some(format!("{err:#}")))
             }
         };
+        if config.verbose {
+            eprintln!(
+                "wbwpty: pid {} substitution live {}ms after spawn \
+                 (loader wait {:?}ms, inline {})",
+                child.pid,
+                resume_at.elapsed().as_millis(),
+                report.as_ref().map(|r| r.loader_wait_ms),
+                if inline_live { "on" } else { "off" }
+            );
+        }
 
         // `Child::spawn` had the last word while the target was suspended, but it
         // does not keep it. Measured on this machine: a target created
@@ -384,18 +561,53 @@ impl Session {
         // injected nothing would just spend a process table snapshot per poll.
         let supervisor = match (report.as_ref(), hook.as_ref(), config.inject, config.cover_descendants) {
             (Some(_), Some(_), true, true) => {
+                // The handover reader resolves the payload's exported words by RVA,
+                // so it needs the image itself rather than re-reading the file on
+                // every poll.
+                crate::supervisor::publish_payload_image(dll_image.clone().unwrap_or_default());
+
                 let mut supervisor = crate::supervisor::SupervisorConfig::new(
                     child.pid,
                     dll_path.clone(),
                     std_handles,
                 );
-                supervisor.payload_image = Arc::new(dll_image.unwrap_or_default());
+                supervisor.payload_image = Arc::new(dll_image.clone().unwrap_or_default());
                 supervisor.verbose = config.verbose;
                 supervisor.explicit_environment = config.explicit_environment;
+                // Where the payload landed in the root, which is where the handover
+                // words live. Not the root's image base - the payload is mapped by
+                // hand and the two have no relation.
+                supervisor.root_payload_base = report.as_ref().map(|r| r.image_base);
                 Some(crate::supervisor::DescendantSupervisor::spawn(supervisor))
             }
             _ => None,
         };
+
+        // Turn the handover on in the root, now that its substitution and the
+        // supervisor are both in place.
+        //
+        // Last, deliberately. While this word is zero the payload's substitution
+        // creates children exactly as it did before - no suspension, no waiting -
+        // so a failure anywhere above degrades to the previous behaviour rather
+        // than to a target whose `CreateProcessW` never returns.
+        if config.handover {
+            if let (Some(injection), Some(_)) = (report.as_ref(), hook.as_ref()) {
+                let proc = crate::manual_map::remote::RemoteProcess::new(child.process_handle());
+                if let Some(rva) = export_rva("WBWPTY_HANDOVER") {
+                    if let Err(err) = proc.write_bytes(
+                        injection.image_base + rva as u64,
+                        &1u32.to_le_bytes(),
+                    ) {
+                        if config.verbose {
+                            eprintln!(
+                                "wbwpty: pid {} could not enable handover: {err:#}",
+                                child.pid
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let pump_input = config.pump_input;
         // The console API substitution, when asked for. Same mechanism as the
@@ -463,6 +675,8 @@ impl Session {
             hook,
             console_hook,
             hook_error,
+        inline_live,
+        inline,
             supervisor,
             screen,
             console_state_rva,
@@ -521,6 +735,32 @@ impl Session {
     /// answers the third.
     pub fn hook(&self) -> Option<&crate::manual_map::HookReport> {
         self.hook.as_ref()
+    }
+
+    /// Whether process creation is substituted, by either mechanism.
+    ///
+    /// The import table route and the inline patch are two ways to reach the same
+    /// substitute, and exactly one of them runs - [`Session::hook`] is `None` when
+    /// the inline patch is live, because the slot was never touched. So a caller
+    /// asking "can I spawn a child and have it covered?" has to ask this, not
+    /// [`Self::hook`]: reading the latter as the answer reports a session that is
+    /// fully substituted as having no substitution at all.
+    ///
+    /// Useful to tests for exactly that reason - a test that waits for the
+    /// substitution before spawning its child was, for a while, waiting for
+    /// something that no longer happens.
+    pub fn process_creation_substituted(&self) -> bool {
+        self.hook.is_some() || self.inline_live
+    }
+
+    /// What the inline patch did, per export.
+    ///
+    /// Reported rather than inferred because a refusal and an absence mean
+    /// different things: a refused prologue means the entry point was left alone
+    /// and process creation is *not* covered by this route, which may still be
+    /// covered by the slot route.
+    pub fn inline_hooks(&self) -> &[crate::manual_map::inline::InlineHook] {
+        &self.inline
     }
 
     /// Why the substitution did not happen, when it was attempted and failed.
@@ -1170,6 +1410,152 @@ fn publish_into(
 /// * the payload could not be resolved at all.
 ///
 /// Both are reported through `WBWPTY_LOG`/stderr only when `verbose` is set.
+/// Replaces process creation in `target` for every export in
+/// [`crate::manual_map::inline::TARGETS`].
+///
+/// Two steps per export, in this order and not the other way round:
+///
+/// 1. patch the entry so it enters the substitute;
+/// 2. publish the trampoline address into the substitute's "original" slot.
+///
+/// The order is the whole safety property. Between the two steps the substitute
+/// is reachable and its way back is zero, so any `CreateProcess` in that window
+/// fails immediately rather than calling through a null pointer - visible, and
+/// harmless to the target. Reversed, the window is just as short but every call
+/// in it reaches the *unhooked* function, which is the bug this exists to fix.
+fn install_inline_process_hooks(
+    proc: &crate::manual_map::remote::RemoteProcess,
+    payload_base: u64,
+    payload_image: &Option<Vec<u8>>,
+    export_rva: &dyn Fn(&str) -> Option<u32>,
+    verbose: bool,
+) -> Vec<crate::manual_map::inline::InlineHook> {
+    use crate::manual_map::inline::{self, InlineHook, TARGETS};
+    use crate::manual_map::remote::RemoteModules;
+
+    if let Some(image) = payload_image {
+        inline::publish_payload_image(image.clone());
+    }
+
+    // The module holding the functions to replace. Read from the target's own
+    // module list rather than assumed at a fixed address.
+    let Ok(modules) = proc.poll_modules_ready(
+        std::time::Duration::from_millis(1),
+        std::time::Duration::from_secs(2),
+    ) else {
+        if verbose {
+            eprintln!("wbwpty: module list unavailable; process creation not replaced");
+        }
+        return Vec::new();
+    };
+    let snapshot = RemoteModules::from_snapshot(modules);
+
+    let mut installed = Vec::new();
+    for target in TARGETS {
+        let Ok(base) = snapshot.base_for_name(proc, target.module) else {
+            if verbose {
+                eprintln!(
+                    "wbwpty: {} is not mapped; {} not replaced",
+                    target.module, target.export
+                );
+            }
+            continue;
+        };
+        let module = crate::manual_map::RemoteModule {
+            base,
+            size: 0,
+            full_name: snapshot
+                .path_for_base(base)
+                .unwrap_or_else(|| target.module.to_string()),
+            base_name: target.module.to_ascii_lowercase(),
+        };
+        // Read the export table from the file on disk rather than out of the
+        // target. `kernelbase.dll` is about 3.8 MB and pulling its directory
+        // across with `ReadProcessMemory` cost roughly 40 ms - longer than the
+        // window this patch has to land in. The RVAs belong to the file, so the
+        // only thing that has to come from the target is the base.
+        let table = match crate::manual_map::exports::load_exports_from_file(
+            std::path::Path::new(&module.full_name),
+            &module,
+        ) {
+            Ok(table) => table,
+            Err(err) => {
+                if verbose {
+                    eprintln!(
+                        "wbwpty: no export table for {} ({}): {err:#}",
+                        target.module, module.full_name
+                    );
+                }
+                continue;
+            }
+        };
+
+        match inline::install_inline_hook(proc, base, &table, payload_base, target) {
+            Ok(InlineHook::Installed {
+                export,
+                entry,
+                trampoline,
+            }) => {
+                // Publish the way back, now that the substitute can be entered. This is
+                // not optional bookkeeping: with the import table route skipped, the
+                // slot below is the *only* thing that lets the substitute reach the
+                // original, and a substitute that cannot is one that returns
+                // failure for every call. A missing export used to be reported as
+                // success here, which is how a session ended up creating no
+                // children at all while logging a substitution as live.
+                let Some(slot_rva) = export_rva(target.original_slot) else {
+                    if verbose {
+                        eprintln!(
+                            "wbwpty: the payload does not export {}, so {} was left alone",
+                            target.original_slot, target.export
+                        );
+                    }
+                    installed.push(InlineHook::Refused {
+                        export: target.export,
+                        reason: format!("the payload has no {} to jump back through", target.original_slot),
+                    });
+                    continue;
+                };
+                if let Err(err) = proc.write_bytes(
+                    payload_base + slot_rva as u64,
+                    &(trampoline as u64).to_le_bytes(),
+                ) {
+                    if verbose {
+                        eprintln!("wbwpty: publishing {} failed: {err:#}", target.original_slot);
+                    }
+                    installed.push(InlineHook::Refused {
+                        export: target.export,
+                        reason: format!("the trampoline could not be published: {err:#}"),
+                    });
+                    continue;
+                }
+                if verbose {
+                    eprintln!(
+                        "wbwpty: replaced {export} at {entry:#x} (trampoline {trampoline:#x})"
+                    );
+                }
+                installed.push(InlineHook::Installed {
+                    export,
+                    entry,
+                    trampoline,
+                });
+            }
+            Ok(InlineHook::Refused { export, reason }) => {
+                if verbose {
+                    eprintln!("wbwpty: left {export} alone: {reason}");
+                }
+                installed.push(InlineHook::Refused { export, reason });
+            }
+            Err(err) => {
+                if verbose {
+                    eprintln!("wbwpty: could not replace {}: {err:#}", target.export);
+                }
+            }
+        }
+    }
+    installed
+}
+
 fn inject_payload(child: &Child, config: &SessionConfig) -> Option<InjectionReport> {
     if !config.inject {
         return None;
@@ -1593,11 +1979,23 @@ fn grandchild_output_reaches_the_pipe() {
         session
             .report()
             .expect("payload must map before the descendant behaviour is meaningful");
+        // "Process creation is substituted", rather than "the import slot was
+        // rewritten".
+        //
+        // This used to assert the slot specifically, which was the only mechanism
+        // then. It is now the wrong assertion twice over: the slot is skipped
+        // whenever the inline patch is live - it reaches the same substitute more
+        // reliably - so asserting it tests an implementation detail that is
+        // deliberately absent. What matters to a caller is whether a child it
+        // spawns will be covered, and that is what this asks.
         assert!(
+            session.process_creation_substituted(),
+            "cmd.exe imports a process-creation entry point, so one of the two \
+             mechanisms must be live; the slot report is {:?} ({:?}) and the \
+             inline report is {:?}",
             session.hook().is_some(),
-            "the target imports CreateProcessW, so the slot must be rewritten; \
-             it was not: {:?}",
-            session.hook_error()
+            session.hook_error(),
+            session.inline_hooks(),
         );
 
         let _ = session
@@ -1674,3 +2072,8 @@ fn grandchild_output_reaches_the_pipe() {
         assert!(text.contains("no-inject-ok"), "output missing, got {text:?}");
     }
 }
+
+
+
+
+

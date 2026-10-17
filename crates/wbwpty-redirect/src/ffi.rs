@@ -101,6 +101,10 @@ pub const DLL_THREAD_DETACH: DWORD = 3;
 pub const DETACHED_PROCESS: DWORD = 0x0000_0008;
 pub const CREATE_NEW_CONSOLE: DWORD = 0x0000_0010;
 pub const CREATE_NO_WINDOW: DWORD = 0x0800_0000;
+/// `CREATE_SUSPENDED`, `winbase.h`. Used by the handover protocol: a child has
+/// to exist before it can be injected into, and this is the only way to have it
+/// exist without running.
+pub const CREATE_SUSPENDED: DWORD = 0x0000_0004;
 pub const STARTF_USESTDHANDLES: DWORD = 0x0000_0100;
 
 pub const COORD_CHAR: u16 = 0xfffe;

@@ -23,8 +23,13 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH, WAIT_OBJECT_
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, INFINITE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOW,
+    STARTF_USESTDHANDLES, STARTF_USESHOWWINDOW, STARTUPINFOW,
 };
+
+/// `SW_MINIMIZE`, `winuser.h`. Spelled out because the `Win32::UI` feature of
+/// `windows-sys` is not enabled in this crate, and the value is one line of the
+/// platform SDK rather than something to be re-derived.
+const SW_MINIMIZE: i32 = 2;
 
 use crate::error::{last_error_text, Handle};
 use crate::manual_map::remote::{ConsolePatch, RemoteProcess};
@@ -79,6 +84,15 @@ pub struct ChildSpec {
     /// Standard handles to inherit; `None` starts the target with NULL std
     /// handles, which is only useful for tests that never do I/O.
     pub stdio: Option<Stdio>,
+    /// `wShowWindow` for the target's first window, via `STARTF_USESHOWWINDOW`.
+    ///
+    /// Not a way to hide a failure. A target that allocates a console anyway will
+    /// still allocate one; this only decides whether the very first one that
+    /// exists starts minimised. It exists because a test that provokes a console
+    /// on purpose should not steal the user's focus while doing it - the console
+    /// existing is the finding, and the assertion is still expected to fail
+    /// (AGENTS §12).
+    pub show_window: Option<i32>,
 }
 
 impl ChildSpec {
@@ -89,7 +103,14 @@ impl ChildSpec {
             env: Vec::new(),
             cwd: None,
             stdio: None,
+            show_window: None,
         }
+    }
+
+    /// Starts the target's first window minimised rather than hidden.
+    pub fn minimized(mut self) -> Self {
+        self.show_window = Some(SW_MINIMIZE);
+        self
     }
 
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
@@ -214,6 +235,10 @@ impl Child {
             si.hStdInput = stdio.stdin;
             si.hStdOutput = stdio.stdout;
             si.hStdError = stdio.stderr;
+        }
+        if let Some(show) = spec.show_window {
+            si.dwFlags |= STARTF_USESHOWWINDOW;
+            si.wShowWindow = show as u16;
         }
 
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };

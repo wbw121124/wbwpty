@@ -104,6 +104,74 @@ pub static mut WBWPTY_HOOK_FLAGS: [DWORD; 2] = [0, 0];
 #[no_mangle]
 pub static mut WBWPTY_EXPLICIT_ENVIRONMENT: u32 = 0;
 
+// ---------------------------------------------------------------------------
+// Handover: the parent hands each child to the host before letting it run.
+//
+// The problem this solves is not coverage but ordering. `cmd.exe /c <command>`
+// spawns its first child a couple of milliseconds after resuming, and the host
+// cannot get a `CreateProcess` substitution into that child before it exists -
+// and by the time the host has the substitution, the kernel has already given
+// the child a console host of its own. Patching `ConsoleHandle` afterwards does
+// not undo that; measured, the child ends up `injected=true hooked=true` with a
+// `conhost.exe` still on the machine.
+//
+// So the creator, not the host, is what has to be in charge. The child is created
+// suspended, its pid is published here, and the creating thread does not return
+// to the target until the host has written the gate. The child therefore begins
+// executing with the substitution already installed, rather than being
+// discovered after the fact.
+//
+// Each of these is per-process: the payload is mapped once per target, so there
+// is one pending pid and one gate per target, and they cannot interfere.
+// ---------------------------------------------------------------------------
+
+/// Pid of the child currently being handed over; `0` when none is.
+///
+/// The host polls this. It is written *after* the suspended child exists and
+/// cleared once the gate has been passed, so a non-zero value always refers to a
+/// process that is real and is not yet running.
+#[no_mangle]
+pub static mut WBWPTY_PENDING_PID: u32 = 0;
+
+/// Set to non-zero by the host once the child may run.
+///
+/// Polled by the creating thread rather than waited on, because a DLL in someone
+/// else's process cannot own a waitable handle on an event the host would have to
+/// create in it, and because the alternative - blocking forever on a host that
+/// died - is exactly the deadlock the timeout below exists to prevent.
+#[no_mangle]
+pub static mut WBWPTY_GATE: u32 = 0;
+
+/// Handover is on: the creator hands children over and waits for the gate.
+#[no_mangle]
+pub static mut WBWPTY_HANDOVER: u32 = 0;
+
+/// How long the creator waits for the gate before letting the child run anyway.
+///
+/// Not a success-path parameter. It is the bound on the deadlock: if the host
+/// cannot inject - it may have died, lost the process, or simply failed - the
+/// child must still run, because a suspended child and a blocked creator are
+/// worse than a child that got a console. On expiry the behaviour degrades to
+/// what it was before handover existed, and
+/// [`WBWPTY_HANDOVER_RESULT`] says so.
+///
+/// 2 seconds is comfortably above the measured injection cost (a few tens of
+/// milliseconds for an already-loaded target) while staying short enough that a
+/// genuinely stuck session is not something the user has to sit through.
+const HANDOVER_TIMEOUT_MS: DWORD = 2000;
+
+/// Outcome of the most recent handover.
+///
+/// `0` = never attempted, `1` = the host released the gate, `2` = timed out and
+/// the child was released without one.
+///
+/// This exists so a release caused by a timeout is visible rather than
+/// indistinguishable from a covered one. A test asserting "no console host"
+/// cannot see the difference for itself, and an unobserved downgrade is how the
+/// original race kept passing.
+#[no_mangle]
+pub static mut WBWPTY_HANDOVER_RESULT: u32 = 0;
+
 type CreateProcessW = unsafe extern "system" fn(
     lp_application_name: *const u16,
     lp_command_line: *mut u16,
@@ -335,6 +403,77 @@ unsafe fn usable_handle(slot: usize, access: DWORD, which: &str) -> Option<HANDL
 /// `INVALID_HANDLE_VALUE`, which is `HANDLE`'s way of saying "no handle".
 const INVALID_HANDLE: HANDLE = -1isize as HANDLE;
 
+/// Hands the just-created child to the host and waits for it to be released.
+///
+/// Returns the flags to actually pass to the kernel. The child's `PROCESS_INFORMATION`
+/// must already be filled in, since the host is identified by the pid in it.
+///
+/// Returns `flags` unchanged when handover is off, and otherwise returns
+/// `flags | CREATE_SUSPENDED`: the child must not run until the host has
+/// installed its substitution, and the only way to guarantee that is to not
+/// start it at all.
+///
+/// `caller_wanted_suspended` is the *caller's* view of `CREATE_SUSPENDED`, taken
+/// before this function's contribution. It decides who resumes afterwards: a
+/// child the caller asked to be suspended is the caller's to resume, and
+/// resuming it here would silently override a decision the caller made on
+/// purpose. Only the suspension this function added is undone here.
+///
+/// Called after the kernel call, not before, because the pid does not exist until
+/// then and a suspended child is still a live process the host can open.
+unsafe fn hand_over(
+    flags: DWORD,
+    pi: *mut PROCESS_INFORMATION,
+    caller_wanted_suspended: bool,
+) -> DWORD {
+    if WBWPTY_HANDOVER == 0 || pi.is_null() {
+        return flags;
+    }
+
+    let child_pid = (*pi).dwProcessId;
+    let child_thread = (*pi).hThread;
+    if child_pid == 0 || child_thread.is_null() {
+        return flags;
+    }
+
+    // Arm the gate before publishing the pid. The other order has a real race: the
+    // host could see the pid, inject, and write the gate before this store to
+    // `WBWPTY_GATE` happened, and the creator would then miss a release that has
+    // already been given. Clearing first and storing the pid last makes the host's
+    // view of "pending" imply the gate is already zero.
+    WBWPTY_GATE = 0;
+    WBWPTY_HANDOVER_RESULT = 0;
+    WBWPTY_PENDING_PID = child_pid;
+
+    let mut waited: DWORD = 0;
+    let mut released = false;
+    while waited < HANDOVER_TIMEOUT_MS {
+        if WBWPTY_GATE != 0 {
+            released = true;
+            break;
+        }
+        // A whole millisecond between checks rather than a spin: the wait is
+        // bounded by the host's polling interval anyway, so a tighter loop buys
+        // no latency and costs the target a core it is using to run `cmd`.
+        ffi::Sleep(1);
+        waited += 1;
+    }
+
+    WBWPTY_HANDOVER_RESULT = if released { 1 } else { 2 };
+    WBWPTY_PENDING_PID = 0;
+
+    // Resume only the suspension this function added. A caller that asked for
+    // `CREATE_SUSPENDED` keeps a suspended child, which is what it asked for.
+    if !released || caller_wanted_suspended {
+        return flags;
+    }
+    if !child_thread.is_null() {
+        ffi::ResumeThread(child_thread);
+    }
+    flags & !ffi::CREATE_SUSPENDED
+}
+
+// ---------------------------------------------------------------------------
 /// Substituted for the target's `CreateProcessW`.
 ///
 /// Everything it changes is forced, not conditional:
@@ -396,9 +535,19 @@ pub unsafe extern "system" fn create_process_w(
     };
 
     publish_handles_w(si);
+    // Recorded before `force_flags`, so `hand_over` can tell the caller's own
+    // `CREATE_SUSPENDED` from the one handover adds and undo only its own.
+    let caller_wanted_suspended = dw_creation_flags & ffi::CREATE_SUSPENDED != 0;
     let flags = force_flags(dw_creation_flags);
     let (environment, flags) = resolve_environment(lp_environment, flags);
     note_call(flags);
+
+    let handed_over = WBWPTY_HANDOVER != 0;
+    let flags = if handed_over {
+        flags | ffi::CREATE_SUSPENDED
+    } else {
+        flags
+    };
 
     let ok = original(
         lp_application_name,
@@ -416,6 +565,10 @@ pub unsafe extern "system" fn create_process_w(
         lp_process_information,
     );
     release_environment(environment, lp_environment);
+
+    if ok != 0 && handed_over {
+        hand_over(flags, lp_process_information, caller_wanted_suspended);
+    }
 
     note_result(ok);
     ok
@@ -597,5 +750,6 @@ fn zeroed_startup_info_a() -> crate::ffi::STARTUPINFOA {
     // SAFETY: as above, for `STARTUPINFOA`.
     unsafe { core::mem::zeroed() }
 }
+
 
 

@@ -9,6 +9,17 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# Used by `manual_map::inline` to decide whether a function's prologue can be
+# relocated. This is a correctness requirement, not a convenience: byte
+# pattern-matching for RIP-relative operands and relative branches is guesswork,
+# and a wrong guess writes a trampoline that jumps into the wrong place inside a
+# process this project does not own.
+#
+# Deliberately *not* a dependency of the `no_std` payload: that DLL must import
+# nothing beyond KERNEL32, because every DLL it imports is one the *target* must
+# finish loading before the payload can be injected at all (see that crate's
+# `Cargo.toml` for the measurement).
+iced-x86.workspace = true
 # The host's virtual screen. Zero platform dependencies, and `std` - which is
 # exactly why it cannot live in the `no_std` payload (see `src/screen.rs`).
 vt-parser = { path = "../vt-parser" }
@@ -33,8 +44,4 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-# Host-side tests disassemble the remote stub. `iced-x86` is shared with the
-# DLL through `[workspace.dependencies]`; its `std` and `no_std` features are
-# mutually exclusive, so both crates must use the same (no_std) flavour.
-iced-x86.workspace = true
 tempfile = "3"

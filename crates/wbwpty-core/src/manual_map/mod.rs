@@ -20,6 +20,7 @@ pub mod console;
 pub mod exports;
 pub mod hook;
 pub mod iat;
+pub mod inline;
 pub mod pe;
 pub mod remote;
 pub mod stub;
@@ -90,21 +91,72 @@ const DEFAULT_LOADER_WAIT: std::time::Duration = std::time::Duration::from_secs(
 /// child a console before anyone patched `ConsoleHandle`.
 const INJECT_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 
-/// [`inject_bytes`] with the session's own loader wait.
+/// [`inject_bytes`] with the session's own loader wait, calling the entry point.
 pub fn inject_bytes(
     proc: &RemoteProcess,
     pid: u32,
     image: &[u8],
     entry_symbol: &str,
 ) -> Result<InjectionReport> {
-    inject_bytes_with(
+    let prepared = inject_bytes_inner(
         proc,
         pid,
         image,
         entry_symbol,
         DEFAULT_LOADER_WAIT,
         INJECT_POLL,
-    )
+        true,
+    )?;
+    let (report, _entry) = prepared.into_parts();
+    Ok(report)
+}
+
+/// Maps the payload without calling its entry point, for a target that is still
+/// suspended.
+///
+/// This is the half of injection that can be done to a process that has not been
+/// resumed yet: everything up to and including the final `WriteProcessMemory` is
+/// pure data movement. The caller resumes the target and then calls
+/// [`PreparedEntry::call_entry`].
+///
+/// The reason to want this is timing, not tidiness. `cmd.exe /c <command>` spawns
+/// its first child within a couple of milliseconds of resuming, and work done
+/// *after* the resume - waiting for the loader, resolving imports, installing the
+/// `CreateProcess` substitution - happens after that child has already been given
+/// a console of its own. Mapping first does not close the window by itself, but it
+/// puts the payload in the target before the target runs any code, which is what
+/// makes a pre-emptive hook possible.
+pub fn inject_bytes_suspended(
+    proc: &RemoteProcess,
+    pid: u32,
+    image: &[u8],
+    entry_symbol: &str,
+    loader_wait: std::time::Duration,
+) -> Result<PreparedInjection> {
+    let prepared = inject_bytes_inner(
+        proc,
+        pid,
+        image,
+        entry_symbol,
+        loader_wait,
+        INJECT_POLL,
+        false,
+    )?;
+    let (report, entry) = prepared.into_parts();
+    Ok(PreparedInjection { report, entry })
+}
+
+/// Both halves of injection: the report, and the entry point still to be called.
+pub struct PreparedInjection {
+    pub report: InjectionReport,
+    pub entry: PreparedEntry,
+}
+
+impl PreparedInjection {
+    /// Splits the two halves apart.
+    fn into_parts(self) -> (InjectionReport, PreparedEntry) {
+        (self.report, self.entry)
+    }
 }
 
 /// [`inject_bytes`] for a caller that cannot afford to block for
@@ -125,6 +177,31 @@ pub fn inject_bytes_with(
     loader_wait: std::time::Duration,
     poll: std::time::Duration,
 ) -> Result<InjectionReport> {
+    Ok(inject_bytes_inner(
+        proc,
+        pid,
+        image,
+        entry_symbol,
+        loader_wait,
+        poll,
+        true,
+    )?
+    .report)
+}
+
+/// The one implementation both entry points share.
+///
+/// `run_entry` is the whole difference between them; see
+/// [`inject_bytes_suspended`] for why that difference is worth having.
+fn inject_bytes_inner(
+    proc: &RemoteProcess,
+    pid: u32,
+    image: &[u8],
+    entry_symbol: &str,
+    loader_wait: std::time::Duration,
+    poll: std::time::Duration,
+    run_entry: bool,
+) -> Result<PreparedInjection> {
     let pe = PeImage::parse(image)?;
     if !pe.info.is_dll {
         bail!(
@@ -202,34 +279,96 @@ pub fn inject_bytes_with(
     };
     let loader_wait_ms = started.elapsed().as_millis() as u64;
 
+    // Where the time actually goes. The whole point of the suspended-injection
+    // split is that this number has to be small compared to how fast the target
+    // spawns its first child, so it is worth measuring per stage rather than
+    // arguing about it.
+    let trace = std::env::var_os("WBWPTY_TRACE_LOADER").is_some();
+    let after_poll = std::time::Instant::now();
+    if trace {
+        eprintln!(
+            "wbwpty: pid {pid} stage loader-wait {}ms",
+            after_poll.elapsed().as_millis()
+        );
+    }
+
     // Imports are written straight into the mapped image, so the payload is
     // fully self-contained by the time `DllMain` is called and the in-target
     // trampoline only has to make the call.
     proc.write_bytes(base, &mapped)?;
 
-    // `DllMain(hinst, DLL_PROCESS_ATTACH, NULL)` cannot be expressed as a
-    // `CreateRemoteThread` start routine (that would pass `rcx=lpParameter`,
-    // `rdx=flags`), so we reuse the already unit-tested stub with an empty
-    // patch list: all it does is set up the three arguments and call through.
-    let job = stub::build_job(base, entry_rva);
-    let job_addr = proc.allocate(job.len())?;
-    proc.write_bytes(job_addr, &job)?;
-    let stub_addr = proc.allocate(stub::build_stub(0).len())?;
-    proc.write_bytes(stub_addr, &stub::build_stub(job_addr))?;
-    let stub_exit = proc.run_thread(stub_addr)?;
-    if stub_exit != 0 {
-        bail!("payload entry {entry_symbol} returned {stub_exit:#x}");
+    let entry = PreparedEntry {
+        base,
+        entry_rva,
+        job: stub::build_job(base, entry_rva),
+    };
+    // Whether to call the entry point is the caller's decision, not ours: a target
+    // that is still suspended cannot run a remote thread, and asking it to is how
+    // `run_thread` ends up blocked forever (AGENTS pitfall 31).
+    if run_entry {
+        entry.call_entry(proc)?;
+    }
+    if trace {
+        eprintln!(
+            "wbwpty: pid {pid} stage resolve+write {}ms, entry {}ms, total {}ms",
+            after_poll.elapsed().as_millis(),
+            std::time::Instant::now().elapsed().as_millis(),
+            started.elapsed().as_millis()
+        );
     }
 
-    Ok(InjectionReport {
-        image_base: base,
-        entry_rva,
-        patch_count,
-        reloc_delta,
-        module_count: discovered.len(),
-        module_source: discovered.source(),
-        loader_wait_ms,
+    Ok(PreparedInjection {
+        entry,
+        report: InjectionReport {
+            image_base: base,
+            entry_rva,
+            patch_count,
+            reloc_delta,
+            module_count: discovered.len(),
+            module_source: discovered.source(),
+            loader_wait_ms,
+        },
     })
+}
+
+/// A mapped, self-contained payload whose entry point has not been called yet.
+///
+/// The split exists because mapping and calling have different requirements.
+/// Mapping is pure data - `VirtualAllocEx` plus `WriteProcessMemory` - and works
+/// against a suspended process. Calling needs the target's threads to run, so it
+/// can only happen after the target is resumed. Keeping them apart is what lets
+/// the payload be in place *before* the target gets to run any code at all.
+pub struct PreparedEntry {
+    base: u64,
+    entry_rva: u32,
+    /// Trampoline bytes that set up `DllMain(hinst, DLL_PROCESS_ATTACH, NULL)`.
+    job: Vec<u8>,
+}
+
+impl PreparedEntry {
+    /// Runs `DllMain` in the target and waits for it to return.
+    ///
+    /// Returns the payload's exit code. Fails if it returns non-zero, because a
+    /// payload that refused to attach must not be mistaken for one that did.
+    pub fn call_entry(&self, proc: &RemoteProcess) -> Result<()> {
+        let job_addr = proc.allocate(self.job.len())?;
+        proc.write_bytes(job_addr, &self.job)?;
+        let stub_addr = proc.allocate(stub::build_stub(0).len())?;
+        proc.write_bytes(stub_addr, &stub::build_stub(job_addr))?;
+        let exit = proc.run_thread(stub_addr)?;
+        if exit != 0 {
+            bail!(
+                "payload entry at rva {:#x} returned {exit:#x}",
+                self.entry_rva
+            );
+        }
+        Ok(())
+    }
+
+    /// The base the payload is mapped at, for callers that publish words into it.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
 }
 
 /// Resumes `child` if needed, waits for its loader, then maps the DLL.

@@ -77,6 +77,20 @@ const KEYWORD_PROCESS: u64 = 0x10;
 /// builds, which comes out as `0x800100`.
 const EVENT_TRACE_USE_NOCOPY: u32 = 0x0080_0000;
 
+/// Minimum `Wnode.BufferSize` accepted by `StartTraceW` for a real-time session.
+///
+/// Not the size of `EVENT_TRACE_PROPERTIES` - that reading is wrong and cost a
+/// full debugging round to get rid of. The field is the size of the buffer the
+/// provider is given, and the kernel refuses a real-time session whose value is
+/// too small, with `ERROR_INVALID_PARAMETER` (24).
+///
+/// Measured on this machine by varying that field alone against every other
+/// argument held fixed (minimum buffers, maximum buffers, buffer size, flush
+/// timer and `LogFileMode` all made no difference): `120` =
+/// `size_of::<EVENT_TRACE_PROPERTIES>()` fails, `1024` succeeds. Kept as a named
+/// constant with the evidence attached so it is not "corrected" back.
+const MIN_WNODE_BUFFER_SIZE: u32 = 1024;
+
 /// Payload offsets for `Process_TypeGroup1` versions 3 and 4.
 const PROCESS_ID_OFFSET: usize = 0x08;
 const PARENT_ID_OFFSET: usize = 0x0C;
@@ -138,23 +152,42 @@ pub struct ProcessWatch {
 }
 
 impl ProcessWatch {
-    /// Starts watching, degrading to sampling if the kernel provider refuses.
+/// Starts watching, degrading to sampling if the kernel provider refuses.
     ///
     /// The degradation is visible: [`Self::mode`] reports it, and
     /// [`Mode::is_exhaustive`] is what decides whether an empty answer may be
     /// quoted as evidence. AGENTS rule 4's "degrade rather than crash" only holds
     /// if the degradation is observable from outside.
+    ///
+    /// On a session without administrator rights this always returns
+    /// [`Mode::Sampled`]: starting the ETW session succeeds, but enabling
+    /// `Microsoft-Windows-Kernel-Process` needs `SeSystemProfilePrivilege` and
+    /// fails with `ERROR_ACCESS_DENIED`. There is no parameter that avoids this,
+    /// and no non-privileged substitute that is exhaustive - see
+    /// [`Self::try_kernel_events`].
     pub fn start() -> Self {
         Self::try_kernel_events().unwrap_or_else(|_| Self::sampled())
     }
 
-    /// Kernel-event watching, with the reason it could not start.
+/// Kernel-event watching, with the reason it could not start.
     ///
     /// Exposed so a caller can insist on the strong mode: a test that must be
     /// able to fail has to be able to refuse the weak one.
+    ///
+    /// Requires an elevated token. `StartTraceW` succeeds for an ordinary user,
+    /// and then `EnableTraceEx2` on `Microsoft-Windows-Kernel-Process` returns
+    /// `ERROR_ACCESS_DENIED` (5) because the provider needs
+    /// `SeSystemProfilePrivilege`. `Win32_ProcessStartTrace` over WMI - the other
+    /// obvious way to observe process creation without a kernel provider - is
+    /// refused for the same reason, so a non-elevated process on this machine has
+    /// no exhaustive source and must say so via [`Mode::is_exhaustive`].
+    ///
+    /// Measured, not assumed: `StartTraceW` was also returning
+    /// `ERROR_INVALID_PARAMETER` (24) until [`MIN_WNODE_BUFFER_SIZE`] was set to a
+    /// buffer size rather than to the size of the properties struct.
     pub fn try_kernel_events() -> Result<Self> {
         let mut properties: EVENT_TRACE_PROPERTIES = unsafe { std::mem::zeroed() };
-        properties.Wnode.BufferSize = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() as u32;
+properties.Wnode.BufferSize = MIN_WNODE_BUFFER_SIZE;
         properties.LogFileMode = EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_USE_NOCOPY;
         properties.BufferSize = 64;
         properties.MinimumBuffers = 8;

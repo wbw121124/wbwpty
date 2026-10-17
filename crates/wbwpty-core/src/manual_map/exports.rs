@@ -65,19 +65,59 @@ pub fn load_exports(proc: &RemoteProcess, module: &RemoteModule) -> Result<Expor
     let Some(dir) = read_export_directory(proc, module)? else {
         return Ok(ExportTable::default());
     };
-
-    let base = module.base;
-    let at = |rva: u32, len: usize| -> Result<Vec<u8>> {
-        proc.read_bytes(base + rva as u64, len).with_context(|| {
+    let mut at = |rva: u32, len: usize| -> Result<Vec<u8>> {
+        proc.read_bytes(module.base + rva as u64, len).with_context(|| {
             format!(
-                "reading {:#x} bytes at rva {rva:#x} of {}",
-                len, module.base_name
+                "reading {len:#x} bytes at rva {rva:#x} of {}",
+                module.base_name
             )
         })
     };
+    read_exports_from_parts(module, dir.virtual_address, dir.size, &mut at)
+}
+
+/// Parses an export directory out of the module's file image, read locally.
+///
+/// The same answer as [`load_exports`], without the cost of reading it out of a
+/// live process.
+///
+/// That cost is not small and it is on the critical path. `kernelbase.dll` is
+/// about 3.8 MB, and pulling its export directory across with
+/// `ReadProcessMemory` - one call per table, against a target that is still
+/// starting - measured at roughly 40 ms. That is longer than the window this
+/// mechanism exists to beat: the substitution went from live at 33 ms to live at
+/// 76 ms purely because of it.
+///
+/// The RVAs are a property of the file, so reading the same file from disk gives
+/// identical answers; only the base differs, and that comes from the target's own
+/// module list.
+pub fn load_exports_from_file(path: &std::path::Path, module: &RemoteModule) -> Result<ExportTable> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let image = crate::manual_map::pe::PeImage::parse(&bytes)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    let Some(dir) = image.info.directory(crate::manual_map::pe::DIRECTORY_ENTRY_EXPORT) else {
+        return Ok(ExportTable::default());
+    };
+    // The closure is handed RVAs and must translate them itself: here the backing
+    // store is a file, so it needs the section table rather than a load address.
+    let mut at = |rva: u32, len: usize| -> Result<Vec<u8>> {
+        image
+            .read_rva(rva, len)
+            .map(|s| s.to_vec())
+            .with_context(|| format!("rva {rva:#x} is outside {}", path.display()))
+    };
+    read_exports_from_parts(module, dir.virtual_address, dir.size, &mut at)
+}
+
+fn read_exports_from_parts(
+    module: &RemoteModule,
+    dir_rva: u32,
+    dir_size: u32,
+    at: &mut dyn FnMut(u32, usize) -> Result<Vec<u8>>,
+) -> Result<ExportTable> {
 
     // IMAGE_EXPORT_DIRECTORY header.
-    let header = at(dir.virtual_address, 0x28)?;
+    let header = at(dir_rva, 0x28)?;
     let base_index = u32_at(&header, 0x10)?;
     let number_of_functions = u32_at(&header, 0x14)? as usize;
     let number_of_names = u32_at(&header, 0x18)? as usize;
@@ -102,9 +142,11 @@ pub fn load_exports(proc: &RemoteProcess, module: &RemoteModule) -> Result<Expor
     let names = at(names_rva, number_of_names * 4)?;
     let ordinals = at(ordinals_rva, number_of_names * 2)?;
 
-    let dir_start = dir.virtual_address;
-    let dir_end = dir_start + dir.size;
-    let classify = |rva: u32| -> Result<ExportTarget> {
+    let dir_start = dir_rva;
+    let dir_end = dir_start + dir_size;
+    let mut classify = |at: &mut dyn FnMut(u32, usize) -> Result<Vec<u8>>,
+                         rva: u32|
+     -> Result<ExportTarget> {
         if (dir_start..dir_end).contains(&rva) {
             // Inside the export directory => ASCII forwarder string.
             let blob = at(rva, MAX_EXPORT_NAME)?;
@@ -124,7 +166,7 @@ pub fn load_exports(proc: &RemoteProcess, module: &RemoteModule) -> Result<Expor
             continue;
         }
         let ordinal = (i as u32 + base_index) as u16;
-        table.by_ordinal.insert(ordinal, classify(rva)?);
+        table.by_ordinal.insert(ordinal, classify(at, rva)?);
     }
 
     for i in 0..number_of_names {
@@ -138,7 +180,7 @@ pub fn load_exports(proc: &RemoteProcess, module: &RemoteModule) -> Result<Expor
         let name = String::from_utf8_lossy(&blob[..end]).into_owned();
         let rva = u32_at(&functions, index * 4)?;
         if rva != 0 {
-            table.by_name.insert(name, classify(rva)?);
+            table.by_name.insert(name, classify(at, rva)?);
         }
     }
 
@@ -201,3 +243,4 @@ impl ImportBy {
         }
     }
 }
+

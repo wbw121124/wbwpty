@@ -217,6 +217,21 @@ impl RemoteModules {
     /// situations: during `LdrpInitializeProcess` entries are linked one at a
     /// time, so a module the payload needs can legitimately appear a
     /// millisecond later. The injector retries on that variant.
+    /// The on-disk path of a mapped module, as the target's loader recorded it.
+    ///
+    /// Needed to read a module's export directory from the file instead of out of
+    /// the process: the RVAs belong to the file, so only the base has to come from
+    /// the target, and reading the directory locally avoids tens of milliseconds
+    /// of `ReadProcessMemory` against a large module while the target is still
+    /// starting.
+    pub fn path_for_base(&self, base: u64) -> Option<String> {
+        self.modules
+            .iter()
+            .find(|m| m.base == base)
+            .map(|m| m.full_name.clone())
+            .filter(|p| !p.is_empty() && p.contains('\\') || p.contains('/'))
+    }
+
     pub fn base_for_name(&self, proc: &RemoteProcess, name: &str) -> Result<u64> {
         if let Some(base) = self.from_peb(name) {
             return Ok(base);
@@ -921,11 +936,25 @@ impl RemoteProcess {
         timeout: std::time::Duration,
     ) -> Result<Vec<RemoteModule>> {
         let deadline = std::time::Instant::now() + timeout;
+        let started = std::time::Instant::now();
         let mut best_effort = 0usize;
         loop {
             if let Ok(modules) = self.walk_modules_allow_empty() {
                 best_effort = best_effort.max(modules.len());
                 if !modules.is_empty() && Self::looks_like_a_real_module_list(&modules) {
+                    if std::env::var_os("WBWPTY_TRACE_LOADER").is_some() {
+                        eprintln!(
+                            "wbwpty: pid {} loader list ready after {:?} ({} entries: {})",
+                            self.pid().unwrap_or(0),
+                            started.elapsed(),
+                            modules.len(),
+                            modules
+                                .iter()
+                                .map(|m| m.base_name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                    }
                     return Ok(modules);
                 }
             }

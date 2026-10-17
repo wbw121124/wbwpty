@@ -466,7 +466,7 @@ fn a_grandchild_reaches_the_pipe_without_a_console() {
     let _guard = TreeGuard { root: session.pid() };
 
     let armed = wait_until(std::time::Duration::from_secs(10), || {
-        session.hook().map(|h| h.slot_count() > 0).unwrap_or(false)
+        session.process_creation_substituted()
     });
     assert!(
         armed,
@@ -602,7 +602,7 @@ fn the_grandchild_tree_is_attributed_and_has_no_console_host() {
     // is the condition that actually matters, and waiting on it directly is what
     // makes "the child below was covered" a fact instead of a hope.
     let armed = wait_until(std::time::Duration::from_secs(10), || {
-        session.hook().map(|h| h.slot_count() > 0).unwrap_or(false)
+        session.process_creation_substituted()
     });
     assert!(
         armed,
@@ -662,6 +662,112 @@ fn the_grandchild_tree_is_attributed_and_has_no_console_host() {
     );
 }
 
+/// `ping` as a delay, with the tree watched for console hosts.
+///
+/// This is the case the rest of this file works around. Every earlier attempt to
+/// buy time before the child under test had to invent a delay, and both
+/// inventions were wrong: `ping` *is* the bug - it is cmd's first spawn, so it is
+/// the process that misses the hook and is handed a console of its own - and a
+/// `for /L` loop spawns nothing but is unbounded and burns the deadline.
+///
+/// Here `ping` is used deliberately, with two protections the previous runs did
+/// not have:
+///
+/// * the target's window starts minimised, so a console that does appear does not
+///   take the user's focus - see [`ChildSpec::minimized`];
+/// * a [`ProcessWatch`] accumulates the tree, and **any** `conhost.exe` or
+///   `OpenConsole.exe` created under this test's own pid fails the test. That is
+///   the judgement the user asked for, and it is the opposite of the
+///   count-the-difference approach that kept reporting clean.
+///
+/// The assertion is about the tree, not about the delay, so a run where `ping`
+/// *does* get a console fails here with the offending pid rather than being
+/// discovered later by whoever was looking at the desktop.
+#[test]
+fn a_ping_delay_creates_no_console_host_in_the_tree() {
+    use wbwpty_core::procwatch::ProcessWatch;
+
+    let watch = ProcessWatch::start();
+    eprintln!(
+        "procwatch mode = {:?}, exhaustive = {}",
+        watch.mode(),
+        watch.mode().is_exhaustive()
+    );
+    let test_pid = std::process::id();
+
+    // `ping -n 4` lives about three seconds: long enough for the injection to
+    // land, short enough to keep the suite quick. The address is a loopback
+    // literal rather than a hostname, so nothing here depends on a resolver
+    // (AGENTS pitfall 29: assert on things that do not vary with language).
+    let spec = ChildSpec::new("cmd.exe")
+        .arg("/c")
+        .arg("ping -n 4 127.0.0.1 > nul & cmd.exe /c \"for %i in (NEU) do @echo %i7Q2K5\"")
+        .minimized();
+    let config = SessionConfig {
+        shim: true,
+        inject: true,
+        // Rule 32: the pump would deliver stdin EOF at a moment this test does not
+        // control, and `cmd /c` reads none of it anyway.
+        pump_input: false,
+        // Timing is the subject here: how long after the target can run its own
+        // code does the substitution become live.
+        verbose: true,
+        ..Default::default()
+    };
+    let session = Session::start(&spec, config).expect("session");
+    let _guard = TreeGuard { root: session.pid() };
+    watch.adopt(session.pid());
+
+    let mut buf = [0u8; 4096];
+    let mut output = String::new();
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline {
+        match session.pipes().with(|p| p.read_output(&mut buf, 200)) {
+            Some(Ok(ReadEvent::Data(n))) => {
+                output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                // Rule 15: the marker is assembled from `%i` so the literal
+                // command line carries no `7Q2K5`, and cannot match the echo of
+                // the command itself.
+                if output.contains("NEU7Q2K5") {
+                    break;
+                }
+            }
+            Some(Ok(ReadEvent::Eof)) | None => break,
+            Some(Err(_)) => break,
+            _ => {}
+        }
+    }
+    session.shutdown();
+
+    // Let the final samples land before the record is read, otherwise a host born
+    // just before shutdown is missed by the very assertion meant to catch it.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let hosts = watch.console_hosts_under(test_pid);
+    eprintln!(
+        "ping-delay run: {} creations recorded, {} console hosts in tree, \
+         marker seen = {}",
+        watch.recorded().len(),
+        hosts.len(),
+        output.contains("NEU7Q2K5")
+    );
+
+    assert!(
+        hosts.is_empty(),
+        "a console host was created under this test's tree while `ping` was \
+         running: {hosts:?}\n\
+         \x20mode = {:?} (exhaustive = {}), so this is {}",
+        watch.mode(),
+        watch.mode().is_exhaustive(),
+        if watch.mode().is_exhaustive() {
+            "proof that the substitution did not cover every spawn"
+        } else {
+            "what the sampled watch could see; a host born and reaped between \
+             two samples would not appear here"
+        },
+    );
+}
+
 /// Takes down whatever the session left, on every path out.
 ///
 /// Descendants before ancestors: killing a parent first reparents its children
@@ -685,13 +791,25 @@ impl TreeGuard {
         };
         let mine = inspect::descendants_of(&table, self.root);
         let alive = mine.len().saturating_sub(1);
+        // Never touch this process or anything that could plausibly be an
+        // ancestor of it. `descendants_of` follows parent links, and a pid that
+        // has already been recycled can make that walk reach a process it has no
+        // business touching - including the test harness, which shows up as the
+        // test binary exiting 1 with no panic and no message. A guard is cheap;
+        // killing the runner is not recoverable.
+        let (me, ppid) = (std::process::id(), parent_of_self());
+        let forbidden = |pid: u32| pid == me || pid == ppid;
         for host in inspect::descendant_console_hosts(&table, self.root) {
+            if forbidden(host.pid) {
+                eprintln!("cleanup: refusing to terminate pid {} (self/parent)", host.pid);
+                continue;
+            }
             eprintln!("cleanup: console host pid {}", host.pid);
             let _ = inspect::terminate(host.pid);
         }
         let mut by_depth: Vec<(usize, u32)> = mine
             .iter()
-            .filter(|&&pid| pid != self.root)
+            .filter(|&&pid| pid != self.root && !forbidden(pid))
             .map(|&pid| {
                 (
                     inspect::ancestry_depth(&table, self.root, pid).unwrap_or(0),
@@ -707,6 +825,27 @@ impl TreeGuard {
     }
 }
 
+/// This process's parent pid, or 0 if it cannot be read.
+fn parent_of_self() -> u32 {
+    // Walk up to the topmost ancestor: a cleanup pass that only guarded the
+    // immediate parent could still reach the shell that launched the suite.
+    let mut current = std::process::id();
+    for _ in 0..64 {
+        let Ok(table) = inspect::process_table() else {
+            return 0;
+        };
+        let Some(entry) = table.iter().find(|e| e.pid == current) else {
+            return current;
+        };
+        // A parent of 0 or 1 is the top of the chain.
+        if entry.parent == 0 || entry.parent == 1 || entry.parent == current {
+            return current;
+        }
+        current = entry.parent;
+    }
+    current
+}
+
 impl Drop for TreeGuard {
     fn drop(&mut self) {
         for _ in 0..20 {
@@ -717,4 +856,6 @@ impl Drop for TreeGuard {
         }
     }
 }
+
+
 
