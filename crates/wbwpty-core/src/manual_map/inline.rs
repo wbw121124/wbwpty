@@ -610,30 +610,79 @@ pub fn install_nt_forced_stub(
     stub: u64,
 ) -> Result<ForcedStub> {
     let entry = resolve_nt_export(proc, ntdll_base, "NtCreateUserProcess")?;
-    let prologue = proc
-        .read_bytes(entry, PROLOGUE_LEN)
+    let window = proc
+        .read_bytes(entry, MAX_PROLOGUE_LEN)
         .with_context(|| format!("reading the prologue of NtCreateUserProcess at {entry:#x}"))?;
-    if !is_relocatable(&prologue) {
-        bail!(
-            "the first {PROLOGUE_LEN} bytes of NtCreateUserProcess at {entry:#x} are \
-             not position-independent, so they cannot be relocated"
-        );
-    }
+    let length = relocatable_prefix_len(&window).ok_or_else(|| {
+        anyhow::anyhow!(
+            "NtCreateUserProcess at {entry:#x} opens with nothing position-independent, \
+             so a trampoline cannot be built for it"
+        )
+    })?;
+    let prologue = &window[..length];
     if stub == 0 {
         bail!("no stub buffer was provided");
     }
 
     let mut body = force_detached_stub_nt();
-    body.extend_from_slice(&prologue);
-    body.extend_from_slice(&jump_absolute(entry + PROLOGUE_LEN as u64));
+    body.extend_from_slice(prologue);
+    body.extend_from_slice(&jump_absolute(entry + length as u64));
     proc.write_bytes(stub, &body)
         .with_context(|| format!("writing the NtCreateUserProcess stub at {stub:#x}"))?;
-    make_writable(proc, entry, PROLOGUE_LEN)?;
+    make_writable(proc, entry, length)?;
     proc.write_bytes(entry, &jump_absolute(stub))
         .with_context(|| format!("patching NtCreateUserProcess at {entry:#x}"))?;
 
     Ok(ForcedStub { entry, stub })
 }
+
+/// The longest position-independent instruction boundary at the start of `bytes`.
+///
+/// A fixed window is the wrong question. `NtCreateUserProcess` opens with
+/// `4c 8b d1 b8 cf 00 00 00 f6 04 25 08 ...` - eight bytes that are entirely
+/// position-independent, followed by a nine-byte instruction that runs past the
+/// twelfth. Asking "are the first twelve bytes relocatable" therefore answers
+/// *no*, for a function whose prologue relocates perfectly well:
+///
+///     NtCreateUserProcess  4c 8b d1 b8 cf 00 00 00 f6 04 25 08  <- INVALID at +8
+///     NtCreateProcess      4c 8b d1 b8 be 00 00 00 f6 04 25 08  <- INVALID at +8
+///     NtCreateProcessEx    4c 8b d1 b8 4d 00 00 00 f6 04 25 08  <- INVALID at +8
+///
+/// `f6 04 25 08 ...` is `test byte ptr [8], al`: `mod=00, rm=100` puts a SIB byte
+/// next, that SIB selects neither base nor index, and the displacement is
+/// therefore absolute - the instruction reads address 8 wherever it is placed. It
+/// was never position-dependent. The truncation was the whole objection.
+///
+/// So the question becomes "where does the prologue stop being relocatable", and
+/// the answer is an instruction boundary rather than a byte count. `None` means no
+/// relocatable prefix at all, which is an outright refusal.
+pub fn relocatable_prefix_len(bytes: &[u8]) -> Option<usize> {
+    use iced_x86::{Code, Decoder, DecoderOptions};
+
+    let mut decoder = Decoder::with_ip(64, bytes, 0, DecoderOptions::NONE);
+    let mut covered = 0usize;
+    loop {
+        let instruction = decoder.decode();
+        if instruction.code() == Code::INVALID {
+            return if covered == 0 { None } else { Some(covered) };
+        }
+        if instruction.ip() + instruction.len() as u64 > bytes.len() as u64 {
+            return if covered == 0 { None } else { Some(covered) };
+        }
+        if instruction.is_ip_rel_memory_operand() || instruction.near_branch_target() != 0 {
+            return if covered == 0 { None } else { Some(covered) };
+        }
+        covered += instruction.len();
+        // A prologue this long would be an unusual place to stop, and letting it
+        // run unbounded risks building a trampoline out of half a function.
+        if covered >= MAX_PROLOGUE_LEN {
+            return Some(covered);
+        }
+    }
+}
+
+/// The most bytes [`relocatable_prefix_len`] may consume.
+pub const MAX_PROLOGUE_LEN: usize = 32;
 
 /// The address of an `ntdll` export, read from the *target's* `ntdll` on disk.
 ///
@@ -1153,4 +1202,146 @@ mod tests {
              CREATE_UNICODE_ENVIRONMENT; the victim received {seen:#018x}"
         );
     }
+}
+
+/// What the ntdll candidates actually look like, decoded rather than guessed.
+///
+/// `NtCreateUserProcess` was refused as unhookable on the strength of a
+/// `f6 04 25 08 ...` byte pattern read as a RIP-relative operand. It is not
+/// one: `mod=00, rm=100` puts a SIB byte next, and that SIB selects no base and
+/// no index, so the displacement is absolute - the instruction reads address
+/// 0x08, where `gs:[0x08]` lives, regardless of where the instruction is. So
+/// the reason it was refused needs to be re-established from the real bytes
+/// rather than inherited.
+#[test]
+fn ntdll_creation_candidates_report_what_they_actually_are() {
+    use crate::manual_map::exports::load_exports_from_file;
+    use crate::manual_map::remote::host_module_base;
+    use std::path::PathBuf;
+
+    let base = host_module_base("ntdll.dll");
+    assert_ne!(base, 0, "ntdll must be mapped in the host");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(r"..\..\..\windows\System32\ntdll.dll");
+    let path = if path.exists() {
+        path
+    } else {
+        PathBuf::from(r"C:\Windows\System32\ntdll.dll")
+    };
+    let module = crate::manual_map::RemoteModule {
+        base,
+        size: 0,
+        full_name: path.to_string_lossy().into_owned(),
+        base_name: "ntdll.dll".to_string(),
+    };
+    let table = match load_exports_from_file(&path, &module) {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("skipping: cannot read {}: {err:#}", path.display());
+            return;
+        }
+    };
+
+    for name in [
+        "NtCreateUserProcess",
+        "NtCreateProcess",
+        "NtCreateProcessEx",
+        "RtlCreateUserProcess",
+    ] {
+        let Ok(addr) = find_export(base, &table, name) else {
+            eprintln!("{name:22} not exported");
+            continue;
+        };
+        let mut window = vec![0u8; 12];
+        // SAFETY: `rva` is an address inside this process's own ntdll.
+        unsafe { std::ptr::copy_nonoverlapping(addr as *const u8, window.as_mut_ptr(), 12) };
+        let hex: Vec<String> = window.iter().map(|b| format!("{b:02x}")).collect();
+
+        use iced_x86::{Decoder, DecoderOptions};
+        let mut decoder = Decoder::with_ip(64, &window, addr, DecoderOptions::NONE);
+        let mut reasons = Vec::new();
+        let mut covered = 0usize;
+        loop {
+            let i = decoder.decode();
+            if i.code() == iced_x86::Code::INVALID {
+                reasons.push(format!("INVALID at +{covered}"));
+                break;
+            }
+            if i.ip() + i.len() as u64 > addr + 12 {
+                reasons.push(format!("truncated {:?} at +{covered}", i.mnemonic()));
+                break;
+            }
+            if i.is_ip_rel_memory_operand() {
+                reasons.push(format!("ip-relative {:?} at +{covered}", i.mnemonic()));
+            }
+            if i.near_branch_target() != 0 {
+                reasons.push(format!("branch {:?} at +{covered}", i.mnemonic()));
+            }
+            covered += i.len();
+            if covered >= 12 {
+                break;
+            }
+        }
+        eprintln!(
+            "{name:22} {addr:#x} relocatable={} bytes=[{}]{}",
+            reasons.is_empty(),
+            hex.join(" "),
+            if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" <- {}", reasons.join(", "))
+            }
+        );
+    }
+}
+
+/// The refusal that kept `NtCreateUserProcess` out of reach was a truncation,
+/// not a position dependency. These are its real opening bytes.
+#[test]
+fn the_ntdll_prologues_relocate_despite_their_length() {
+    // 4c 8b d1 (mov r10,rcx) b8 .. 00 00 00 (mov eax,N) then a nine-byte
+    // instruction that runs past byte twelve.
+    let window = [
+        0x4c, 0x8b, 0xd1, 0xb8, 0xcf, 0x00, 0x00, 0x00, 0xf6, 0x04, 0x25, 0x08, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ];
+    // The question this replaces answered *no*:
+    assert!(
+        !is_relocatable(&window[..12]),
+        "the fixed twelve-byte window should still report false, or this test is \
+             not testing the thing that was wrong"
+    );
+    let prefix = relocatable_prefix_len(&window).expect("the prologue must relocate");
+    assert!(
+        prefix >= 12,
+        "the relocatable prefix is {prefix} bytes, so it already covers the \
+             twelve that used to disqualify the function"
+    );
+    // Everything relocated has to stay inside the window we actually read, or
+    // the trampoline would resume mid-instruction.
+    let mut decoder =
+        iced_x86::Decoder::with_ip(64, &window[..prefix], 0, iced_x86::DecoderOptions::NONE);
+    let mut covered = 0usize;
+    while covered < prefix {
+        let i = decoder.decode();
+        assert_ne!(i.code(), iced_x86::Code::INVALID, "truncated at {covered}");
+        covered += i.len();
+    }
+    assert_eq!(
+        covered, prefix,
+        "the prefix must end on an instruction boundary"
+    );
+
+    // A genuinely position-dependent first instruction refuses outright.
+    // 48 8b 05 disp32 is `mov rax, [rip+disp32]`.
+    assert_eq!(
+        relocatable_prefix_len(&[0x48, 0x8b, 0x05, 0, 0, 0, 0, 0]),
+        None
+    );
+
+    // A relative branch as the first instruction also refuses.
+    assert_eq!(
+        relocatable_prefix_len(&[0xE9, 0x10, 0x00, 0x00, 0x00]),
+        None
+    );
 }
