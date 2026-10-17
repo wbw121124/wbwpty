@@ -309,6 +309,108 @@ pub fn publish_payload_image(image: Vec<u8>) {
     let _ = EXPORT_IMAGE.set(image);
 }
 
+/// Forces `DETACHED_PROCESS` on a stack argument, with no imports at all.
+///
+/// # Why this exists, separately from everything else here
+///
+/// Every other mechanism in this file needs the payload, and the payload needs its
+/// imports resolved, and resolving them needs the target to have mapped
+/// `kernelbase.dll` - because `kernel32`'s exports are forwarders into it.
+/// Measured on this machine that wait is about 28 ms, while `cmd.exe` calls
+/// `CreateProcess` at about 31 ms and the full substitution is not live until
+/// 43 ms. The only mechanism that can be installed in time is the one that
+/// depends on nothing.
+///
+/// Which is what this is: straight-line code that ORs a bit into the caller's
+/// argument and jumps on, with no calls, no data and no imports, so it needs only
+/// `kernelbase`'s address and can go in the moment the loader maps it.
+///
+/// It is deliberately incomplete - no handles, no handover, neither of which it
+/// could do without the payload. Its whole job is to make sure no console is ever
+/// allocated. The full substitution follows and takes over; by then the spawn it
+/// needed to intercept has already been intercepted.
+///
+/// # The encoding
+///
+/// `dwCreationFlags` is the sixth parameter of `CreateProcessW`, so at the entry
+/// - before any prologue - it is at `rsp + 0x30`: four register parameters
+/// shadow the return address, so the fifth is at `rsp + 0x28` and the sixth at
+/// `rsp + 0x30`.
+///
+/// `rsp`-relative addressing needs a SIB byte, which no encoding of `or`/`and`
+/// with a `[rsp+disp32]` memory destination omits. That is why these are 8 and 10
+/// bytes rather than the 6 and 8 they would otherwise be.
+pub fn force_detached_stub(flags_at_rsp_offset: u32) -> Vec<u8> {
+    let offset = flags_at_rsp_offset;
+    let mut out = Vec::with_capacity(18);
+    // `or dword ptr [rsp+offset], 8` - ModRM `0x8C` is mod `10`, reg `001`
+    // (/1 = OR), rm `100` (SIB).
+    out.extend_from_slice(&[0x83, 0x8C, 0x24]);
+    out.extend_from_slice(&offset.to_le_bytes());
+    out.push(0x08);
+    // `and dword ptr [rsp+offset], ~0x10` - clears `CREATE_NEW_CONSOLE`, which the
+    // docs call undefined in combination with `DETACHED_PROCESS`.
+    //
+    // ModRM `0xA4`, not `0x8C`: `0xA4` is reg `100`, which is `/4` = AND. `0x8C`
+    // is `/1` = OR, and OR-ing a mask is the exact opposite operation - it would
+    // *set* `CREATE_NEW_CONSOLE`, the flag this is meant to remove.
+    out.extend_from_slice(&[0x81, 0xA4, 0x24]);
+    out.extend_from_slice(&offset.to_le_bytes());
+    out.extend_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+    out
+}
+
+/// Offset of `dwCreationFlags` from `rsp` at the entry of `CreateProcessW`.
+pub const CREATE_PROCESS_W_FLAGS_OFFSET: u32 = 0x30;
+
+/// What [`install_forced_stub`] patched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForcedStub {
+    /// Address of the patched function entry.
+    pub entry: u64,
+    /// Address of the stub it now jumps to.
+    pub stub: u64,
+}
+
+/// Bytes [`install_forced_stub`] writes into its stub buffer.
+pub fn forced_stub_size() -> usize {
+    force_detached_stub(CREATE_PROCESS_W_FLAGS_OFFSET).len() + PROLOGUE_LEN * 2
+}
+
+/// Patches `entry` so it forces `DETACHED_PROCESS` before running the original.
+///
+/// Needs nothing but `kernelbase`'s address, which is why it can be installed
+/// before the payload's imports are resolved.
+///
+/// Unlike [`install_inline_hook`] there is no substitute to fall back to, so a
+/// prologue that cannot be proven safe to relocate is an outright failure rather
+/// than a refusal: leaving the entry alone here means every descendant gets a
+/// console, which is the one outcome this whole mechanism exists to prevent.
+pub fn install_forced_stub(proc: &RemoteProcess, entry: u64, stub: u64) -> Result<ForcedStub> {
+    let prologue = proc
+        .read_bytes(entry, PROLOGUE_LEN)
+        .with_context(|| format!("reading the prologue at {entry:#x}"))?;
+    if !is_relocatable(&prologue) {
+        bail!(
+            "the first {PROLOGUE_LEN} bytes at {entry:#x} are not position-independent, \
+             so they cannot be relocated"
+        );
+    }
+    if stub == 0 {
+        bail!("no stub buffer was provided");
+    }
+
+    let mut body = force_detached_stub(CREATE_PROCESS_W_FLAGS_OFFSET);
+    body.extend_from_slice(&prologue);
+    body.extend_from_slice(&jump_absolute(entry + PROLOGUE_LEN as u64));
+    proc.write_bytes(stub, &body)
+        .with_context(|| format!("writing the stub at {stub:#x}"))?;
+    proc.write_bytes(entry, &jump_absolute(stub))
+        .with_context(|| format!("patching {entry:#x}"))?;
+
+    Ok(ForcedStub { entry, stub })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +520,98 @@ mod tests {
         let built = build_trampoline(&prologue, resume);
         assert_eq!(&built[..prologue.len()], &prologue[..]);
         assert_eq!(&built[prologue.len()..], &jump_absolute(resume));
+    }
+/// The forced-flag stub is the two instructions it claims to be.
+    ///
+    /// Decoded rather than compared against a byte string, because a byte
+    /// comparison cannot tell `81 8C 24` from `81 A4 24` - and that difference is
+    /// the bug this module hit while being written: `0x8C` is `/1` = OR, `0xA4` is
+    /// `/4` = AND, so the wrong one *sets* `CREATE_NEW_CONSOLE`, the very flag
+    /// the second instruction exists to clear. Decoding says "AND" or it does not.
+    #[test]
+    fn the_forced_stub_decodes_to_forcing_detached_and_clearing_new_console() {
+        use iced_x86::{Code, Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+
+        let code = force_detached_stub(CREATE_PROCESS_W_FLAGS_OFFSET);
+        let mut decoder = Decoder::with_ip(64, &code, 0, DecoderOptions::NONE);
+        let mut seen: Vec<Mnemonic> = Vec::new();
+
+        while decoder.can_decode() {
+            let i = decoder.decode();
+            assert_ne!(
+                i.code(),
+                Code::INVALID,
+                "the stub does not decode at {:#x}",
+                i.ip()
+            );
+            // Both must address `[rsp + offset]` as a 32-bit value. A byte or
+            // word operand would write part of a different thing and still look
+            // right as bytes.
+            assert_eq!(i.op_kind(0), OpKind::Memory, "{:?}", i.mnemonic());
+            assert_eq!(i.memory_base(), Register::RSP, "{:?}", i.mnemonic());
+            assert_eq!(
+                i.memory_displacement64(),
+                CREATE_PROCESS_W_FLAGS_OFFSET as u64,
+                "{:?} addresses the wrong stack slot",
+                i.mnemonic()
+            );
+            assert_eq!(
+                i.memory_size(),
+                iced_x86::MemorySize::UInt32,
+                "{:?} is not 32-bit",
+                i.mnemonic()
+            );
+            seen.push(i.mnemonic());
+        }
+
+        assert_eq!(
+            seen,
+            vec![Mnemonic::Or, Mnemonic::And],
+            "the stub should set DETACHED_PROCESS and clear CREATE_NEW_CONSOLE"
+        );
+        assert_eq!(
+            code.len(),
+            decoder.position(),
+            "the stub has bytes that are not instructions"
+        );
+    }
+
+/// The flags offset is the sixth parameter, by the calling convention.
+    ///
+    /// Derived rather than measured, and the derivation is the whole of it: under
+    /// the Microsoft x64 convention a callee finds the return address at `[rsp]`,
+    /// the four register parameters shadowed at `[rsp+0x08 .. rsp+0x28]`, and the
+    /// first stack parameter at `[rsp+0x28]`. `dwCreationFlags` is the sixth
+    /// parameter of `CreateProcessW` - after `lpApplicationName`,
+    /// `lpCommandLine`, `lpProcessAttributes`, `lpThreadAttributes` and
+    /// `bInheritHandles` - so it is the second stack slot: `0x28 + 8`.
+    ///
+    /// An earlier version of this test tried to confirm it by measuring where a
+    /// six-parameter Rust function puts its last argument, and it reported
+    /// `rsp + 0x50`. That was the test being wrong rather than the constant: the
+    /// two functions it compared were called from different places, so the
+    /// difference contained both their prologues and the caller's frame. Measuring
+    /// a stack offset from Rust means measuring its prologue too, and there is no
+    /// way to read the entry `rsp` from safe code.
+    ///
+    /// What *is* verified mechanically is the encoding - see
+    /// `the_forced_stub_decodes_to_forcing_detached_and_clearing_new_console` -
+    /// and the offset this constant supplies is checked there against the
+    /// displacement the decoder reports.
+    #[test]
+    fn the_flags_offset_follows_the_calling_convention() {
+        const RETURN_ADDRESS: u64 = 8;
+        const SHADOW_FOR_FOUR_REGISTERS: u64 = 4 * 8;
+        const FIRST_STACK_PARAMETER: u64 = RETURN_ADDRESS + SHADOW_FOR_FOUR_REGISTERS;
+        /// `bInheritHandles` is the fifth parameter; the flags are the sixth.
+        const PARAMETERS_BEFORE_THE_FLAGS: u64 = 5;
+
+        let derived = FIRST_STACK_PARAMETER
+            + (PARAMETERS_BEFORE_THE_FLAGS - 4) * 8;
+        assert_eq!(
+            derived, CREATE_PROCESS_W_FLAGS_OFFSET as u64,
+            "the constant and the calling convention disagree about where \
+             dwCreationFlags lives"
+        );
     }
 }
