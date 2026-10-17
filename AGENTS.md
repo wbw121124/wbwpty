@@ -506,3 +506,136 @@ cmd.exe /c "for /L %i in (1,1,999999) do @rem & <被测子进程>"
   `ping`），这条路径实测不会弹。
 - 需要在**完全没有 console** 的环境里跑测试时，用任务计划或服务方式启动，
   不要用 `Start-Process cmd.exe`（那本身就会分配 console，见 §7' 坑 33）。
+---
+
+## 13. 2026-10-17：为什么「无 conhost」还没成立（停工时的真实状态）
+
+这一轮排除了三个错误假设，剩下的那个是结构性的。**先读这一节再动这块代码。**
+
+### 已用证据排除的（别再走回头路）
+
+35. **cmd.exe 不调用 `CreateProcessW`，它直接调 `kernelbase!CreateProcessInternalW`。**
+    x64dbg 三个断点实测的调用链：
+
+    ```
+    00007FF72120F8F0  cmd.exe 入口点 (AddressOfEntryPoint)
+    00007FFEE31B51C0  kernelbase!CreateProcessInternalW   ← 命中
+    00007FFEE5E51A90  ntdll!NtCreateUserProcess           ← 命中
+    ```
+
+    `RtlCreateUserProcess` **从未被命中**。所以之前挂在 `CreateProcessW` /
+    `CreateProcessAsUserW` 上的 IAT 替换、inline hook、强制 stub，
+    **装得上但一次都不会执行**。日志里的自证：
+
+    ```
+    replaced CreateProcessW at 0x7ffee31eea50 (trampoline 0x1c586e50000)
+    replaced CreateProcessAsUserW at 0x7ffee31f1b70 (trampoline 0x1c586e60000)
+    CreateProcessW hook: 0 call(s)
+    1 console hosts in tree
+    ```
+
+    「装上了 + 调用 0 次 + conhost 照旧」——这三个同时出现，就是 hook 错了函数。
+
+36. **`CreateProcessInternalW` 用的是 `CreateProcessW` 的参数表**，偏移没变。
+    实测帧（`RSP = 0x3CF58FF118`）：
+
+    | 槽位 | 值 | 含义 |
+    | --- | --- | --- |
+    | `[rsp+0x20]` (r9) | `0x7FFEE31B3124` | `lpThreadAttributes`（kernelbase .data）|
+    | `[rsp+0x28]` | `0x1` | `bInheritHandles` |
+    | **`[rsp+0x30]`** | **`0x0`** | **`dwCreationFlags`** |
+    | `[rsp+0x38]` | `0x18E5330ABC0` | `lpEnvironment` |
+    | `[rsp+0x40]` | `0x3CF58FF290` | `lpCurrentDirectory` |
+    | `[rsp+0x48]` | `0x3CF58FF278` | `lpStartupInfo` |
+
+    **本文件 §11 里记的 `[rsp+0x38] = 0x80000` 是另一次调用的帧，错了。**
+    `0x38` 是 `lpEnvironment`，一个指针。偏移这种东西离开它被读出来的那一帧就没有意义，
+    所以现在把整帧和偏移写在一起。
+
+37. **强制 stub 的 AND 掩码差一位，一直是空操作。**
+    `force_flags_at` 原来 AND 的是 `0xFFFF_FFF0`，清的是 bit 0-3；
+    而 `CREATE_NEW_CONSOLE = 0x10` 是 **bit 4**。所以那条「清掉 CREATE_NEW_CONSOLE」
+    的指令从来没生效过，而它解码出来仍然是个 AND —— 解码测试断言了助记符和位移，
+    **没断言立即数**，所以一直是绿的。现在是 `u32::MAX & !CREATE_NEW_CONSOLE`。
+    **这条又是「字节对、解码对、语义错」，而且比坑 3 还深一层：在解码器不看的那��值里。**
+
+38. **`NtCreateUserProcess` 是可以 hook 的，之前的拒绝是错的。**
+
+    ```
+    4c 8b d1                    mov r10, rcx
+    b8 cf 00 00 00              mov eax, 0xcf
+    f6 04 25 08 03 fe 7f 01     test byte ptr [0x7FFE0308], al
+    75 03                       jne  +3
+    0f 05                       syscall
+    c3 / cd 2e c3               ret / int 0x2e / ret
+    ```
+
+    它就是个 syscall stub。`f6 04 25 08 ...` 的 `mod=00, rm=100` 后面跟 SIB，
+    该 SIB 既不选 base 也不选 index，所以位移是**绝对**的（`0x7FFE0308` =
+    `KUSER_SHARED_DATA+0x308`），**从来就不是位置相关**。
+    当年判它 false 的真正原因是**固定的 12 字节窗口把这条 9 字节指令截断了**，
+    iced 在 +8 报 `INVALID`，于是整个序言被连坐。
+    现在用 `relocatable_prefix_len()` 问「序言在哪里不再可重定位」，
+    对 `NtCreateUserProcess` 回答 **16** —— 比那个否掉它的窗口还长。
+
+39. **「resume 之后打 kernelbase 的补丁」这条路赢不了，也不要再去调它。**
+    分段计时（`-v`）：
+
+    ```
+    list=1284us parse_exports=7us find_export=0us allocate=35us patch=2179us   -> 4ms，赢
+    allocate=6400us patch=6943us                                               -> 16ms，输
+    ```
+
+    cmd 在 ~8ms spawn。同一台机器上 `VirtualAllocEx` / `VirtualProtectEx`
+    **能差 200 倍**（26µs vs 6400µs）。没有余量可调，赢 3 次输 1 次就够了。
+
+    顺带一个真的优化：RVA 是文件内偏移、不随 ASLR 变，宿主自己就加载着同一个
+    `kernelbase.dll`。`GetProcAddress(宿主) - 宿主 base = RVA`，把
+    `load_exports_from_file(kernelbase.dll)` 的 **6529µs 降到 7µs**。
+
+40. **ntdll 是挂起态唯一可用的目标，所以「挂起时打 ntdll 补丁」是唯一无竞态的路。**
+    挂起态只有 exe + ntdll；kernelbase 要等 loader。这也是为什么先 resume 再打
+    kernelbase 从来只是权宜。
+
+### 仍未解决
+
+- **`ProcessFlags` 在 `NtCreateUserProcess` 的第几个栈参数，没定死。**
+  两种写法互相矛盾：一个说 `[rsp+0x28]`、8 字节；另一个按参数表说第 5 个是
+  `ProcessInheritHandles`、**第 6 个 `[rsp+0x30]`** 才是 flags、4 字节。
+  探针（`wbwpty-nt-probe`）实测到的调用全是：
+
+  ```
+  [rsp+0x28] = 0x0
+  [rsp+0x30] = 0x0
+  [rsp+0x38] = 0x0000000001000000
+  ```
+
+  两个候选都是 0，**区分不了**。需要一个 `[rsp+0x28] != 0` 的调用
+  （`CreateProcessInternalW` 那侧明确显示 `bInheritHandles = 1`）才能钉死。
+- **ping 的 conhost 仍然会出现**，`a_ping_delay_creates_no_console_host_in_the_tree` 仍失败。
+- **ETW 仍拿不到**：管理员也是 `Mode::Sampled, exhaustive=false`。
+
+### `wbwpty-nt-probe` 踩到的三个坑（它自己比被测代码更容易错）
+
+41. **`rep movsb` 会把 `rcx` 清零，而 `rcx` 是 `NtCreateUserProcess` 的第一个参数。**
+    抓帧 stub 一旦不保存/恢复 `rcx`，就把一个空 `ProcessHandle` 递给内核，目标直接
+    `0xC0000005`。看起来完全像「补丁打坏了」。
+42. **5 字节 `E9 rel32` 跳不到 `VirtualAllocEx` 的页。**
+    实测 `code = 0x21b98950000`、`entry = 0x7ffee5e51a90`，相距约 1TB，
+    `rel as i32` **静默截断**成 `0xb2afe56b`，跳进垃圾，进程暴死。
+    只有 12 字节绝对跳转能表达这个距离 —— 这不是风格选择。
+43. **RIP 相对位移是 `目标 - (指令结束处)`，不是 `目标 - 12`。**
+    写 `mov [rip+d], rax` 时算成 `sink - 12` 而不是 `sink - (code + 12)`，
+    于是写到完全无关的地址 → `0xC0000005`。**症状和「补丁打错函数」一模一样。**
+
+### 停工时的提交
+
+`b24d77e` 是本轮最后一个提交。`d5e9ca9` / `f30c544` / `be97ef7` / `673a4d2` 在它之前。
+
+### 接手的人建议从这里开始
+
+1. 先用 `wbwpty-nt-probe` 抓到一个 `[rsp+0x28] != 0` 的 `NtCreateUserProcess` 调用，
+   定死 flags 的偏移和宽度（4 还是 8 字节）。这一步是纯测量，不要再猜。
+2. 然后把 ntdll 的补丁挂到 **resume 之前**：`install_nt_forced_stub` 已经有了，
+   `relocatable_prefix_len` 已经能给到 16 字节。重定位本身不是难点，偏移才是。
+3. **不要**再去优化 resume 之后的 kernelbase 路径（坑 39）。

@@ -640,3 +640,31 @@ STD_HANDLES in=268 out=272 err=276
 ## 8. License
 
 MIT
+
+---
+
+## 附：停工时的状态（2026-10-17）
+
+**目标没达成。** `cmd /c <child>` 的孙进程仍然会拿到自己的 console，
+`a_ping_delay_creates_no_console_host_in_the_tree` 仍然失败，ping 会弹出
+`conhost.exe` / Windows Terminal 窗口。
+
+这一轮排除了四个错误假设，每个都有实测证据（细节见 `AGENTS.md` §13）：
+
+| 原假设 | 实测结果 |
+| --- | --- |
+| cmd 调 `CreateProcessW` | **不调。**直接调 `kernelbase!CreateProcessInternalW` |
+| `RtlCreateUserProcess` 可以拦 | **cmd 不走它**（断点从未命中） |
+| stub 只是装得太晚 | 装得够早（4ms）也拦不住；打错函数才是主因 |
+| `NtCreateUserProcess` 不可 hook | **可以。**它 16 字节序言完全可重定位 |
+
+已确认可用的部分：
+
+- `CreateProcessInternalW` 的参数表 = `CreateProcessW` 的，`dwCreationFlags` 在 `[rsp+0x30]`
+- `force_flags_at` 的 AND 掩码已修（原 `0xFFFF_FFF0` 差一位，清不掉 `CREATE_NEW_CONSOLE`）
+- stub 有了**调用计数器**，因此能区分「装上了」和「被调用过」——后者此前一直无法判断
+- stub 的 RVA 改从宿主自身的 `kernelbase` 反推，`parse_exports` 6529µs → 7µs
+
+未解决：竞态本身不可靠（`VirtualAllocEx` 耗时在 26µs–6400µs 间浮动 200 倍，
+而 cmd 只给 ~8ms），以及 `NtCreateUserProcess` 的 `ProcessFlags` 偏移尚未钉死。
+唯一无竞态的路径是**在 resume 之前打 ntdll 补丁**，因为挂起态只有 exe + ntdll。
