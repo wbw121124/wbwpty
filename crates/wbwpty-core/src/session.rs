@@ -1747,6 +1747,51 @@ fn install_nt_creation_hook(
     Ok(inline::install_rtl_creation_hook(proc, ntdll, stub)?.stub)
 }
 
+/// Resolves `CreateProcessInternalW` inside the target from the *host's* copy of
+/// `kernelbase`, without reading the file.
+///
+/// The stub needed one number - an RVA - and getting it by parsing `kernelbase.dll`
+/// off disk cost 6.5 ms, which is the entire margin this mechanism is working with:
+///
+///     list=277us parse_exports=6529us find_export=0us allocate=26us patch=1779us
+///
+/// An RVA is a file offset, so it does not move with ASLR, and the host has the
+/// same `kernelbase.dll` loaded as the target. Subtracting the host's base from
+/// `GetProcAddress` therefore gives the RVA, and adding the target's base gives its
+/// address - in microseconds rather than milliseconds.
+///
+/// A wrong answer cannot survive: [`crate::manual_map::inline::install_internal_forced_stub`]
+/// relocates the target's own prologue, and a mismatched module would fail that.
+/// `None` means fall back to parsing the file, which is slower but independent.
+fn internal_entry_from_host(target_kernelbase_base: u64) -> Option<u64> {
+    use crate::manual_map::remote::host_module_base;
+
+    let host_base = host_module_base("kernelbase.dll");
+    if host_base == 0 {
+        return None;
+    }
+    let name = b"CreateProcessInternalW\0";
+    // `windows-sys` types `GetProcAddress` as returning an optional function
+    // pointer rather than a raw address, which is why it is transmuted rather
+    // than cast: only its address is wanted, and that is what an export table
+    // entry is.
+    let address = unsafe {
+        let get: unsafe extern "system" fn(
+            windows_sys::Win32::Foundation::HMODULE,
+            *const u8,
+        ) -> windows_sys::Win32::Foundation::FARPROC = std::mem::transmute(
+            windows_sys::Win32::System::LibraryLoader::GetProcAddress as *const (),
+        );
+        get(host_base as *mut _, name.as_ptr()).map_or(0, |f| f as usize as u64)
+    };
+    if address == 0 {
+        return None;
+    }
+    let rva = address;
+    rva.checked_sub(host_base)
+        .map(|offset| target_kernelbase_base + offset)
+}
+
 /// Waits for `kernelbase`, then forces `DETACHED_PROCESS` on every child the
 /// target creates.
 ///
@@ -1780,6 +1825,7 @@ fn install_forced_stub(
 
     let deadline = std::time::Instant::now() + WAIT;
     loop {
+        let attempt = std::time::Instant::now();
         // Every failure here is "not yet", not "never": the loader links modules
         // one at a time, so `kernelbase` can be absent from the snapshot this
         // microsecond and present in the next. The first version treated a missing
@@ -1788,6 +1834,9 @@ fn install_forced_stub(
         // - which is exactly the window this exists to use.
         let ready = (|| -> Result<u64> {
             let modules = proc.poll_modules_ready(POLL, POLL)?;
+            let listed = std::time::Instant::now();
+            let mut parsed = listed;
+            let mut found = listed;
             let snapshot = RemoteModules::from_snapshot(modules);
             let base = snapshot.base_for_name(proc, KERNELBASE)?;
             // The path has to be the target's *own* record of it: the fallback in
@@ -1802,15 +1851,38 @@ fn install_forced_stub(
                 full_name: path.clone(),
                 base_name: KERNELBASE.to_ascii_lowercase(),
             };
-            let table = load_exports_from_file(std::path::Path::new(&path), &module)?;
-            // `CreateProcessInternalW`, not `CreateProcessW`. cmd.exe calls the
-            // internal one directly, so a stub on `CreateProcessW` installs
-            // cleanly and then never runs - which is exactly what it did for the
-            // whole run that produced `CreateProcessW hook: 0 call(s)` next to a
-            // `ping` that had a console.
-            let entry = inline::find_export(base, &table, "CreateProcessInternalW")?;
+            let entry = match internal_entry_from_host(base) {
+                Some(entry) => {
+                    parsed = std::time::Instant::now();
+                    entry
+                }
+                None => {
+                    let table = load_exports_from_file(std::path::Path::new(&path), &module)?;
+                    let entry = inline::find_export(base, &table, "CreateProcessInternalW")?;
+                    parsed = std::time::Instant::now();
+                    entry
+                }
+            };
+            let found = std::time::Instant::now();
             let stub = proc.allocate(inline::internal_forced_stub_size())?;
-            Ok(inline::install_internal_forced_stub(proc, entry, stub)?.stub)
+            let allocated = std::time::Instant::now();
+            let at = inline::install_internal_forced_stub(proc, entry, stub)?.stub;
+            let patched = std::time::Instant::now();
+            if verbose {
+                // Which of these is the cost is not obvious from the code: parsing
+                // `kernelbase.dll`'s export table off disk is a PE parse of a
+                // megabyte-scale image, and it measured 6.5 ms - the whole margin.
+                eprintln!(
+                    "wbwpty: forced-stub stages: list={}us parse_exports={}us \
+                     find_export={}us allocate={}us patch={}us",
+                    (listed - attempt).as_micros(),
+                    (parsed - listed).as_micros(),
+                    (found - parsed).as_micros(),
+                    (allocated - found).as_micros(),
+                    (patched - allocated).as_micros(),
+                );
+            }
+            Ok(at)
         })();
 
         match ready {
